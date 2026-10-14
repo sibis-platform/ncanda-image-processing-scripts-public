@@ -1,0 +1,1326 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+# Torsten's last version
+# Revision: 1531
+ 
+# Major change with 2mm computations (much faster to execute)
+# Revision: 1704
+
+# Major change on fieldmap and bold relations
+# Revision: 2596
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+NCANDA_SOURCE_DIR=@NCANDA_SOURCE_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+#
+# Setup branch configuration options
+#
+
+export DROPVOLUMES=@NCANDA_RSFMRI_DROPVOLUMES@
+export RESTING_DIR=${WORKDIR}/restingstate
+export SVN_VERSION=`echo "$Revision$" | cut -d ' ' -f 2`
+export MAX_NUM_OUTLIERS=53
+
+
+export FMRI_DIR=${RESTING_DIR}/native/rs-fMRI
+export FIELDMAP_DIR=${RESTING_DIR}/native/fieldmap
+
+if [ ! -d ${FMRI_DIR} -o ! -d ${FIELDMAP_DIR} ]; then
+  # echo "ERROR: ${WORKDIR}: No FMRI data: ${WORKDIR}"
+  exit 1
+fi
+
+if [ "${SITE}" != "A" -a "${SITE}" != "D" ]; then
+  # make sure fieldmap is correctly defined 
+  LIST="fieldmap-imaginary-1.nii.gz fieldmap-imaginary-2.nii.gz fieldmap-real-1.nii.gz fieldmap-real-2.nii.gz fieldmap-magnitude-1.nii.gz fieldmap-magnitude-2.nii.gz"
+  for FILE in $LIST; do
+      if [ ! -e ${FIELDMAP_DIR}/$FILE -a ! -e ${FIELDMAP_DIR}/manual/$FILE ]; then 
+	  echo "ERROR:$WORKDIR:${FIELDMAP_DIR}/$FILE is missing!" 
+	  exit 1
+      fi
+  done
+fi 
+
+
+t1_mrbias=$(LWDP_get_override_file ${WORKDIR}/structural/mrbias/t1.nii.gz)
+
+if [ ! -e ${t1_mrbias} ]; then
+  echo "ERROR: ${WORKDIR}: No structural image: ${WORKDIR}"
+  exit 1
+fi
+
+if [ -e ${RESTING_DIR}/failed_qc ]; then
+  echo "Warning: ${RESTING_DIR}: failed qc"
+  exit 1
+fi
+
+# Function to copy slice order-related fields from input header to output header (necessary because FSL tools like to drop these)
+# This also puts in default values for cases where the original DICOMs do not have the necessary information (looking at you, GE!)
+copy_slice_order_fields()
+{
+  local infile=$1
+  local outfile=$2
+  local outfile_nogz="$(dirname $2)/$(basename $2 .gz)"
+
+  local hdrinfo=$(mktemp)
+
+  afni nifti_tool -disp_hdr -infiles ${infile} > ${hdrinfo}
+
+  # First copy fields that we know we have in all our NIfTIs because dcm2image puts them there.
+  local mod_fields=""
+  for f in dim_info; do
+    mod_fields+=" -mod_field $f $(fgrep $f ${hdrinfo} | gawk '{print $4}')"
+  done
+
+  # Now, depending on whether they were in the DICOMs, either copy from initial NIfTIs or set defaults
+  local slice_code=$(fgrep slice_code ${hdrinfo} | gawk '{print $4}')
+  if [ "${slice_code}" != "0" ]; then
+    for f in slice_code slice_start slice_end slice_duration; do
+      mod_fields="${mod_fields} -mod_field $f $(fgrep $f ${hdrinfo} | gawk '{print $4}')"
+    done
+  else
+    # Where missing, use what we know the parameters to be based on the protocol definition: interleaved/alternating, increasing, slice duration = 2.2s / 32 slices
+    mod_fields="${mod_fields} -mod_field slice_code 3 -mod_field slice_start 0 -mod_field slice_end 31 -mod_field slice_duration 0.06875"
+  fi
+  
+  if [ ${outfile} != ${outfile_nogz} ]; then
+    gzip -d ${outfile}
+  fi
+
+  afni nifti_tool -overwrite -mod_hdr -infiles ${outfile_nogz} ${mod_fields}
+
+  if [ ${outfile} != ${outfile_nogz} ]; then
+    gzip -9f ${outfile_nogz}
+  fi
+
+  rm $hdrinfo
+}
+
+function printImageFileInfo
+{ 
+  local FILE=$1
+  local ENTROPYFLAG="$2"
+  if [ -e $FILE -o -e ${FILE}.gz ]; then 
+    local logFile="${FILE%%.*}.log"
+    echo "SVN,TYPE,DIM X,DIM Y,DIM Z,DIM T,PIX X,PIX Y,PIX Z,PIX T,min Intensity,max Intensity,min of 98% Intensity,max of 98% Intensity,Entropy" > $logFile 
+    TYPE="`fsl fslhd $FILE | grep datatype | sed 's/datatype//g'| tr -d ' '`"
+    # DIM=`fsl fslhd $FILE | grep dim | head -5 | tail -4 | sed 's/dim//g' | sed 's/.//' | tr '\n' ',' | tr -d ' '` 
+    # PIX=`fsl fslhd $FILE | grep pixdim | head -5 | tail -4 | sed 's/pixdim//g' | sed 's/.//' | tr '\n' ',' | tr -d ' '` 
+    DIM="$(fsl fslval $FILE dim1),$(fsl fslval $FILE dim2),$(fsl fslval $FILE dim3),$(fsl fslval $FILE dim4),"
+    DIM=$(echo "$DIM" | tr -d '[:space:]')
+
+    PIX="$(fsl fslval $FILE pixdim1),$(fsl fslval $FILE pixdim2),$(fsl fslval $FILE pixdim3),$(fsl fslval $FILE pixdim4),"
+    PIX=$(echo "$PIX" | tr -d '[:space:]')
+    INTAbsolute=`fsl fslstats $FILE -R | tr ' ' ','`
+    INTRelative=`fsl fslstats $FILE -r | tr ' ' ','`
+    if [ "${ENTROPYFLAG}" == "1" ]; then 
+      ENTROPY=`fsl fslstats $FILE -E | tr -d ' '`
+    else 
+      ENTROPY=""
+    fi 
+    echo "${SVN_VERSION},${TYPE},${DIM}${PIX}${INTAbsolute}${INTRelative}${ENTROPY}" >> $logFile  
+  fi 
+}
+
+function checkLabelMap
+{
+  labelMap=${1%.gz}
+  if [ ! -e $labelMap -a  ! -e ${labelMap}.gz ] ; then 
+    echo 1
+    return  
+  fi   
+  # log file created after manually or automatic checking maps for failure 
+  labelFailLog=${labelMap%.nii}.failed
+  if [ -e ${labelFailLog} ]; then 
+    echo 1 
+    return
+  fi
+
+  maxVal=`fsl fslstats $labelMap -R | cut -d ' ' -f 2`
+  if [ "$(awk -vn1=${maxVal} 'BEGIN{print (n1 > 0)}')" -eq 0 ]; then 
+    echo "Map only has zero entries - epi_reg most likely failed to register bold to t1 scan." > $labelFailLog
+    echo  1
+    return 
+  fi  
+
+  echo 0
+}
+
+get_echo_time()
+{
+  local xml_file=$(echo $1 | sed 's/\.nii.*/\.nii\.xml/g')
+  fgrep dicom:EchoTime ${xml_file} | sed 's/\s*<[^<]*>\s*//g'
+}
+
+
+smoothing_with_mask(){
+   sigma=$1
+   file=$2
+   mask=$3
+   output=$4
+   tmp=$(mktemp -d)
+   
+   # mask and smooth data
+   c3d c3d ${file} ${mask} -multiply -type float -o ${tmp}/a.nii.gz
+   fsl fslmaths ${tmp}/a.nii.gz -s ${sigma}  ${tmp}/b.nii.gz
+   
+   # compute smoothed mask
+   fsl fslmaths ${mask} -s ${sigma}  ${tmp}/ms.nii.gz
+
+   # divide smoothed data by smoothed mask and mask output   
+   c3d c3d ${tmp}/ms.nii.gz ${tmp}/b.nii.gz -divide -type float -o ${tmp}/c.nii.gz
+   c3d c3d ${tmp}/c.nii.gz ${mask}  -multiply -type float -o ${output}
+   
+   rm -r ${tmp}
+}
+ 
+smoothing_with_mask4d(){
+   sigma=$1
+   file=$2
+   mask=$3
+   output=$4
+   if [ "$output" == "" ]; then 
+       echo "ERROR:$WORKDIR:smoothing_with_mask4d not correctly called!"
+       exit 1
+   fi 
+
+   tmp=$(mktemp -d)
+   
+   # mask and smooth data
+   afni 3dcalc -a ${file} -b ${mask} -expr 'a*bool(b)' -prefix ${tmp}/a.nii.gz
+   fsl fslmaths ${tmp}/a.nii.gz -s ${sigma}  ${tmp}/b.nii.gz
+   
+   # compute smoothed mask
+   fsl fslmaths ${mask} -s ${sigma}  ${tmp}/ms.nii.gz
+
+   # divide smoothed data by smoothed mask and mask output   
+   afni 3dcalc -a  ${tmp}/b.nii.gz -b ${tmp}/ms.nii.gz -expr 'a/b' -prefix ${tmp}/c.nii.gz
+   afni 3dcalc -a  ${tmp}/c.nii.gz -b ${mask} -expr 'a*bool(b)' -prefix ${output}
+   
+   rm -r ${tmp}
+}
+
+#
+# Step A 1: Align t1 images to fieldmap space
+#
+
+t1_brain=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain.nii.gz)
+t1_brainmask=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain_mask.nii.gz)
+t1_seg=$(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg.nii.gz)
+
+# fieldmap magnitude
+magnitude_images=$(LWDP_get_override_files_list ${RESTING_DIR}/native/fieldmap/fieldmap-magnitude-1.nii.gz ${RESTING_DIR}/native/fieldmap/fieldmap-magnitude-2.nii.gz)
+declare -a magnitude_array=(${magnitude_images})
+fieldmap_mag=${RESTING_DIR}/fieldmap/magnitude_average.nii.gz
+if LWDP_needs_update_and_lock ${fieldmap_mag} ${magnitude_array[0]} ${magnitude_array[1]}; then
+  cmtk imagemath --in ${magnitude_array[0]} ${magnitude_array[1]} --average --out ${fieldmap_mag}
+  LWDP_lockfile_delete ${fieldmap_mag}
+fi
+if [ ! -e ${fieldmap_mag} ]; then
+  echo "ERROR: ${WORKDIR}: Creating average magnitude map ${fieldmap_mag} failed!"
+  exit 1
+fi
+
+# align fieldmap with t1 
+fieldmap_to_t1_pfx=${RESTING_DIR}/registration/fieldmap_to_t1/ants_
+fieldmap_to_t1_affine=${fieldmap_to_t1_pfx}0GenericAffine.mat
+if LWDP_needs_update_and_lock ${fieldmap_to_t1_affine} ${t1_mrbias} ${fieldmap_mag}; then
+  log_out=${fieldmap_to_t1_pfx}0GenericAffine.log
+  ants antsRegistration -d 3 -u -w [0.005,0.995] -r [${fieldmap_mag},${t1_mrbias},1] -t Rigid[0.001] -m MI[${fieldmap_mag},${t1_mrbias},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.001] -m MI[${fieldmap_mag},${t1_mrbias},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${fieldmap_to_t1_pfx} > ${log_out}
+  LWDP_lockfile_delete ${fieldmap_to_t1_affine}
+fi
+
+t1_brainmask_aligned_to_fieldmap=${RESTING_DIR}/reslice/fieldmap/t1_brain_mask.nii.gz
+if LWDP_needs_update_and_lock ${t1_brainmask_aligned_to_fieldmap} ${fieldmap_mag} ${t1_brainmask} ${fieldmap_to_t1_affine}; then
+  ants antsApplyTransforms -n NearestNeighbor -i ${t1_brainmask} -r ${fieldmap_mag} -o ${t1_brainmask_aligned_to_fieldmap} -t ${fieldmap_to_t1_affine}
+  c3d c3d ${t1_brainmask_aligned_to_fieldmap} -type short -o ${t1_brainmask_aligned_to_fieldmap}
+  LWDP_lockfile_delete ${t1_brainmask_aligned_to_fieldmap}
+fi
+#
+# estimate brain mask using bet
+fieldmap_mag_mask=${RESTING_DIR}/fieldmap/magnitude_average_mask.nii.gz
+if LWDP_needs_update_and_lock ${fieldmap_mag_mask} ${fieldmap_mag}; then
+  fsl bet ${fieldmap_mag} ${RESTING_DIR}/fieldmap/magnitude_average -m -f 0.5 -g -0.0 -n
+  LWDP_lockfile_delete ${fieldmap_mag_mask}
+fi
+
+t1_brainmask_aligned_to_fieldmap_dice=${RESTING_DIR}/reslice/fieldmap/t1_brain_mask.dice
+# check overlap between bet mask and aligned mask
+if LWDP_needs_update_and_lock ${t1_brainmask_aligned_to_fieldmap_dice} ${t1_brainmask_aligned_to_fieldmap} ${fieldmap_mag_mask}; then
+   c3d c3d ${t1_brainmask_aligned_to_fieldmap} ${fieldmap_mag_mask} -overlap 1 | cut -d "," -f 5 | tr -d " " > ${t1_brainmask_aligned_to_fieldmap_dice}
+   LWDP_lockfile_delete ${t1_brainmask_aligned_to_fieldmap_dice}
+fi
+
+dice=`cat ${t1_brainmask_aligned_to_fieldmap_dice}`
+if [ $(echo "${dice} < 0.9" | bc) -eq 1 ]; then
+  # MSG="ERROR:${WORKDIR}:failed to process restingstate as there was insufficient overlap between bet mask ${t1_brainmask_aligned_to_fieldmap} and aligned mask ${fieldmap_mag_mask} (dice = ${dice} < 0.9)! Most likely affine registration failed, i.e., ${fieldmap_to_t1_affine} ."
+  # Mask of field map does not work for SRI scans acquired since 2023  
+  echo "WARNING:$WORKDIR:overlap between t1-based mask aligned to fieldmap and fieldmap mask is low (dice = ${dice} < 0.9)!"
+  # echo "${MSG}" | ncanda_error_email ${WORKDIR}
+  # exit 1
+fi
+
+t1_aligned_to_fieldmap=${RESTING_DIR}/reslice/fieldmap/t1.nii.gz
+if LWDP_needs_update_and_lock ${t1_aligned_to_fieldmap} ${fieldmap_mag} ${t1_mrbias} ${fieldmap_to_t1}; then
+  ants antsApplyTransforms -n BlackmanWindowedSinc -i ${t1_mrbias} -r ${fieldmap_mag} -o ${t1_aligned_to_fieldmap} -t ${fieldmap_to_t1_affine}
+  c3d c3d ${t1_aligned_to_fieldmap} -clip 0 inf -type float -o ${t1_aligned_to_fieldmap}
+  LWDP_lockfile_delete ${t1_aligned_to_fieldmap}
+fi
+t1_brain_aligned_to_fieldmap=${RESTING_DIR}/reslice/fieldmap/t1_brain.nii.gz
+if LWDP_needs_update_and_lock ${t1_brain_aligned_to_fieldmap} ${fieldmap_mag} ${t1_aligned_to_fieldmap} ${t1_brainmask_aligned_to_fieldmap}; then
+  c3d c3d ${t1_aligned_to_fieldmap} ${t1_brainmask_aligned_to_fieldmap} -multiply -type float -o ${t1_brain_aligned_to_fieldmap}
+  LWDP_lockfile_delete ${t1_brain_aligned_to_fieldmap}
+fi
+t1_seg_aligned_to_fieldmap=${RESTING_DIR}/reslice/fieldmap/t1_seg.nii.gz
+if LWDP_needs_update_and_lock ${t1_seg_aligned_to_fieldmap} ${fieldmap_mag} ${t1_seg} ${fieldmap_to_t1_affine}; then
+  ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${t1_seg} -r ${fieldmap_mag} -o ${t1_seg_aligned_to_fieldmap} -t ${fieldmap_to_t1_affine}
+  c3d c3d ${t1_seg_aligned_to_fieldmap} -type short -o ${t1_seg_aligned_to_fieldmap}
+  LWDP_lockfile_delete ${t1_seg_aligned_to_fieldmap}
+fi
+
+magnitude_brain=${RESTING_DIR}/fieldmap/magnitude_brain.nii.gz
+if LWDP_needs_update_and_lock ${magnitude_brain} ${fieldmap_mag} ${t1_brainmask_aligned_to_fieldmap}; then
+  c3d c3d ${fieldmap_mag} ${t1_brainmask_aligned_to_fieldmap} -multiply -type float -o ${magnitude_brain}
+  LWDP_lockfile_delete ${magnitude_brain}
+fi
+
+#
+# Step A 2: Create fieldmap
+#
+
+# fieldmap processing
+phase_image=$(LWDP_get_override_file ${RESTING_DIR}/native/fieldmap/fieldmap-phase.nii.gz)
+if [ "${SITE}" == "A" -o "${SITE}" == "D" ]; then
+  if [ -s "${phase_image}" ]; then
+    # If we have a phase image (Siemens), use it in fsl_prepare_fieldmap
+    fieldmap=${RESTING_DIR}/fieldmap/fieldmap.nii.gz
+    if LWDP_needs_update_and_lock ${fieldmap} ${phase_image} ${magnitude_brain} ${magnitude_array[0]} ${magnitude_array[1]}; then
+      te1=$(get_echo_time ${magnitude_array[0]})
+      te2=$(get_echo_time ${magnitude_array[1]})
+      delta_te=$(eval dc --expression=\"${te2} ${te1} - p\" | sed 's/^-//g')
+      fsl fsl_prepare_fieldmap SIEMENS ${phase_image} ${magnitude_brain} ${fieldmap} ${delta_te}
+      LWDP_lockfile_delete ${fieldmap}
+    fi
+  else
+    echo "ERROR: ${WORKDIR}: ${phase_image} is missing! Cannot compute fieldmap."
+    exit 1
+  fi
+else
+  # If we do NOT have a phase image, i.e. it is a GE scan, use the real and imaginary images instead in prelude
+  # Additional documentation can be found at https://neuro.sri.com/labwiki/index.php/Generate_Fieldmap_and_Apply_to_RS_Sequence_Acquired_on_GE_Scanner#Step_1:_Transform_Gradientfield_into_Complex_Sequence
+  real_images=$(LWDP_get_override_files_list ${RESTING_DIR}/native/fieldmap/fieldmap-real-1.nii.gz ${RESTING_DIR}/native/fieldmap/fieldmap-real-2.nii.gz)
+  declare -a real_array=(${real_images})
+  imag_images=$(LWDP_get_override_files_list ${RESTING_DIR}/native/fieldmap/fieldmap-imaginary-1.nii.gz ${RESTING_DIR}/native/fieldmap/fieldmap-imaginary-2.nii.gz)
+  declare -a imag_array=(${imag_images})
+
+  # djk: be cautious when using fslcpgeom as it can introduce flipping
+  # djk: this version eliminates fslcpgeom using afni functions
+  phasemap_unwrapped=${RESTING_DIR}/fieldmap/phasemap_unwrapped.nii.gz
+  if LWDP_needs_update_and_lock ${phasemap_unwrapped} ${real_array[0]} ${imag_array[0]} ${real_array[1]} ${imag_array[1]} ${magnitude_array[0]} ${magnitude_array[1]} ${t1_brainmask_aligned_to_fieldmap}; then
+    tmpdir=$(mktemp -d)
+
+    if [ "${SITE}" == "C" ]; then
+      cmtk imagemath --in ${real_array[1]} ${imag_array[1]} ${real_array[0]} ${imag_array[0]} --complex-div --out ${tmpdir}/fmap_i.nii.gz --pop --out ${tmpdir}/fmap_r.nii.gz
+    else
+      # djk: reverted the order (to torsten's last version r1497) for site B and E as computed fieldmap has reversed sign
+      cmtk imagemath --in ${real_array[0]} ${imag_array[0]} ${real_array[1]} ${imag_array[1]} --complex-div --out ${tmpdir}/fmap_i.nii.gz --pop --out ${tmpdir}/fmap_r.nii.gz
+    fi
+    if [ ! -e ${tmpdir}/fmap_r.nii.gz ] || [ ! -e ${tmpdir}/fmap_i.nii.gz ]; then
+      echo "ERROR: ${WORKDIR}: cmtk imagemath has failed"
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${phasemap_unwrapped}
+      exit 1
+    fi
+
+    afni 3dcalc -a ${tmpdir}/fmap_r.nii.gz -b ${tmpdir}/fmap_i.nii.gz -expr 'atan2(b,a)' -prefix ${tmpdir}/fmap_p.nii.gz
+    afni 3dcalc -a ${tmpdir}/fmap_r.nii.gz -b ${tmpdir}/fmap_i.nii.gz -expr 'sqrt(a^2+b^2)' -prefix ${tmpdir}/fmap_m.nii.gz
+
+    fsl prelude -a ${tmpdir}/fmap_m.nii.gz -p ${tmpdir}/fmap_p.nii.gz -u ${phasemap_unwrapped} -m ${t1_brainmask_aligned_to_fieldmap} -f
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${phasemap_unwrapped}
+  fi
+
+  fieldmap=${RESTING_DIR}/fieldmap/fieldmap.nii.gz
+  if LWDP_needs_update_and_lock ${fieldmap} ${phasemap_unwrapped}; then
+    tmpdir=$(mktemp -d)
+
+    # transform unwarped phasemap into rad/s
+    te1=$(get_echo_time ${magnitude_array[0]})
+    te2=$(get_echo_time ${magnitude_array[1]})
+    delta_te_sec=`python3 -c "print (abs(${te2} - ${te1})/1000.0)"`
+    if [ "$(awk -vn1=${delta_te_sec} 'BEGIN{print (n1!=0)?1:0 }')" -eq 1 ]; then
+      fsl fslmaths ${phasemap_unwrapped} -div ${delta_te_sec} ${tmpdir}/fieldmap_1.nii.gz -odt float
+      fsl fugue --loadfmap=${tmpdir}/fieldmap_1.nii.gz --savefmap=${tmpdir}/fieldmap_2.nii.gz --mask=${t1_brainmask_aligned_to_fieldmap} -m
+    else
+      echo "ERROR:${WORKDIR}: Cannot process restingstate as delta_te_sec = ${delta_te_sec} (te1: ${te1}; te2: ${te2}) and thus was unable to compute fieldmap."
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${fieldmap}
+      exit 1
+    fi
+
+    # demean
+    fieldmap_P50=`fsl fslstats ${tmpdir}/fieldmap_2.nii.gz -k ${t1_brainmask_aligned_to_fieldmap} -P 50`
+    fsl fslmaths ${tmpdir}/fieldmap_2.nii.gz -sub ${fieldmap_P50} -mas ${t1_brainmask_aligned_to_fieldmap} ${tmpdir}/fieldmap_3.nii.gz -odt float
+
+    # clean up edge voxels
+    fsl fugue --loadfmap=${tmpdir}/fieldmap_3.nii.gz --savefmap=${tmpdir}/fieldmap_4.nii.gz --mask=${t1_brainmask_aligned_to_fieldmap} --despike --despikethreshold=2.1
+    fsl fslmaths ${t1_brainmask_aligned_to_fieldmap} -kernel 2D -ero ${tmpdir}/mask.nii.gz
+    fsl fslmaths ${t1_brainmask_aligned_to_fieldmap} -sub ${tmpdir}/mask.nii.gz -thr 0.5 -bin ${tmpdir}/mask_edge.nii.gz
+    fsl fslmaths ${tmpdir}/fieldmap_4.nii.gz -mas ${tmpdir}/mask_edge.nii.gz ${tmpdir}/fieldmap_5.nii.gz
+    fsl fslmaths ${tmpdir}/fieldmap_3.nii.gz -mas ${tmpdir}/mask.nii.gz -add ${tmpdir}/fieldmap_5.nii.gz ${fieldmap}
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${fieldmap}
+  fi
+fi
+fieldmap=$(LWDP_get_override_file ${RESTING_DIR}/fieldmap/fieldmap.nii.gz)
+
+#
+# Step A 3: Prepare bold images
+#
+
+# Make list of input 3D volumes - drop the first "DROPVOLUMES" frames
+bold_native_list=$(ls ${WORKDIR}/restingstate/native/rs-fMRI/bold-*.nii* | sort | fgrep -v xml | tail -n+$((${DROPVOLUMES}+1)))
+bold_native=`echo ${bold_native_list} | cut -d " " -f1`
+bold_xml=`echo ${bold_native} | rev | cut -d "." -f2- | rev`.xml
+bold_xml=$(LWDP_get_override_file ${bold_xml})
+
+# Get the TR from sidecar file
+bold_tr=$(fgrep RepetitionTime ${bold_xml} | sed 's/\s*<[^<]*>\s*//g')
+if [ -z "${bold_tr}" ]; then
+  echo "ERROR:${WORKDIR}: could not read repetition time from ${bold_xml}."
+  exit 1
+fi
+bold_tr_sec=`python3 -c "print (${bold_tr}/1000.0)"`
+
+# Get the dwell time from XML sidecar file
+bold_dwelltime=$(fgrep dwellTime ${bold_xml} | sed 's/\s*<[^<]*>\s*//g')
+if [ -z "${bold_dwelltime}" ]; then
+  # Phantoms have xml files with DwellTime flag 
+  bold_dwelltime=$(fgrep DwellTime ${bold_xml} | sed 's/\s*<[^<]*>\s*//g')
+  if [ -z "${bold_dwelltime}" ]; then
+    echo "ERROR:${WORKDIR}: could not read dwell time from ${bold_xml}."
+    exit 1
+  fi
+fi
+
+# Kilian: Siemens and GE scanners spit out their bolds (native/rs-fMRI/bold-*.nii) in different data types (one does signed short, and the other one does unsigned short)
+# to unify analysis put everything in signed integer, which otherwise happens at some point when creating the unwarped bold images anyway as fsl turns unsigned short to integer!
+bold_4d=${RESTING_DIR}/bold/1_prepared/bold_4d.nii.gz
+if LWDP_needs_update_and_lock ${bold_4d} ${bold_native} ${bold_native_list}; then
+  if [ ! -e ${bold_native} ]; then
+    echo "ERROR: ${WORKDIR}: ${bold_native} does not exist."
+    LWDP_lockfile_delete ${bold_4d}
+    exit 1
+  fi
+  # Kilian: this should be done as part of uploading data
+  # DIM=`fsl fslhd ${bold_native} | grep dim | head -4 | tail -3 | sed 's/dim//g' | sed 's/.//' | tr '\n' ',' | tr -d ' \t'`
+  # if [ "`echo $DIM | cut -d ',' -f 1`" != "64" -o "`echo $DIM | cut -d ',' -f 2`" != "64" -o "`echo $DIM | cut -d ',' -f 3`" != "32" ] ; then
+  #   echo "ERROR: ${WORKDIR}: Dimension ($DIM) of bold files is not correct!"
+  #   LWDP_lockfile_delete ${bold_4d}
+  #   exit 1
+  # fi
+  # 05/18/26: Updated to use fslval:
+  dim1=$(fsl fslval ${bold_native} dim1 | tr -d '[:space:]')
+  dim2=$(fsl fslval ${bold_native} dim2 | tr -d '[:space:]')
+  dim3=$(fsl fslval ${bold_native} dim3 | tr -d '[:space:]')
+
+  if [ "${dim1}" != "64" ] || [ "${dim2}" != "64" ] || [ "${dim3}" != "32" ]; then
+    echo "ERROR: ${WORKDIR}: Dimension (${dim1},${dim2},${dim3}) of bold files is not correct!"
+    LWDP_lockfile_delete ${bold_4d}
+    exit 1
+  fi
+  oDIM=`echo ${bold_native_list} | wc -w`
+  DIM=`python3 -c "print (${oDIM} + ${DROPVOLUMES})"`
+  if [ "${DIM}" != "274" -a "${DIM}" != "275" -a  "${DIM}" != "330" ]; then
+    echo "ERROR: ${WORKDIR}: Number of bold files ($DIM) is not correct - should be 274, 275, or 330!"
+    LWDP_lockfile_delete ${bold_4d}
+    exit 1
+  fi
+
+  tmpdir=$(mktemp -d)
+
+  bold_prepared_list=
+  index=1
+  for volume in ${bold_native_list}; do
+    index_f=`printf "%03d" ${index}`
+    # djk: let's resample bold into 96x96x64 (2.5mm isotropic) space with float data type
+    c3d c3d ${volume} -interpolation Sinc -resample 96x96x64vox -clip 0 inf -type float -o ${tmpdir}/bold-${index_f}.nii.gz
+    bold_prepared_list="${bold_prepared_list} ${tmpdir}/bold-${index_f}.nii.gz"
+    #bold_prepared_list="${bold_prepared_list} ${volume}"
+    let index++
+  done
+
+  fsl fslmerge -tr ${bold_4d} ${bold_prepared_list} ${bold_tr_sec}
+  # djk: this slice information is not used in the following procedures
+  #copy_slice_order_fields ${bold_native} ${bold_4d}
+  printImageFileInfo ${bold_4d} 0
+
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${bold_4d}
+fi 
+
+#
+# Step A 4: Motion correction using mcflirt
+#
+
+# Doc for mcflirt concerning the -meanvol flag
+
+#MCFLIRT loads the time-series in its entirity and will default to the middle volume as an initial template image. A coarse 8mm search for the motion 
+#parameters is then carried out using the cost function specified followed by two subsequent searches at 4mm using increasingly tighter tolerances. 
+#All optimizations use trilinear interpolation.
+
+#As part of the initial 8mm search, an identity transformation is assumed between the middle volume and the adjacent volume. The transformation found in 
+#this first search is then used as the estimate for the transformation between the middle volume and the volume beyond the adjacent one. This scheme should 
+#lead to much faster optimization and greater accuracy for the majority of studies where subject motion is minimal. In the pathalogical cases, this scheme 
+#does not penalise the quality of the final correction.
+
+#If mean registration is used, the curent motion correction parameters are applied to the time-series, the volumes are averaged to create a new template 
+#image and the same 3-stage correction is carried out using this new mean image as a template. 
+
+#mcflirt_output=${RESTING_DIR}/bold/2_motion_corrected/bold_mcf.nii.gz
+bold_mean=${RESTING_DIR}/bold/2_motion_corrected/bold_mcf_mean.nii.gz
+motion_par=${RESTING_DIR}/bold/2_motion_corrected/bold_mcf.par
+if LWDP_needs_update_and_lock ${bold_mean} ${bold_4d}; then
+  tmpdir=$(mktemp -d)
+
+  # Torsten: fsl mcflirt -out ${RESTING_DIR}/mcflirt/bold_unwarped_mcf -in ${bold_unwarped} -cost normcorr -spline_final -mats -plots -report -dof 6 -meanvol
+  # note: If it does not work well change -refvol 0 to -refvol 7 or -meanvol just for motion correction and rerun it with -refvol 0 to compute motion estimates needed for ART 
+
+  # running it twice - first time to compute mean image 
+  # second time to motion correction 
+  # basically no difference to running it ones 
+
+  # these setttings  created more outliers than the default value (median time series) 
+  # fsl mcflirt -out ${tmpdir}/bold_mcf -in ${bold_4d} -refvol 0 -cost normcorr -spline_final -mats -plots -dof 6 
+  # fsl mcflirt -out ${tmpdir}/bold_mcf -in ${bold_4d} -meantilsuvol -cost normcorr -spline_final -mats -plots -dof 6 
+  # middle one  (default) 
+
+  fsl mcflirt -out ${tmpdir}/bold_mcf -in ${bold_4d} -cost normcorr -spline_final -mats -plots -dof 6 
+
+  #fsl fslmaths ${tmpdir}/bold_mcf.nii.gz -thr 0 ${mcflirt_output} -odt input
+  #printImageFileInfo ${mcflirt_output} 0
+
+  rm -rf ${RESTING_DIR}/bold/2_motion_corrected/bold_mcf.mat
+  mv ${tmpdir}/bold_mcf.mat ${RESTING_DIR}/bold/2_motion_corrected/bold_mcf.mat
+  mv ${tmpdir}/bold_mcf.par ${motion_par}
+
+  chmod -R a+rx ${RESTING_DIR}/bold/2_motion_corrected/bold_mcf.mat
+
+  # Create mean bold image for mcf 
+  fsl fslmaths ${tmpdir}/bold_mcf.nii.gz -Tmean ${bold_mean} 
+  printImageFileInfo ${bold_mean} 1
+
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${bold_mean}
+fi
+
+#
+# Step A 5: Fieldmap to bold alignment using epi_reg
+#
+
+warp_dir=y
+
+fieldmap_to_bold_pfx=${RESTING_DIR}/registration/fieldmap_to_bold/epi_reg
+fieldmap_to_bold_affine=${fieldmap_to_bold_pfx}.mat
+if LWDP_needs_update_and_lock ${fieldmap_to_bold_affine} ${t1_seg_aligned_to_fieldmap} ${bold_mean} ${t1_aligned_to_fieldmap} ${t1_brain_aligned_to_fieldmap} ${fieldmap}; then
+  # djk: create epi_reg_fast_wmseg.nii.gz file to turn around a bug of epi_reg (fsl 5.0.6)
+  cmtk convertx --map-values-only 3:1 --replace-padding 0 --labels ${t1_seg_aligned_to_fieldmap} ${fieldmap_to_bold_pfx}_fast_wmseg.nii.gz
+  # we're using t1 aligned to fieldmap (--nofmapreg)
+  fsl_epi_reg --epi=${bold_mean} --t1=${t1_aligned_to_fieldmap} --t1brain=${t1_brain_aligned_to_fieldmap} --wmseg=${fieldmap_to_bold_pfx}_fast_wmseg.nii.gz --pedir=${warp_dir} --fmap=${fieldmap} --fmapmag=${t1_aligned_to_fieldmap} --fmapmagbrain=${t1_brain_aligned_to_fieldmap} --nofmapreg --noclean -v --echospacing=${bold_dwelltime} --out=${fieldmap_to_bold_pfx} >& ${fieldmap_to_bold_pfx}.log
+  # djk: remove dangling link
+  rm -f ${fieldmap_to_bold_pfx}_fast_wmseg
+  LWDP_lockfile_delete ${fieldmap_to_bold_affine}
+fi
+# convert fsl mtx to itk tfm
+fieldmap_to_bold_affine_tfm=${fieldmap_to_bold_pfx}.tfm
+if LWDP_needs_update_and_lock ${fieldmap_to_bold_affine_tfm} ${fieldmap_to_bold_affine} ${bold_mean} ${fieldmap_mag}; then
+  c3d c3d_affine_tool -ref ${fieldmap_mag} -src ${bold_mean} ${fieldmap_to_bold_affine} -fsl2ras -oitk ${fieldmap_to_bold_affine_tfm}
+  LWDP_lockfile_delete ${fieldmap_to_bold_affine_tfm}
+fi
+
+if [ ! -e ${fieldmap_to_bold_affine_tfm} ]; then 
+    echo "ERROR:$WORKDIR:Was not able to generate ${fieldmap_to_bold_affine_tfm}. Most likely ${fieldmap_to_bold_affine} contains non-float numbers. Remove ${fieldmap_to_bold_affine} and run with fsl version 5.0.10 or higher !" 
+    exit 1
+fi 
+
+#
+# Step A 6: Create shift map & fieldmap warp 
+#
+
+shiftmap_bold=${RESTING_DIR}/fieldmap/shiftmap_bold.nii.gz
+if LWDP_needs_update_and_lock ${shiftmap_bold} ${fieldmap_to_bold_affine}; then
+  if [ ! -e ${fieldmap_to_bold_pfx}_fieldmaprads2epi_shift.nii.gz ]; then
+    echo "ERROR: ${WORKDIR}: ${fieldmap_to_bold_pfx}_fieldmaprads2epi_shift.nii.gz is required"
+    LWDP_lockfile_delete ${shiftmap_bold}
+    exit 1
+  fi
+  c3d c3d ${fieldmap_to_bold_pfx}_fieldmaprads2epi_shift.nii.gz -o ${shiftmap_bold}
+  LWDP_lockfile_delete ${shiftmap_bold}
+fi
+
+fieldmap_bold_warp=${RESTING_DIR}/fieldmap/fieldmap_bold_warp.nii.gz
+if LWDP_needs_update_and_lock ${fieldmap_bold_warp} ${bold_4d} ${shiftmap_bold}; then
+  # make a vector field bold_warp map from the shiftmap_bold using the resting state 4D data set as the ref for dimensions.   
+  fsl convertwarp -r ${bold_4d} -s ${shiftmap_bold} --shiftdir=${warp_dir} --absout -o $(echo ${fieldmap_bold_warp} | sed 's/\.nii.*//g')
+  LWDP_lockfile_delete ${fieldmap_bold_warp}
+fi
+fieldmap_bold_warp=$(LWDP_get_override_file ${RESTING_DIR}/fieldmap/fieldmap_bold_warp.nii.gz)
+
+#
+# Step A 7: Concatinate deformations and apply intensity correction 
+#
+
+final_bold_noInt=${RESTING_DIR}/bold/3_unwarped/bold_noIntenCorr_4d.nii.gz
+#
+# the '.failed' files are manually created - do not remove them unless you are sure that it is now working  
+# For the baseline scans - Eva and Dolf identified three cases in 03/2015 for which the unwarping did not work correctly   
+# you can see if things are working by comparing 
+# NCANDA_S<case>/standard/baseline/restingstate/native/rs-fMRI/bold-141.nii.gz
+# to  NCANDA_S0<case>/standard/baseline/restingstate/bold/3_unwarped/bold_noIntenCorr/bold_0135.nii.gz
+
+if [ -e ${final_bold_noInt%.nii}.failed ]; then 
+  echo "ERROR: ${WORKDIR}: Could not process restingstate as unwarping did not work correctly."
+  exit 1
+fi 
+
+if LWDP_needs_update_and_lock ${final_bold_noInt} ${bold_4d} ${bold_mean} ${fieldmap_bold_warp}; then
+  tmpdir=$(mktemp -d)
+
+  fsl fslsplit ${bold_4d} ${tmpdir}/bold- -t
+  bold_prepared_list=$(ls ${tmpdir}/bold-*.nii.gz | sort)
+ 
+  count=0
+  final_volumes=""
+  for volume in ${bold_prepared_list}; do 
+    mat=$(printf "${RESTING_DIR}/bold/2_motion_corrected/bold_mcf.mat/MAT_%04d" "${count}")
+
+    fsl applywarp -i ${volume} -r ${bold_4d} -o ${tmpdir}/final${count}.nii.gz -w ${fieldmap_bold_warp} --premat=${mat} --interp=spline
+
+    # iintensity correction map is not applied
+    #fsl fslmaths ${tmpdir}/final${count}.nii.gz -mul ${icorrmap} ${tmpdir}/final${count}.nii.gz
+
+    final_volumes="${final_volumes} ${tmpdir}/final${count}.nii.gz"
+
+    # increment the counter for the MAT_???? file name
+    let count++
+  done
+   
+  fsl fslmerge -tr ${tmpdir}/finalmerged.nii.gz ${final_volumes} ${bold_tr_sec}
+  # Make sure it is not negative 
+  fsl fslmaths ${tmpdir}/finalmerged.nii.gz -thr 0 ${final_bold_noInt} -odt input 
+
+  printImageFileInfo ${final_bold_noInt} 0
+
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${final_bold_noInt}
+fi
+
+#final_bold_noInt_3D=${RESTING_DIR}/bold/3_unwarped/bold_noIntenCorr/bold_0000.nii.gz
+#if LWDP_needs_update_and_lock ${final_bold_noInt_3D} ${final_bold_noInt}; then
+#  fsl fslsplit ${final_bold_noInt} ${RESTING_DIR}/bold/3_unwarped/bold_noIntenCorr/bold_ -t
+#  LWDP_lockfile_delete ${final_bold_noInt_3D}
+#fi
+
+# create mean final BOLD image
+final_bold_noInt_mean=${RESTING_DIR}/bold/3_unwarped/bold_noIntenCorr_mean.nii.gz
+if LWDP_needs_update_and_lock ${final_bold_noInt_mean} ${final_bold_noInt}; then
+  fsl fslmaths ${final_bold_noInt} -Tmean ${final_bold_noInt_mean}
+  printImageFileInfo ${final_bold_noInt_mean} 1
+  LWDP_lockfile_delete ${final_bold_noInt_mean}
+fi
+
+#
+# Step A 8: Transform images to bold space and perform skull stripping on bold
+#
+
+t1_aligned_to_bold=${RESTING_DIR}/reslice/bold/t1.nii.gz
+if LWDP_needs_update_and_lock ${t1_aligned_to_bold} ${bold_mean} ${t1_mrbias} ${fieldmap_to_bold_affine_tfm} ${fieldmap_to_t1_affine}; then
+  ants antsApplyTransforms -n BlackmanWindowedSinc -i ${t1_mrbias} -r ${bold_mean} -o ${t1_aligned_to_bold} -t [${fieldmap_to_bold_affine_tfm},1] ${fieldmap_to_t1_affine}
+  c3d c3d ${t1_aligned_to_bold} -clip 0 inf -type float -o ${t1_aligned_to_bold}
+  LWDP_lockfile_delete ${t1_aligned_to_bold}
+fi
+t1_brainmask_aligned_to_bold=${RESTING_DIR}/reslice/bold/t1_brain_mask.nii.gz
+if LWDP_needs_update_and_lock ${t1_brainmask_aligned_to_bold} ${bold_mean} ${t1_brainmask} ${fieldmap_to_bold_affine_tfm} ${fieldmap_to_t1_affine}; then
+  ants antsApplyTransforms -n NearestNeighbor -i ${t1_brainmask} -r ${bold_mean} -o ${t1_brainmask_aligned_to_bold} -t [${fieldmap_to_bold_affine_tfm},1] ${fieldmap_to_t1_affine}
+  c3d c3d ${t1_brainmask_aligned_to_bold} -type short -o ${t1_brainmask_aligned_to_bold}
+  LWDP_lockfile_delete ${t1_brainmask_aligned_to_bold}
+fi
+t1_brain_aligned_to_bold=${RESTING_DIR}/reslice/bold/t1_brain.nii.gz
+if LWDP_needs_update_and_lock ${t1_brain_aligned_to_bold} ${t1_aligned_to_bold} ${t1_brainmask_aligned_to_bold}; then
+  c3d c3d ${t1_aligned_to_bold} ${t1_brainmask_aligned_to_bold} -multiply -type float -o ${t1_brain_aligned_to_bold}
+  LWDP_lockfile_delete ${t1_brain_aligned_to_bold}
+fi
+t1_seg_aligned_to_bold=${RESTING_DIR}/reslice/bold/t1_seg.nii.gz
+if LWDP_needs_update_and_lock ${t1_seg_aligned_to_bold} ${bold_mean} ${t1_seg} ${fieldmap_to_bold_affine_tfm} ${fieldmap_to_t1_affine}; then
+  ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${t1_seg} -r ${bold_mean} -o ${t1_seg_aligned_to_bold} -t [${fieldmap_to_bold_affine_tfm},1] ${fieldmap_to_t1_affine}
+  c3d c3d ${t1_seg_aligned_to_bold} -type short -o ${t1_seg_aligned_to_bold}
+  LWDP_lockfile_delete ${t1_seg_aligned_to_bold}
+fi
+
+#bold_stripped=${RESTING_DIR}/bold/3_unwarped/bold_noIntenCorr_brain_4d.nii.gz
+#if LWDP_needs_update_and_lock ${bold_stripped} ${final_bold_noInt} ${t1_brainmask_aligned_to_bold}; then
+#  CMD="fsl fslmaths ${final_bold_noInt} -mul ${t1_brainmask_aligned_to_bold} ${bold_stripped} -odt input"
+#  log_and_execute "$CMD" ${bold_stripped}
+#  LWDP_lockfile_delete ${bold_stripped}
+#fi
+
+# transform wm, gm, csf mask
+for TYPE in t1_gm_parc t1_ven_parc t1_wm_parc; do 
+  inp=$(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos/${TYPE}.nii.gz)
+  out=${RESTING_DIR}/reslice/bold/${TYPE}.nii.gz
+  if LWDP_needs_update_and_lock ${out} ${inp} ${bold_mean} ${fieldmap_to_bold_affine_tfm} ${fieldmap_to_t1_affine}; then
+    ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp} -r ${bold_mean} -o ${out} -t [${fieldmap_to_bold_affine_tfm},1] ${fieldmap_to_t1_affine}
+    LWDP_lockfile_delete ${out}
+  fi
+done 
+bold_ventricle_seg=${RESTING_DIR}/reslice/bold/t1_ven_parc.nii.gz
+
+bold_wm_mask=${RESTING_DIR}/reslice/bold/wm_mask.nii.gz
+if LWDP_needs_update_and_lock ${bold_wm_mask} ${t1_seg_aligned_to_bold}; then
+  cmtk convertx --map-values-only 3:1 --replace-padding 0 --labels ${t1_seg_aligned_to_bold} ${bold_wm_mask}
+  LWDP_lockfile_delete ${bold_wm_mask}
+fi
+
+bold_gm_mask=${RESTING_DIR}/reslice/bold/gm_mask.nii.gz
+if LWDP_needs_update_and_lock ${bold_gm_mask} ${t1_seg_aligned_to_bold}; then
+  cmtk convertx --map-values-only 2:1 --replace-padding 0 --labels ${t1_seg_aligned_to_bold} ${bold_gm_mask}
+  LWDP_lockfile_delete ${bold_gm_mask}
+fi
+
+bold_csf_mask=${RESTING_DIR}/reslice/bold/csf_mask.nii.gz
+if LWDP_needs_update_and_lock ${bold_csf_mask} ${t1_seg_aligned_to_bold}; then
+  cmtk convertx --map-values-only 1:1 --replace-padding 0 --labels ${t1_seg_aligned_to_bold} ${bold_csf_mask}
+  LWDP_lockfile_delete ${bold_csf_mask}
+fi
+
+# Create Ventricle mask 
+bold_ventricle_mask=${RESTING_DIR}/reslice/bold/ventricle_mask.nii.gz
+if LWDP_needs_update_and_lock ${bold_ventricle_mask} ${bold_ventricle_seg}; then
+  tmpdir=$(mktemp -d)
+  # make it a mask 
+  cmtk convertx --thresh-above 1.0 --dilate 1 --char --labels ${bold_ventricle_seg} ${tmpdir}/bold_ventricles.nii.gz
+  # multiply with csf 
+  cmtk imagemath --in ${tmpdir}/bold_ventricles.nii.gz ${bold_csf_mask} --mul --out ${bold_ventricle_mask}
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${bold_ventricle_mask} 
+fi
+
+# Ventricle+White Matter Mask 
+bold_ventricle_whitematter_mask=${RESTING_DIR}/reslice/bold/wm_ven_mask.nii.gz
+if LWDP_needs_update_and_lock ${bold_ventricle_whitematter_mask} ${bold_ventricle_mask} ${bold_wm_mask}; then
+  tmpdir=$(mktemp -d)
+  # merge with venticle mask 
+  cmtk imagemath --in ${bold_ventricle_mask} ${bold_wm_mask} --add --out ${tmpdir}/wm_ven_mask.nii.gz
+  # make it a mask 
+  cmtk convertx --thresh-above 1.0 --char --labels ${tmpdir}/wm_ven_mask.nii.gz ${bold_ventricle_whitematter_mask} 
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${bold_ventricle_whitematter_mask} 
+fi
+
+#
+# Step B: Perform RS Specific Processing
+#
+
+#artifact_detection_dir=${RESTING_DIR}/debug/artifact
+#artifact_detection=${artifact_detection_dir}/regression.`basename ${final_bold_noInt} | cut -d '.' -f 1`_outliers.txt
+#if LWDP_needs_update_and_lock ${artifact_detection} ${final_bold_noInt} ${bold_brainmask} ${motion_par} ; then
+#    CMD="${NCANDA_SOURCE_DIR}/utils/rsFMRI_artifact_detection --bold ${final_bold_noInt} --mask ${bold_brainmask} --motion_file ${motion_par} -z 5 -n 0.3 --output_dir ${artifact_detection_dir}"
+#    log_and_execute "$CMD" ${artifact_detection_dir}/art.cmd
+#    LWDP_lockfile_delete ${artifact_detection}
+#fi
+
+bold_brainmask=${t1_brainmask_aligned_to_bold}
+if [ -e  ${bold_brainmask%.nii}.failed ]; then 
+  maxVal=`fsl fslstats ${bold_brainmask} -R | cut -d ' ' -f 2`
+  if [ "$(awk -vn1=${maxVal} 'BEGIN{print (n1 > 0)}')" -eq 0 ]; then 
+    echo "ERROR:${WORKDIR}: Map only has zero entries - epi_reg most likely failed to register bold to t1 scan."
+    exit 1
+  fi  
+  # catch other failed cases later to see if it had a lot of outliers 
+else
+  if [ `checkLabelMap ${bold_brainmask}` -eq 1 ]; then 
+    echo "ERROR:${WORKDIR}: Brain mask for bold scan incorrect. Brain mask for t1 scan not defined." 
+    exit 1
+  fi 
+fi 
+
+rs_specific_processing=${RESTING_DIR}/rs_specific_processing/timeseries/bold_noIntenCorr_4d_filtermotart_cleaned_bp.nii.gz
+if LWDP_needs_update_and_lock ${rs_specific_processing} ${final_bold_noInt} ${motion_par} ${bold_brainmask} ${bold_ventricle_whitematter_mask}; then
+  tmpdir=${RESTING_DIR}/rs_specific_processing/debug
+  DebugDir=${tmpdir}/rs_specific_processing_${SUBJECT}
+
+  export NIPYPE_CRASH_DIR=${DebugDir}
+  caseDir=`echo $WORKDIR | sed 's/\(NCANDA_S[0-9]\{5\}\).*$/\1/' | xargs dirname `
+  CMD="${NCANDA_SOURCE_DIR}/utils/rsfmri_specific_preprocessing.py -c ${caseDir} -s ${SUBJECT} -a ${ARM} -v ${VISIT} --bold_unwarped ${final_bold_noInt#${RESTING_DIR}/} --motion_params ${motion_par#${RESTING_DIR}/} --brain_mask ${bold_brainmask#${RESTING_DIR}/} --wm_vent_mask ${bold_ventricle_whitematter_mask#${RESTING_DIR}/} -w ${tmpdir} -t ${bold_tr_sec} -o ${RESTING_DIR} -m MultiProc"
+  
+  log_and_execute "$CMD" ${rs_specific_processing} >& ${RESTING_DIR}/rs_specific_processing/timeseries/bold_noIntenCorr_4d_filtermotart_cleaned_bp.log 
+
+  if [ -e ${rs_specific_processing} ] ; then 
+    if [ "$(ls -A ${tmpdir} | wc -l)" -gt 1 ]; then 
+      rm -rf ${DebugDir}
+    else 
+      rm -rf ${tmpdir} 
+    fi  
+  else  
+    # did not run through so save all outputs to debug folder  
+    logFile=${RESTING_DIR}/rs_specific_processing/timeseries/bold_noIntenCorr_4d_filtermotart_cleaned_bp.log
+    echo "ERROR:${WORKDIR}: Did not complete correctly - review ${DebugDir} and ${logFile}."
+    LWDP_lockfile_delete ${rs_specific_processing}
+    exit 1
+  fi 
+
+  LWDP_lockfile_delete ${rs_specific_processing}
+fi
+
+art_outliers=${RESTING_DIR}/rs_specific_processing/qa/art/art.bold_noIntenCorr_4d_outliers.txt
+if [ -e $art_outliers ]; then 
+  numOutliers=`cat ${art_outliers} | wc -l`
+  if [ "$numOutliers" -gt "$MAX_NUM_OUTLIERS"  ]; then 
+    echo "ERROR:${WORKDIR}: art detected in ${RESTING_DIR} more than 20% outliers (${numOutliers}). Stop processing of restingstate."
+    exit 1
+  fi   
+else 
+  echo "ERROR:${WORKDIR}: ${art_outliers} is missing."
+  exit 1
+fi
+
+# To stop the processing due to bad mask at this point and not earlier is to check out if the bad mask was due to large motion 
+# The masked were manually checked 
+if [ -e ${bold_brainmask%.nii}.failed ]; then 
+  echo "ERROR:${WORKDIR}: Quality of ${bold_brainmask} too low. Check  ${bold_brainmask%.nii}.failed for reason."
+  exit 1 
+fi
+
+#
+# Reslice into template space 
+#
+
+#
+# old way of registering to the sri24 atlas by registering mean bold to t1-> t1 to t1 baseline -> t1 baseline to sri24 atlas 
+#
+if false; then 
+  bold_processed_name=`basename ${rs_specific_processing} | cut -d. -f1`
+  
+  # First atlas will be the sri 24atlas with index 1 
+  atlas_type[1]="sri24"
+  atlas_mask[1]=${DATA_DIR}/sri24/sri24_brainmask.nii.gz
+  
+  # Second atlas is the mni atlas with index 2
+  atlas_type[2]="mni"
+  atlas_mask[2]=${DATA_DIR}/mni/avg152T1_mask.nii.gz
+    
+  atlas_type[3]="sri24_2mm"
+  atlas_sri24_2mm_dir=${DATA_DIR}/sri24/connectivity/2mm
+  atlas_mask[3]=${atlas_sri24_2mm_dir}/sri24_brainmask.nii.gz
+  
+  for index in 1 3; do  
+    atlas_reg=`echo ${atlas_type[$index]} | cut -d "_" -f1`
+  
+    t1_atlas_affine=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_${atlas_reg}/ants_0GenericAffine.mat)
+    t1_atlas_warp_inv=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_${atlas_reg}/ants_1InverseWarp.nii.gz)
+    if [ ! -e  ${t1_atlas_affine} ] ; then
+      echo "ERROR:${WORKDIR}: ${t1_atlas_affine} is missing."
+      exit 1
+    fi
+    if [ ! -e  ${t1_atlas_warp_inv} ] ; then
+      echo "ERROR:${WORKDIR}: ${t1_atlas_warp_inv} is missing."
+      exit 1
+    fi
+    if [ "${VISIT}" == "baseline" ]; then
+      atlas_t1_mtx="[${t1_atlas_affine},1] ${t1_atlas_warp_inv}"
+      atlas_t1_mtx_list="${t1_atlas_affine} ${t1_atlas_warp_inv}"
+    else
+      t1_brain_to_baseline_affine=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_0GenericAffine.mat)
+      t1_brain_to_baseline_warp_inv=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_1InverseWarp.nii.gz)
+      if [ ! -e  ${t1_brain_to_baseline_affine} ] ; then
+        echo "ERROR:${WORKDIR}: ${t1_brain_to_baseline_affine} is missing."
+        exit 1
+      fi
+      if [ ! -e  ${t1_brain_to_baseline_warp_inv} ] ; then
+        echo "ERROR:${WORKDIR}: ${t1_brain_to_baseline_warp_inv} is missing."
+        exit 1
+      fi
+      atlas_t1_mtx="[${t1_atlas_affine},1] ${t1_atlas_warp_inv} [${t1_brain_to_baseline_affine},1] ${t1_brain_to_baseline_warp_inv}"
+      atlas_t1_mtx_list="${t1_atlas_affine} ${t1_atlas_warp_inv} ${t1_brain_to_baseline_affine} ${t1_brain_to_baseline_warp_inv}"
+    fi
+   
+    aligned_to_atlas_dir[$index]=${RESTING_DIR}/reslice/${atlas_type[$index]}
+    # reslice bold
+    if [ ${index} -eq 3 ]; then
+      # use 8mm one for further processing
+      bold_aligned_to_atlas[$index]=${aligned_to_atlas_dir[$index]}/${bold_processed_name}_smooth8mm_stripped.nii.gz
+      if LWDP_needs_update_and_lock ${bold_aligned_to_atlas[$index]} ${rs_specific_processing} ${atlas_mask[$index]} ${atlas_t1_mtx_list} ${fieldmap_to_t1_affine} ${fieldmap_to_bold_affine_tfm}; then
+        tmpdir=$(mktemp -d)
+  
+        ants antsApplyTransforms -d 3 -e 3 -i ${rs_specific_processing} -r ${atlas_mask[${index}]} -o ${tmpdir}/bold_4d.nii.gz -t ${atlas_t1_mtx} [${fieldmap_to_t1_affine},1] ${fieldmap_to_bold_affine_tfm}
+  
+        mask=${tmpdir}/mask.nii.gz
+        ants antsApplyTransforms -n NearestNeighbor -i ${t1_brainmask} -r ${atlas_mask[${index}]} -o ${mask} -t ${atlas_t1_mtx}
+  
+        # smoothing and stripping
+        for fwhm in 8; do
+          out=${aligned_to_atlas_dir[$index]}/${bold_processed_name}_smooth${fwhm}mm_stripped.nii.gz
+          sigma=`python3 -c "import numpy; print('%.5f' % (${fwhm} / numpy.sqrt(8 * numpy.log(2))))"`
+  	smoothing_with_mask4d ${sigma} ${tmpdir}/bold_4d.nii.gz ${mask} ${out}
+          # fsl fslmaths ${tmpdir}/bold_4d.nii.gz -s ${sigma} ${tmpdir}/bold_4d_s${fwhm}.nii.gz
+          # fsl fslmaths ${tmpdir}/bold_4d_s${fwhm}.nii.gz -mul ${mask} ${out}
+        done
+   
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${bold_aligned_to_atlas[$index]}
+      fi
+    fi
+    # reslice mean bold
+    if [ ${index} -eq 1 ] || [ ${index} -eq 3 ]; then
+      bold_mean_aligned_to_atlas[$index]=${aligned_to_atlas_dir[$index]}/bold_noIntenCorr_mean.nii.gz
+      if LWDP_needs_update_and_lock ${bold_mean_aligned_to_atlas[$index]} ${final_bold_noInt_mean} ${atlas_mask[$index]} ${atlas_t1_mtx_list} ${fieldmap_to_t1_affine} ${fieldmap_to_bold_affine_tfm}; then
+        tmpdir=$(mktemp -d)
+        ants antsApplyTransforms -n BlackmanWindowedSinc -i ${final_bold_noInt_mean} -r ${atlas_mask[${index}]} -o ${tmpdir}/bold_mean_warped.nii.gz -t ${atlas_t1_mtx} [${fieldmap_to_t1_affine},1] ${fieldmap_to_bold_affine_tfm}
+        c3d c3d ${tmpdir}/bold_mean_warped.nii.gz -clip 0 inf -type float -o ${bold_mean_aligned_to_atlas[$index]}
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${bold_mean_aligned_to_atlas[$index]}
+      fi
+      #
+      bold_mcf_mean_aligned_to_atlas[$index]=${aligned_to_atlas_dir[$index]}/bold_mcf_mean.nii.gz
+      if LWDP_needs_update_and_lock ${bold_mcf_mean_aligned_to_atlas[$index]} ${bold_mean} ${atlas_mask[$index]} ${atlas_t1_mtx_list} ${fieldmap_to_t1_affine} ${fieldmap_to_bold_affine_tfm}; then
+        ants antsApplyTransforms -n BlackmanWindowedSinc -i ${bold_mean} -r ${atlas_mask[${index}]} -o ${bold_mcf_mean_aligned_to_atlas[$index]} -t ${atlas_t1_mtx} [${fieldmap_to_t1_affine},1] ${fieldmap_to_bold_affine_tfm}
+        c3d c3d ${bold_mcf_mean_aligned_to_atlas[$index]} -clip 0 inf -type float -o ${bold_mcf_mean_aligned_to_atlas[$index]}
+        LWDP_lockfile_delete ${bold_mcf_mean_aligned_to_atlas[$index]}
+      fi
+      #
+      inp[1]=${fieldmap_mag}
+      inp[2]=${fieldmap}
+      out[1]=${aligned_to_atlas_dir[$index]}/fieldmap_mag.nii.gz
+      out[2]=${aligned_to_atlas_dir[$index]}/fieldmap.nii.gz
+      for i in 1; do
+        if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${atlas_mask[$index]} ${atlas_t1_mtx_list} ${fieldmap_to_t1_affine}; then
+          ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${atlas_mask[${index}]} -o ${out[${i}]} -t ${atlas_t1_mtx} [${fieldmap_to_t1_affine},1]
+          c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+          LWDP_lockfile_delete ${out[${i}]}
+        fi
+      done
+      for i in 2; do
+        if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${atlas_mask[$index]} ${atlas_t1_mtx_list} ${fieldmap_to_t1_affine}; then
+          ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${atlas_mask[${index}]} -o ${out[${i}]} -t ${atlas_t1_mtx} [${fieldmap_to_t1_affine},1]
+          c3d c3d ${out[${i}]} -type float -o ${out[${i}]}
+          LWDP_lockfile_delete ${out[${i}]}
+        fi
+      done
+    fi
+    # measure mean intensity
+    if [ ${index} -eq 1 ]; then
+      [ -d ${RESTING_DIR}/measures/${atlas_type[$index]} ] || mkdir -p ${RESTING_DIR}/measures/${atlas_type[$index]}
+      roi_image=${DATA_DIR}/sri24/parcellation/sri24_parc116.nii.gz
+      roi_label=${DATA_DIR}/sri24/parcellation/sri24_parc116.txt
+      roi_measure=${RESTING_DIR}/measures/${atlas_type[$index]}/parc116_bold_noIntenCorr_mean.csv
+      if LWDP_needs_update_and_lock ${roi_measure} ${roi_image} ${bold_mean_aligned_to_atlas[$index]}; then
+        echo "label,volume,mean" >> ${roi_measure}
+  
+        roi_vol=`cmtk vol2csv ${roi_image} ${bold_mean_aligned_to_atlas[$index]}`
+        roi_vol_num=`echo ${roi_vol} | wc -w`
+        roi_label_list=`cat ${roi_label} | tr -s "\t" " " | cut -d " " -f1,2 --output-delimiter=","`
+  
+        for roi_vol_idx in `seq 3 ${roi_vol_num}`; do
+          roi_vol_i=`echo ${roi_vol} | cut -d " " -f${roi_vol_idx} | cut -d "," -f1`
+  
+          found=0
+          for roi in ${roi_label_list}; do
+            roi_idx=`echo ${roi} | cut -d "," -f1`
+            roi_text=`echo ${roi} | cut -d "," -f2`
+            if [ ${roi_vol_i} -eq ${roi_idx} ]; then
+              found=1
+              break
+            fi
+          done
+          if [ ${found} -eq 0 ]; then
+            continue
+          fi
+  
+          num=`echo ${roi_vol} | cut -d " " -f${roi_vol_idx} | cut -d "," -f2`
+          sum=`echo ${roi_vol} | cut -d " " -f${roi_vol_idx} | cut -d "," -f3`
+          num=`printf "%.0f" ${num}`
+          sum=`printf "%.6f" ${sum}`
+          roi_val=`printf "%.6f" $(bc -l <<< ${sum}/${num})`
+          echo "\"${roi_text}\",${num},${roi_val}" >> ${roi_measure}
+        done
+  
+        LWDP_lockfile_delete ${roi_measure}
+      fi
+    fi
+  done
+  
+  bold_aligned_to_sri24_2mm=${bold_aligned_to_atlas[3]}
+  # End of old way 
+else
+    # New Way
+
+    #
+    # Registration to sri24 atlas by registering mean bold to mean bold baseline -> mean bold baseline to sri24 epi atlas
+    # needs to be done before number of outlier is detected so that it does not matter if baseline does not pass threshold 
+    #
+    sri24_2mm_epi_atlas_pattern=${DATA_DIR}/sri24/restingstate/2mm/sri24_EPIatlas
+    sri24_2mm_epi_atlas=${sri24_2mm_epi_atlas_pattern}.nii.gz
+    sri24_2mm_epi_atlas_brain=${sri24_2mm_epi_atlas_pattern}_brain.nii.gz
+    sri24_2mm_epi_atlas_mask=${sri24_2mm_epi_atlas_pattern}_mask.nii.gz
+
+
+    final_bold_noInt_mean_pattern=${final_bold_noInt_mean::-7}
+    final_bold_noInt_mean_mask=${final_bold_noInt_mean_pattern}_mask.nii.gz
+    if LWDP_needs_update_and_lock ${final_bold_noInt_mean_mask} ${final_bold_noInt_mean}; then
+	CMD="fsl bet ${final_bold_noInt_mean} $final_bold_noInt_mean_pattern  -m -f 0.5 -g -0.0 -n"
+	$CMD
+	LWDP_lockfile_delete ${final_bold_noInt_mean_mask}
+    fi
+    
+    final_bold_noInt_mean_brain=${final_bold_noInt_mean_pattern}_brain.nii.gz
+    if LWDP_needs_update_and_lock ${final_bold_noInt_mean_brain} ${final_bold_noInt_mean_mask} ${final_bold_noInt_mean}; then
+	c3d c3d ${final_bold_noInt_mean} ${final_bold_noInt_mean_mask} -multiply -type float -o ${final_bold_noInt_mean_brain}
+	LWDP_lockfile_delete ${final_bold_noInt_mean_brain}
+    fi
+
+    # find out the first visit that was registered to atlas
+    BASE_VISIT=""
+    if [ "${VISIT}" != "baseline" ]; then 
+        for sVISIT in `cd $SUBJECT/$ARM; ls -1d baseline followup_*y`; do 
+	    if [ $sVISIT == $VISIT ]; then
+		break
+	    fi
+
+	    base_art_outliers=$SUBJECT/$ARM/${sVISIT}/restingstate/rs_specific_processing/qa/art/art.bold_noIntenCorr_4d_outliers.txt
+	    if [ ! -e $base_art_outliers ]; then
+		continue
+	    fi 
+	    numOutliers=`cat ${base_art_outliers} | wc -l`
+	    if [ "$numOutliers" -gt "${MAX_NUM_OUTLIERS}"  ]; then
+		continue
+	    fi
+	    
+	    BASE_VISIT="$sVISIT"
+	    break
+	done
+    fi
+    if [ "${BASE_VISIT}" == "" ]; then
+        transformation_folder=${RESTING_DIR}/registration/bold_to_sri24_2mm_epi
+        bold_to_sri24_2mm_epi_nonrigid=${transformation_folder}/ants_1Warp.nii.gz
+        if LWDP_needs_update_and_lock ${bold_to_sri24_2mm_epi_nonrigid} ${sri24_2mm_epi_atlas_brain} ${final_bold_noInt_mean_brain}; then
+     	    [ -e ${transformation_folder}/ants_1InverseWarp.nii.gz ] && rm -f ${transformation_folder}/ants_1InverseWarp.nii.gz 
+     	    [ -e ${transformation_folder}/ants_0GenericAffine.mat ] && rm -f ${transformation_folder}/ants_0GenericAffine.mat
+     	    CMD="ants antsRegistration -d 3 -u -w [0.005,0.995] -r [${sri24_2mm_epi_atlas_brain},${final_bold_noInt_mean_brain},1] -t Rigid[0.01] -m MI[${sri24_2mm_epi_atlas_brain},${final_bold_noInt_mean_brain},1,32,Regular,0.25] -c [1000x1000x1000x1000x1000,1e-7,10] -f 8x6x4x2x1 -s 6x3x2x1x0vox -t Affine[0.01] -m MI[${sri24_2mm_epi_atlas_brain},${final_bold_noInt_mean_brain},1,32,Regular,0.25] -c [1000x1000x1000x1000x1000,1e-7,10] -f 8x6x4x2x1 -s 6x3x2x1x0vox -t SyN[0.1] -m MI[${sri24_2mm_epi_atlas_brain},${final_bold_noInt_mean_brain},1,32,Regular,0.25] -c [1000x1000x1000x1000x1000,1e-7,10] -f 8x6x4x2x1 -s 6x3x2x1x0vox -o ${transformation_folder}/ants_"
+     	    $CMD &> ${transformation_folder}/log
+     	    LWDP_lockfile_delete ${bold_to_sri24_2mm_epi_nonrigid}
+        fi
+	
+        bold_to_sri24_2mm_epi_transformation="${bold_to_sri24_2mm_epi_nonrigid} ${transformation_folder}/ants_0GenericAffine.mat"	 
+    else
+	if [ "${BASE_VISIT}" != "baseline" ]; then
+	    echo "INFO:$WORKDIR:Base for restingstate is ${BASE_VISIT}!"
+	fi
+
+	base_restingstate_folder=${SUBJECT}/${ARM}/${BASE_VISIT}/restingstate
+	base_transformation_folder=${base_restingstate_folder}/registration/bold_to_sri24_2mm_epi
+	
+	if [ ! -e ${base_transformation_folder}/ants_1Warp.nii.gz ]; then
+	    echo "ERROR:$WORKDIR:base warp to sri24_epi ${base_transformation_folder}/ants_1Warp.nii.gz is missing!" 
+	    exit 1
+	fi
+       
+
+        base_final_bold_noInt_mean_brain=${base_restingstate_folder}/bold/3_unwarped/bold_noIntenCorr_mean_brain.nii.gz
+	
+        transformation_folder=${RESTING_DIR}/registration/bold_to_${BASE_VISIT}_bold
+        bold_to_base_bold_affine=${transformation_folder}/ants_0GenericAffine.mat
+
+        if LWDP_needs_update_and_lock ${bold_to_base_bold_affine} ${base_final_bold_noInt_mean_brain} ${final_bold_noInt_mean_brain}; then
+     	    CMD="ants antsRegistration -d 3 -u -w [0.005,0.995] -r [${base_final_bold_noInt_mean_brain},${final_bold_noInt_mean_brain},1] -t Rigid[0.01] -m MI[${base_final_bold_noInt_mean_brain},${final_bold_noInt_mean_brain},1,32,Regular,0.25] -c [1000x1000x1000x1000x1000,1e-7,10] -f 8x6x4x2x1 -s 6x3x2x1x0vox -t Affine[0.01] -m MI[${base_final_bold_noInt_mean_brain},${final_bold_noInt_mean_brain},1,32,Regular,0.25] -c [1000x1000x1000x1000x1000,1e-7,10] -f 8x6x4x2x1 -s 6x3x2x1x0vox -o ${transformation_folder}/ants_"
+     	    $CMD &> ${transformation_folder}/log
+     	    LWDP_lockfile_delete ${bold_to_base_bold_affine}
+        fi
+
+        bold_to_sri24_2mm_epi_transformation="${base_transformation_folder}/ants_1Warp.nii.gz ${base_transformation_folder}/ants_0GenericAffine.mat ${transformation_folder}/ants_0GenericAffine.mat"
+    fi
+    
+    export bold_mean_in_sri24_2mm_epi=${RESTING_DIR}/reslice/sri24_2mm_epi/bold_noIntenCorr_mean_brain.nii.gz
+    if LWDP_needs_update_and_lock ${bold_mean_in_sri24_2mm_epi} ${final_bold_noInt_mean_brain} ${sri24_2mm_epi_atlas_brain} ${bold_to_sri24_2mm_epi_transformation}; then
+        CMD="ants antsApplyTransforms -n BlackmanWindowedSinc  -i ${final_bold_noInt_mean_brain} -r ${sri24_2mm_epi_atlas_brain} -o ${bold_mean_in_sri24_2mm_epi} -t ${bold_to_sri24_2mm_epi_transformation}"
+        $CMD
+        LWDP_lockfile_delete ${bold_mean_in_sri24_2mm_epi}
+    fi
+    
+    # Resample to atlas space 
+    export bold_in_sri24_2mm_epi_prefix=${WORKDIR}/restingstate/reslice/sri24_2mm_epi/bold_noIntenCorr_4d_filtermotart_cleaned_bp
+    export bold_aligned_to_sri24_2mm_epi=${bold_in_sri24_2mm_epi_prefix}_smooth8mm_stripped.nii.gz
+
+    if LWDP_needs_update_and_lock ${bold_aligned_to_sri24_2mm_epi} ${rs_specific_processing} ${sri24_2mm_epi_atlas_brain} ${sri24_2mm_epi_atlas_mask} ${bold_to_sri24_2mm_epi_transformation}; then
+	tmp=$(mktemp -d)
+
+	CMD="ants antsApplyTransforms -d 3 -e 3 -n BlackmanWindowedSinc  -i ${rs_specific_processing} -r ${sri24_2mm_epi_atlas_brain} -o ${tmp}/warped.nii.gz -t ${bold_to_sri24_2mm_epi_transformation}"
+	$CMD
+	# smoothing
+	sigma=`python3 -c "import numpy; print('%.5f' % (8 / numpy.sqrt(8 * numpy.log(2))))"`
+	smoothing_with_mask4d $sigma ${tmp}/warped.nii.gz ${sri24_2mm_epi_atlas_mask} ${bold_aligned_to_sri24_2mm_epi}
+	# fsl fslmaths ${tmp}/warped.nii.gz -s ${sigma}  ${tmp}/bold_4d_s8.nii.gz
+	# fsl fslmaths ${tmp}/bold_4d_s8.nii.gz -mul ${sri24_2mm_epi_atlas_mask} ${bold_aligned_to_sri24_2mm_epi}
+	rm -rf ${tmp}
+	LWDP_lockfile_delete ${bold_aligned_to_sri24_2mm_epi}
+    fi
+fi
+
+#
+# Compute Correlation Region To Region Correlation 
+#
+
+#corr_dir=${RESTING_DIR}/correlation/bold
+#for roimap in t1_gm_parc; do 
+#  parc=${RESTING_DIR}/reslice/bold/${roimap}.nii.gz
+#  out=${corr_dir}/${roimap}_roi2roi_corr.txt
+#  if LWDP_needs_update_and_lock ${out} ${rs_specific_processing} ${parc} ; then
+#    CMD="${NCANDA_SOURCE_DIR}/utils/rsfmri_regional_correlation -t roi2roi -c normal -b ${rs_specific_processing} -l ${parc} -o ${corr_dir}"
+#    log_and_execute "$CMD" ${out}
+#    LWDP_lockfile_delete ${out}
+#  fi 
+#done
+# ---------------------------------------------------
+# correlation is not correctly computed
+# if False; then
+#   corr_dir=${RESTING_DIR}/correlation/sri24_2mm
+#   for roimap in t1_gm_parc; do 
+#     parc=${WORKDIR}/structural/reslice/sri24_2mm/warp/atropos/${roimap}.nii.gz
+#     out=${corr_dir}/${roimap}_roi2roi_corr.txt
+#     if LWDP_needs_update_and_lock ${out} ${bold_aligned_to_sri24_2mm} ${parc} ; then
+#        CMD="${NCANDA_SOURCE_DIR}/utils/rsfmri_regional_correlation -t roi2roi -c normal -b ${bold_aligned_to_sri24_2mm} -l ${parc} -o ${corr_dir}"
+#        log_and_execute "$CMD" ${out}
+#       LWDP_lockfile_delete ${out}
+#     fi 
+#   done
+# 
+#   sri24_roi2roi_correlation=${corr_dir}/t1_gm_parc_roi2roi_corr.txt
+#   sri24_roi2roi_measures=${RESTING_DIR}/measures/sri24/rs_roi2roi_corr.csv 
+#   if LWDP_needs_update_and_lock ${sri24_roi2roi_measures} ${sri24_roi2roi_correlation} ${art_outliers}; then
+#     ${NCANDA_SOURCE_DIR}/utils/turn_restingstate_stats_into_csv $WORKDIR 
+#     LWDP_lockfile_delete ${sri24_roi2roi_measures}
+#   fi
+# fi
+
+#
+# better correlation computations
+#
+
+# roimap="t1_gm_parc"
+# Problem with the following roimap is that regions might disappear - hard to do group analysis 
+# parcellation=${WORKDIR}/structural/reslice/sri24_2mm/warp/atropos/${roimap}.nii.gz
+# so we use a standard atlas (might introduce more noise in measurements)
+
+for PARC in parc116 parc215; do
+    parcellation=${DATA_DIR}/sri24/parcellation/2mm/sri24_${PARC}_gm.nii.gz
+    roiCorrelationPrefix=${WORKDIR}/restingstate/correlation/sri24_2mm_epi/sri24_${PARC}_gm
+    roiCorrelations=${roiCorrelationPrefix}-correlations.txt
+    if LWDP_needs_update_and_lock ${roiCorrelations} ${bold_aligned_to_sri24_2mm_epi} ${parcellation} ; then
+	tmp=$(mktemp -d)
+	fsl fslsplit ${bold_aligned_to_sri24_2mm_epi} ${tmp}/bold- -t
+	CMD="${NCANDA_SOURCE_DIR}/utils/rsfmri_regional_correlation --bold_prefix ${tmp}/bold- --parcellation ${parcellation} --output_prefix ${roiCorrelationPrefix}"
+	log_and_execute "$CMD" ${roiCorrelations}
+	rm -rf ${tmp}
+	LWDP_lockfile_delete ${roiCorrelations}
+    fi
+
+    sri24_roi2roi_pattern=${RESTING_DIR}/measures/sri24_epi/sri24_${PARC}_gm_roi2roi
+    for TYPE in correlations partial_correlations; do
+	roiCorrelations=${roiCorrelationPrefix}-${TYPE}.txt
+	sri24_roi2roi_measures=${RESTING_DIR}/measures/sri24_epi/sri24_${PARC}_gm_roi2roi_${TYPE}.csv 
+	ATLAS_PREFIX=${DATA_DIR}/sri24/parcellation/2mm/sri24_${PARC}_gm
+	if LWDP_needs_update_and_lock ${sri24_roi2roi_measures} ${ATLAS_PREFIX}.csv ${ATLAS_PREFIX}_roi2roi.csv  ${roiCorrelations}; then
+	    ${NCANDA_SOURCE_DIR}/utils/turn_restingstate_stats_into_csv cor $WORKDIR ${roiCorrelations} ${sri24_roi2roi_measures} ${ATLAS_PREFIX} 
+	    LWDP_lockfile_delete ${sri24_roi2roi_measures}
+	fi
+    done
+done
+
+#
+# qc() 
+#
+
+MOTION_PFX=${RESTING_DIR}/bold/2_motion_corrected/bold_mcf
+MOTION_PRF=${MOTION_PFX}_motion
+MOTION_AVG=${MOTION_PRF}.avg
+if LWDP_needs_update_and_lock ${MOTION_AVG} ${t1_brainmask_aligned_to_bold} ${MOTION_PFX}.mat/MAT_0000; then 
+    ${NCANDA_SOURCE_DIR}/utils/rsfmri_compute_motion.py -ma ${t1_brainmask_aligned_to_bold} -mo ${MOTION_PFX}.mat -o ${MOTION_PRF}
+    LWDP_lockfile_delete ${MOTION_AVG}
+fi
+
+QC_CSV=${RESTING_DIR}/measures/rs_qa.csv
+BOLD_XML=$FMRI_DIR/bold-001.nii.xml    
+if LWDP_needs_update_and_lock ${QC_CSV} ${BOLD_XML} ${art_outliers} $MOTION_AVG; then	
+    echo "subject,arm,visit,num_usable,rt,usable_time,avg_motion" > $QC_CSV
+    NUM_SCAN=`ls -1 ${FMRI_DIR}/bold-*.nii.gz | wc -l`
+    NUM_FAIL=`cat ${art_outliers} | wc -l`
+    NUM_GOOD="$(($NUM_SCAN-$NUM_FAIL))"
+    RT=`grep RepetitionTime $BOLD_XML | cut -d'>' -f2 | cut -d'.' -f1`
+    TIME=`echo "scale=1;$NUM_GOOD * $bold_tr_sec" | bc`
+    MOTION=`cat ${MOTION_AVG}`
+    echo "$SUBJECT,$ARM,$VISIT,$NUM_GOOD,$RT,$TIME,`printf '%.4f\n' $MOTION`" >> $QC_CSV
+    LWDP_lockfile_delete ${QC_CSV}
+fi
+
+#art_outliers_csv=${RESTING_DIR}/measures/rs_qa.csv
+#if LWDP_needs_update_and_lock ${art_outliers_csv} ${art_outliers}; then
+#    ${NCANDA_SOURCE_DIR}/utils/turn_restingstate_stats_into_csv art $WORKDIR ${art_outliers} ${art_outliers_csv} 
+#    LWDP_lockfile_delete ${art_outliers_csv}
+#fi
+
+# update below with the 2mm_epi 
+exit 0 
+  #
+  # Step E: Compute Region-To-Voxel Correlation Map   
+  #
+
+atlas_sri24_2mm_roi_dir=${DATA_DIR}/sri24/restingstate/2mm
+corr_dir=${RESTING_DIR}/correlation/sri24_2mm
+
+# making hrf weight file
+hrf_weight=${corr_dir}/hrf_weight.txt
+if LWDP_needs_update_and_lock ${hrf_weight} ${bold_aligned_to_sri24_2mm}; then
+  nscans=`fsl fslval ${bold_aligned_to_sri24_2mm} dim4 | tr -d " "`
+  CMD="${NCANDA_SOURCE_DIR}/utils/rsfmri_compute_hrf_weight -n ${nscans} -t ${bold_tr_sec} -o ${hrf_weight}"
+  log_and_execute "$CMD" ${hrf_weight}
+  LWDP_lockfile_delete ${hrf_weight}
+fi
+
+for roimap in ACC Amygdala Calcarine Heschl Midbrain NAcc PCC Postcentral SFG SPL Thalamus_L Thalamus_R; do 
+  ROI=${atlas_sri24_2mm_roi_dir}/sri24_${roimap}.nii.gz
+  out=${corr_dir}/sri24_${roimap}_roi2vox_corr.nii.gz
+  if LWDP_needs_update_and_lock ${out} ${bold_aligned_to_sri24_2mm} ${ROI} ${hrf_weight}; then
+    CMD="${NCANDA_SOURCE_DIR}/utils/rsfmri_regional_correlation -t roi2vox -c normal -b ${bold_aligned_to_sri24_2mm} -l ${ROI} -w ${hrf_weight} -o ${corr_dir}"
+    log_and_execute "$CMD" ${out}
+    LWDP_lockfile_delete ${out}
+  fi
+done 
+
+exit 0
+
+#
+# reslice freesurfer segmentations
+#
+
+if [ "${VISIT}" == "baseline" ]; then
+  sri24_padded_to_t1_rigid=${WORKDIR}/structural/registration/sri24_padded_to_t1/ants_rigid_0GenericAffine.mat 
+else
+  sri24_padded_to_t1_rigid=${WORKDIR}/structural/longitudinal/registration/baseline_sri24_padded_to_t1/ants_rigid_0GenericAffine.mat
+fi
+
+freesurfer_seg_mgz=${WORKDIR}/structural/freesurfer/${SUBJECT}_${ARM}_${VISIT}/mri/aparc+aseg.mgz
+freesurfer_rawavg_mgz=${WORKDIR}/structural/freesurfer/${SUBJECT}_${ARM}_${VISIT}/mri/rawavg.mgz
+freesurfer_seg_aligned_to_t1=${RESTING_DIR}/reslice/subject_t1/aparc+aseg.nii.gz
+if LWDP_needs_update_and_lock ${freesurfer_seg_aligned_to_t1} ${freesurfer_seg_mgz} ${freesurfer_rawavg_mgz}; then
+  mri_label2vol --seg ${freesurfer_seg_mgz} --temp ${freesurfer_rawavg_mgz} --o ${freesurfer_seg_aligned_to_t1} --regheader ${freesurfer_seg_mgz}
+  LWDP_lockfile_delete ${freesurfer_seg_aligned_to_t1}
+fi
+freesurfer_seg=${RESTING_DIR}/reslice/bold/aparc+aseg.nii.gz
+if LWDP_needs_update_and_lock ${freesurfer_seg} ${freesurfer_seg_aligned_to_t1} ${bold_mean} ${fieldmap_to_bold_affine_tfm} ${fieldmap_to_t1_affine}; then
+  ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${freesurfer_seg_aligned_to_t1} -r ${bold_mean} -o ${freesurfer_seg} -t [${fieldmap_to_bold_affine_tfm},1] ${fieldmap_to_t1_affine}
+  c3d c3d ${freesurfer_seg} -type short -o ${freesurfer_seg}
+  LWDP_lockfile_delete ${freesurfer_seg}
+fi
+sri24_padded_suit_seg=${WORKDIR}/structural/reslice/sri24_padded/Cerebellum-SUIT.nii.gz
+suit_seg_aligned_to_t1=${RESTING_DIR}/${branch}/reslice/subject_t1/Cerebellum-SUIT.nii.gz
+if LWDP_needs_update_and_lock ${suit_seg_aligned_to_t1} ${sri24_padded_suit_seg} ${t1_mrbias} ${sri24_padded_to_t1_rigid}; then
+  ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${sri24_padded_suit_seg} -r ${t1_mrbias} -o ${suit_seg_aligned_to_t1} -t [${sri24_padded_to_t1_rigid},1]
+  c3d c3d ${suit_seg_aligned_to_t1} -type short -o ${suit_seg_aligned_to_t1}
+  LWDP_lockfile_delete ${suit_seg_aligned_to_t1}
+fi
+suit_seg=${DIFFUSION_DIR}/${branch}/reslice/bold/Cerebellum-SUIT.nii.gz
+if LWDP_needs_update_and_lock ${suit_seg} ${sri24_padded_suit_seg} ${bold_mean}  ${fieldmap_to_bold_affine_tfm} ${fieldmap_to_t1_affine}; then
+  ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${sri24_padded_suit_seg} -r ${bold_mean} -o ${suit_seg} -t  [${fieldmap_to_bold_affine_tfm},1] ${fieldmap_to_t1_affine}
+  c3d c3d ${suit_seg} -type short -o ${suit_seg}
+  LWDP_lockfile_delete ${suit_seg}
+fi
+suit_seg_600=${DIFFUSION_DIR}/${branch}/reslice/bold/Cerebellum-SUIT_600.nii.gz
+if LWDP_needs_update_and_lock ${suit_seg_600} ${suit_seg}; then
+  c3d c3d ${suit_seg} -shift 600 -replace 600 0 -o ${suit_seg_600}
+  LWDP_lockfile_delete ${suit_seg_600}
+fi
+label[0]=${DATA_DIR}/freesurfer/FreeSurferColorLUT_Connectivity.txt
+label[1]=${DATA_DIR}/freesurfer/FreeSurferColorLUT_WM.txt
+label[2]=${DATA_DIR}/freesurfer/FreeSurferColorLUT_Ventricles.txt
+label[3]=${DATA_DIR}/freesurfer/FreeSurferColorLUT_Connectivity_SUIT.txt
+label[4]=${DATA_DIR}/freesurfer/FreeSurferColorLUT_WM_SUIT.txt
+input[0]=${RESTING_DIR}/reslice/bold/aparc+aseg.nii.gz
+input[1]=${RESTING_DIR}/reslice/bold/aparc+aseg.nii.gz
+input[2]=${RESTING_DIR}/reslice/bold/aparc+aseg.nii.gz
+input[3]=${RESTING_DIR}/reslice/bold/Cerebellum-SUIT_600.nii.gz
+input[4]=${RESTING_DIR}/reslice/bold/Cerebellum-SUIT_600.nii.gz
+output[0]=${RESTING_DIR}/reslice/bold/aparc+aseg_conn.nii.gz
+output[1]=${RESTING_DIR}/reslice/bold/aparc+aseg_wm.nii.gz
+output[2]=${RESTING_DIR}/reslice/bold/aparc+aseg_ventricles.nii.gz
+output[3]=${RESTING_DIR}/reslice/bold/Cerebellum-SUIT_600_conn.nii.gz
+output[4]=${RESTING_DIR}/reslice/bold/Cerebellum-SUIT_600_wm.nii.gz
+output2[0]=${RESTING_DIR}/reslice/bold/aparc+aseg_conn_bin.nii.gz
+output2[1]=${RESTING_DIR}/reslice/bold/aparc+aseg_wm_bin.nii.gz
+output2[2]=${RESTING_DIR}/reslice/bold/aparc+aseg_ventricles_bin.nii.gz
+output2[3]=${RESTING_DIR}/reslice/bold/Cerebellum-SUIT_600_conn_bin.nii.gz
+output2[4]=${RESTING_DIR}/reslice/bold/Cerebellum-SUIT_600_wm_bin.nii.gz
+for idx in 0 1 2 3 4; do
+  if LWDP_needs_update_and_lock ${output[${idx}]} ${intput[${idx}]} ${label[${idx}]}; then
+    tmpdir=$(mktemp -d)
+    label_set=`cat ${label[${idx}]} | cut -d " " -f1`
+    replace_txt=
+    for l in ${label_set}; do
+      replace_txt="${replace_txt} ${l} 100000"
+    done
+    c3d c3d ${input[${idx}]} -replace ${replace_txt} -thresh 100000 inf 1 0 -type short -o ${tmpdir}/tmp_bin.nii.gz
+    c3d c3d ${input[${idx}]} ${tmpdir}/tmp_bin.nii.gz -multiply -o ${output[${idx}]}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${output[${idx}]}
+  fi
+  if LWDP_needs_update_and_lock ${output2[${idx}]} ${output[${idx}]}; then
+    c3d c3d ${output[${idx}]} -thresh 1 inf 1 0 -o ${output2[${idx}]}
+    LWDP_lockfile_delete ${output2[${idx}]}
+  fi
+done
+# merge SUIT conn labels
+suit_conn_map=${DIFFUSION_DIR}/${branch}/reslice/bold/Cerebellum-SUIT_600_conn.nii.gz
+suit_conn_map_merged=${DIFFUSION_DIR}/${branch}/reslice/bold/Cerebellum-SUIT_600_conn_merged.nii.gz
+if LWDP_needs_update_and_lock ${suit_conn_map_merged} ${suit_conn_map}; then
+  c3d c3d ${suit_conn_map} -replace 603 601 602 601 604 601 608 605 611 605 614 605 609 606 612 606 615 606 610 607 613 607 616 607 620 617 623 617 626 617 621 618 624 618 627 618 622 619 625 619 628 619 -o ${suit_conn_map_merged}
+  LWDP_lockfile_delete ${suit_conn_map_merged}
+fi
+# merge freesurfer and SUIT rois
+freesurfer_map=${DIFFUSION_DIR}/${branch}/reslice/bold/aparc+aseg.nii.gz
+freesurfer_conn_map=${DIFFUSION_DIR}/${branch}/reslice/bold/aparc+aseg_conn.nii.gz
+freesurfer_wm_map_bin=${DIFFUSION_DIR}/${branch}/reslice/bold/aparc+aseg_wm_bin.nii.gz
+label_conn_map=${DIFFUSION_DIR}/${branch}/reslice/bold/aparc+aseg_SUIT_conn.nii.gz
+if LWDP_needs_update_and_lock ${label_conn_map} ${freesurfer_map} ${freesurfer_wm_map_bin} ${freesurfer_conn_map} ${suit_conn_map_merged}; then
+  tmpdir=$(mktemp -d)
+  c3d c3d ${freesurfer_map} -thresh 1 inf 1 0 -o ${tmpdir}/mask1.nii.gz
+  c3d c3d ${freesurfer_wm_map_bin} -scale -1 -shift 1 -o ${tmpdir}/mask2.nii.gz
+  c3d c3d ${suit_conn_map_merged} ${tmpdir}/mask1.nii.gz -multiply ${tmpdir}/mask2.nii.gz -multiply -o ${tmpdir}/suit_conn.nii.gz
+  c3d c3d ${freesurfer_conn_map} ${tmpdir}/suit_conn.nii.gz -add -type short -o ${label_conn_map}
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${label_conn_map}
+fi
+freesurfer_wm_map_bin=${DIFFUSION_DIR}/${branch}/reslice/bold/aparc+aseg_wm_bin.nii.gz
+suit_wm_map_bin=${DIFFUSION_DIR}/${branch}/reslice/bold/Cerebellum-SUIT_600_wm_bin.nii.gz
+label_wm_map_bin=${DIFFUSION_DIR}/${branch}/reslice/bold/aparc+aseg_SUIT_wm_bin.nii.gz
+if LWDP_needs_update_and_lock ${label_wm_map_bin} ${freesurfer_wm_map_bin} ${label_conn_map} ${suit_wm_map_bin}; then
+  tmpdir=$(mktemp -d)
+  c3d c3d ${label_conn_map} -thresh 1 inf 1 0 -scale -1 -shift 1 -o ${tmpdir}/mask.nii.gz
+  c3d c3d ${freesurfer_wm_map_bin} ${suit_wm_map_bin} -add -thresh 1 inf 1 0 ${tmpdir}/mask.nii.gz -multiply -o ${label_wm_map_bin}
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${label_wm_map_bin}
+fi
+

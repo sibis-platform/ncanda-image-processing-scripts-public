@@ -1,0 +1,144 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+# only call with <case>/<arm>
+# e.g. ../scripts/image_processing/bin/ncanda_all_visits <subject>/standard 
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+
+#
+# functions
+#
+check_site() {
+    demographics=${ARMDIR}/${VISIT}/measures/demographics.csv
+    if [ ! -e ${demographics} ]; then
+	echo "ERROR:${demographics} missing."
+	exit 1
+    fi
+
+    SITE=`cat ${demographics} | tail -1  | cut -d, -f4`
+    if [ "${SITE}" == "$siteBase"  ]; then
+	return 0
+    fi  
+    return 1
+}
+ 
+check_longitudinal_freesurfer() {
+  LAST_VISIT=$1
+  if [ $LAST_VISIT == "baseline" ]; then 
+      return 
+  fi 
+
+  LAST_VISIT_YEAR=`echo $LAST_VISIT | cut -d_ -f2 | tr -d y`
+  for year in `seq ${LAST_VISIT_YEAR} -1 1`; do
+      VISIT=followup_${year}y
+      WORKDIR=$ARMDIR/$VISIT
+      if [ -d $WORKDIR/structural ]; then  
+	  check_site
+	  if [ "$?" -eq 1 ]; then
+	      continue 
+	  fi 
+
+	  if [ $year != ${LAST_VISIT_YEAR} ]; then 
+	      echo "WARNING:${WORKDIR}:ncanda_all_visits: trying to generate longitudinal freesurfer results as it was missing for preceeding visits" 
+	      # bash ${NCANDA_BINARY_DIR}/ncanda_all_pipelines ${WORKDIR} true 
+	      bash ${NCANDA_BINARY_DIR}/ncanda_structural_all_pipelines ${WORKDIR} true     
+	  fi
+	  # ugly but does the job to check if freesurfer produced results 
+	  for FILE in ${WORKDIR}/structural/longitudinal/freesurfer_refined/template_*/label/rh.entorhinal_exvivo.label; do 
+	      if [ -e $FILE ]; then
+		  echo "INFO:$WORKDIR:ncanda_all_visits: most current longitudinal freesurfer results!" 
+		  return
+	      fi
+	  done
+      fi 
+  done
+  echo "INFO:$ARMDIR:ncanda_all_visits: were not able to generate longitudinal freesurfer results for any visits! Most likely only baseline has structural scans!" 
+}
+
+run_longitudinal_restingstate() {
+  LAST_VISIT=$1
+  BOLD=restingstate/reslice/sri24_2mm_epi/bold_noIntenCorr_4d_filtermotart_cleaned_bp_smooth8mm_stripped.nii.gz   
+  if [ $LAST_VISIT != "baseline" ]; then 
+
+      LAST_VISIT_YEAR=`echo $LAST_VISIT | cut -d_ -f2 | tr -d y`
+      for year in `seq ${LAST_VISIT_YEAR} -1 1`; do
+	  VISIT=followup_${year}y
+	  WORKDIR=$ARMDIR/$VISIT
+	  if [ -e $WORKDIR/$BOLD ]; then  
+	      ${NCANDA_BINARY_DIR}/ncanda_restingstate_longitudinal_pipeline $WORKDIR
+	      return
+	  fi
+      done
+  fi
+
+  WORKDIR=$ARMDIR/${LAST_VISIT}
+  if [ -e $ARMDIR/${LAST_VISIT}/$BOLD ]; then 
+      ${NCANDA_BINARY_DIR}/ncanda_restingstate_longitudinal_pipeline $WORKDIR
+  fi
+}
+
+#
+# Setup input and output
+#
+
+# remove trailing "/"
+if [ "${1: -1:1}" == "/" ]; then
+  export ARMDIR=${1:: -1}
+else
+  export ARMDIR=${1}
+fi
+
+LAST_VISIT_YEAR=11
+
+VISIT_LIST="baseline"
+for year in `seq 1 ${LAST_VISIT_YEAR}`; do
+    VISIT_LIST="${VISIT_LIST} followup_${year}y"
+done
+
+demoBaseline=${ARMDIR}/baseline/measures/demographics.csv
+if [ ! -e ${demoBaseline} ]; then
+    echo "ERROR:${demoBaseline} missing."
+    exit 1
+fi
+siteBase=`cat ${demoBaseline} | tail -1  | cut -d, -f4`
+
+LAST_VISIT=followup_${LAST_VISIT_YEAR}y
+
+for VISIT in ${VISIT_LIST}; do 
+    WORKDIR=$ARMDIR/$VISIT
+
+    # Only run longitudinal freesurfer in the last year when it is needed 
+    if [ $VISIT == ${LAST_VISIT} ]; then  
+	LONG_FLAG=true
+    else 
+	LONG_FLAG=false
+    fi
+
+    if [ -d ${WORKDIR}/structural ]; then 
+      check_site
+      if [ "$?" -eq 0 ]; then
+	    ${NCANDA_BINARY_DIR}/ncanda_all_pipelines ${WORKDIR} ${LONG_FLAG}    
+	    if [ $? -ne 0 ] ; then
+	       echo "ERROR:$WORKDIR:ncanda_all_visits: skipped remaining visits as ncanda_all_pipelines exited with an error! Please investigate!"
+	       exit 1  
+	    fi 
+      else 
+	    echo "INFO:$WORKDIR:Skip visit as subject changed sites (${VISIT}: ${SITE}, baseline: ${siteBase})!"
+      fi
+    fi
+done
+
+# If freesurfer results were not generated then need to run longitudinal freesurfer on previous visits as they were skipped before ! 
+check_longitudinal_freesurfer ${VISIT}
+
+run_longitudinal_restingstate ${LAST_VISIT}

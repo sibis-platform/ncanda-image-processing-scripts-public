@@ -1,0 +1,12 @@
+NCANDA baseline TBSS template (ncanda_baseline_meet_criteria)
+
+Group templates from NCANDA's cross-sectional baseline TBSS analysis, in SRI24
+space. The diffusion pipeline projects each visit's FA, MD, L1 and LT onto these
+skeletons and reports Mori ROI measures on them.
+
+mean_FA*.nii.gz                       group mean FA, mask, skeleton mask and skeleton
+                                      distance map, without site correction
+mean_FA_corrected_global*.nii.gz      the same, with global site correction
+mean_FA_corrected_local_mul*.nii.gz   the same, with local multiplicative site correction
+
+Group-level data only; no individual participant images are included.

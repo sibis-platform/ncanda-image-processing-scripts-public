@@ -1,0 +1,7 @@
+
+# making sri24_wm_sc_mask.nii.gz
+
+wb_command -volume-math "(1-CSF>0.8)&&((WM>0.8)||((GM>0)&&(PC==0)&&(CERE==0)))" sri24_wm_sc_mask.nii.gz -var WM sri24_pbmap_WM.nii.gz -var GM sri24_pbmap_GM.nii.gz -var CSF sri24_pbmap_CSF.nii.gz -var PC parcellation/sri24_parc_cortical.nii.gz -var CERE sri24_cere_bs_mask.nii.gz
+
+wb_command -volume-remove-islands sri24_wm_sc_mask.nii.gz sri24_wm_sc_mask.nii.gz
+

@@ -1,0 +1,28 @@
+00,Unclassified
+01,Middle cerebellar peduncle
+02,Pontine crossing tract
+03,Genu of corpus callosum
+04,Body of corpus callosum
+05,Splenium of corpus callosum
+06,Fornix (column and body of fornix)
+07,Corticospinal tract L
+08,Medial lemniscus L
+09,Inferior cerebellar peduncle L
+10,Superior cerebellar peduncle L
+11,Cerebral peduncle L
+12,Anterior limb of internal capsule L
+13,Posterior limb of internal capsule L
+14,Retrolenticular internal capsule L
+15,Anterior corona radiata L
+16,Superior corona radiata L
+17,Posterior corona radiata L
+18,Posterior thalamic radiation  L
+19,Sagittal stratum L
+20,External capsule L
+21,Cingulum (cingulate gyrus) L
+22,Cingulum (hippocampus) L
+23,Fornix (cres)/Stria terminalis L
+24,Superior longitudinal fasciculus L
+25,Superior fronto-occipital fasciculus L
+26,Uncinate fasciculus L
+27,Tapetum L

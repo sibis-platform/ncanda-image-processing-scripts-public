@@ -1,0 +1,7 @@
+601 cbm-anterior 70 130 180 0
+605 cbm-lh-superiorposterior 196 58 250 0
+606 cbm-vermis-superiorposterior 0 148 0 0
+607 cbm-rh-superiorposterior 220 248 164 0
+617 cbm-lh-inferiorposterior 220 216 20 0
+618 cbm-vermis-inferiorposterior 103 255 255 0
+619 cbm-rh-inferiorposterior 80 196 98 0

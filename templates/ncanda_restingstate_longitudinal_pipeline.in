@@ -1,0 +1,191 @@
+#!/bin/bash
+ 
+##
+##  Copyright 2023 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL: https://www.nitrc.org/svn/ncanda-datacore/trunk/image_processing/templates/ncanda_restingstate_pipeline.in $
+##  $Revision: 2813 $
+##  $LastChangedDate: 2020-02-11 09:07:30 -0800 (Tue, 11 Feb 2020) $
+##  $LastChangedBy: pohl $
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+NCANDA_SOURCE_DIR=@NCANDA_SOURCE_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+regression() {
+  BOLD=$1
+  templateIC=$2
+  outDIR=$3
+
+  echo "=== Regression ==="
+  oldSGE_ROOT=$SGE_ROOT 
+  unset SGE_ROOT
+  # write to reg to avoid error message 
+  fsl dual_regression ${templateIC} 1 -1 0 ${outDIR}/reg ${BOLD}
+  mv  ${outDIR}/reg/*  ${outDIR}/.
+  rm -rf ${outDIR}/reg
+  SGE_ROOT=${oldSGE_ROOT}
+
+  tmpDir=`mktemp -d`
+  echo "=== Compute Network Efficiency ==="
+  # mask each network by the foreground (z>3)
+  for i in {0000..0024}; do
+      mask=${melodic_DIR}/${i}.nii.gz
+      network=${outDIR}/dr_stage2_ic${i}.nii
+      masked_network=${tmpDir}/masked_ic${i}.nii
+      fslmaths ${mask} -thr 3 -bin -mul ${network} ${masked_network}
+  done
+  fslmerge -t ${tmpDir}/masked_ic_all.nii.gz ${tmpDir}/masked_ic*.nii.gz
+
+  fslstats -t ${tmpDir}/masked_ic_all.nii.gz -M > ${outDIR}/efficiency.txt
+
+  rm ${outDIR}/dr_stage2_ic*.nii.gz
+  rm -rf $tmpDir
+
+}
+
+translateTxtToCSV () {
+    effCsv=$1
+    shift
+    effTxtList=$*
+    
+    if LWDP_needs_update_and_lock ${effCsv} ${effTxtList}; then
+	echo "subject,arm,visit`for i in {0000..0024}; do echo -n ",$i"; done`" > ${effCsv}
+	for effTxt in ${effTxtList}; do 
+	    rsVISIT=`dirname ${effTxt} | rev | cut -d'/' -f1 | rev` 
+	    if [ $rsVISIT == "subject" ]; then
+		rsVISIT=$VISIT
+	    fi
+	    VALUES=`cat ${effTxt} | tr -d ' ' | tr '\n' ','`
+	    echo "$SUBJECT,$ARM,$rsVISIT,${VALUES::-1}" >> ${effCsv}
+	done
+	LWDP_lockfile_delete ${effCsv}
+    fi
+}
+
+#
+# Subject level analysis by Qingyu
+# copied script from /fs/neurosci01/qingyuz/NCANDA_rsfmri_analysis/script/subject_level_analysis.sh
+# script was used in 
+# Zhao Q, Kwon D, Müller-Oehring EM, Le Berre AP, Pfefferbaum A, Sullivan EV, Pohl KM: Longitudinally Consistent Estimates of Intrinsic Functional Networks, Human Brain Mapping, 40 (8), pp. 2511-2528, 2019
+
+# export MCR_CACHE_ROOT=$(mktemp -d)
+
+############# README #############
+#
+# This script computes the subject-level network efficiency scores
+# For each network, it computes an average efficiency over all longitudinal visits
+# E.g., subject_level_analysis.sh <subject> SUBJECT_OUTPUT_DIR
+# output file is SUBJECT_OUTPUT_DIR/efficiency.csv
+#
+##################################
+
+# input argument
+# global variable
+# same tmplate as used in publication only based on 8mm smoothing of clean bold instead of 6mm provided in release of year 3 used in publication
+# updated to 8mm (slightly different processing as in HBM paper)
+melodic_DIR=${DATA_DIR}/restingstate/melodic
+melodic_IC=${melodic_DIR}/results_8mm_d25_dx/melodic_IC.nii.gz
+if [ ! -e "${melodic_IC}" ]; then
+  echo "INFO: ${melodic_IC} not found; skipping longitudinal resting-state network analysis"
+  exit 0
+fi
+
+clean_bold=restingstate/reslice/sri24_2mm_epi/bold_noIntenCorr_4d_filtermotart_cleaned_bp_smooth8mm_stripped.nii.gz 
+if [ ! -e $WORKDIR/${clean_bold} ]; then
+    echo "INFO:${WORKDIR}:missing cross-sectional restingstate analysis for this visit - cannot perform longitudinal restingstate pipeline!" 
+    exit 0 
+fi 
+  
+BOLD=${SUBJECT}/$ARM/baseline/${clean_bold} 
+if [ -e $BOLD ]; then 
+    bold_list="${BOLD} "
+    visit_list="baseline "
+else 
+    bold_list=""
+    visit_list=""
+fi 
+
+followup_year=`echo ${VISIT} | cut -d "_" -f2 | cut -d "y" -f1`
+for year in `seq 1 ${followup_year}`; do
+    aVISIT=followup_${year}y
+    BOLD=${SUBJECT}/$ARM/$aVISIT/${clean_bold}
+    if [ -e ${BOLD} ]; then
+      bold_list="${bold_list}${BOLD} " 
+      visit_list="${visit_list}$aVISIT "
+    fi 
+done 
+
+rsDIR=${WORKDIR}/restingstate
+SUB_RESULT_DIR=$rsDIR/longitudinal/subject
+
+effTxt=${SUB_RESULT_DIR}/efficiency.txt
+if LWDP_needs_update_and_lock ${effTxt} ${bold_list} ${melodic_IC}; then
+
+    tmp_dir=`mktemp -d`
+
+    # concatenate BOLD signal from all visits
+    fsl fslmerge -t ${tmp_dir}/merged.nii.gz ${bold_list}
+
+    # subject-level dual regression based on group-level IC estimates
+    regression ${tmp_dir}/merged.nii.gz ${melodic_IC} ${SUB_RESULT_DIR}
+
+    rm -rf ${tmp_dir}
+
+    LWDP_lockfile_delete ${effTxt}
+fi
+
+#output needed for visit level analysis
+subjectIC=$(LWDP_get_override_file ${SUB_RESULT_DIR}/dr_stage2_subject00000.nii.gz)
+
+rsMeasuresDIR=$rsDIR/measures/longitudinal
+
+translateTxtToCSV ${rsMeasuresDIR}/subject_efficiency.csv ${effTxt} 
+
+numVisits=`echo $visit_list | wc -w`
+if [ $numVisits -lt 2 ]; then 
+    echo "INFO:$WORKDIR:Skip computing visit efficiency as it requires at least two visits!"
+    exit 1
+fi 
+
+#
+# visit level analysis by Qingyu 
+# copied script from /fs/neurosci01/qingyuz/NCANDA_rsfmri_analysis/script/visit_level_analysis.sh
+#
+#
+
+############# README #############
+#
+# This script computes the visit-level network efficiency scores
+# Dual regression derives visit-specific networks based on the networks estimated on the subject level, so it requires subject-level results
+# For each network, it then derives an efficiency score
+# Usage: visit_level_analysis.sh ${SUBJECT_ID} ${VISIT_ID} ${SUBJECT_LEVEL_RESULTS_DIR} ${OUTPUT_DIR}
+# E.g., visit_level_analysis.sh <subject> followup_1y SUBJECT_OUTPUT_DIR SUBJECT_followup_1y_OUTPUT_DIR
+#
+##################################
+
+effTxtList=""
+for rsVISIT in ${visit_list}; do 
+    # visit-level dual regression based on subject-level IC estimates
+    bold=${SUBJECT}/$ARM/${rsVISIT}/${clean_bold}
+
+    VISIT_RESULT_DIR=$rsDIR/longitudinal/$rsVISIT
+    effTxt=${VISIT_RESULT_DIR}/efficiency.txt
+    if LWDP_needs_update_and_lock ${effTxt} ${bold} ${subjectIC}; then
+	regression ${bold} ${subjectIC} ${VISIT_RESULT_DIR}
+	LWDP_lockfile_delete ${effTxt}
+    fi
+
+    effTxtList="${effTxtList}${effTxt} "
+done 
+
+translateTxtToCSV ${rsMeasuresDIR}/visit_efficiency.csv ${effTxtList}
+
+
+
+

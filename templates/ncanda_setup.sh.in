@@ -1,0 +1,624 @@
+#!/bin/bash
+ 
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+export NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+export NCANDA_SOURCE_DIR=@NCANDA_SOURCE_DIR_CONFIG@
+export NCANDA_DATA_DIR=@DATA_DIR_CONFIG@
+
+if command -v lsb_release >/dev/null 2>&1; then
+  UBUNTU_VERSION=$(lsb_release -rs 2>/dev/null | cut -d. -f1)
+elif [ -r /etc/os-release ]; then
+  UBUNTU_VERSION=$(awk -F= '/^VERSION_ID=/{gsub(/"/, "", $2); split($2,a,"."); print a[1]}' /etc/os-release)
+else
+  UBUNTU_VERSION="unknown"
+fi
+
+echo "UBUNTU VERSION: $UBUNTU_VERSION"
+
+# 05/21/26: JD: Do not allow Conda runtime libraries to leak into compiled pipeline tools.
+# Conda's libstdc++/Qt/libtinfo can break ANTs, Workbench, CMTK, etc.
+sanitize_ld_library_path()
+{
+  if [ -n "${LD_LIBRARY_PATH}" ]; then
+    export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH}" | tr ':' '\n' | grep -v '/usr/local/tools/miniconda' | paste -sd: -)
+  fi
+}
+
+#
+# Setup input and output
+#
+
+if [ $# -gt 0 ]; then
+  if [ `echo ${1} | grep NCANDA_S | wc -l` -eq 1 ]; then
+    # remove trailing "/"
+    if [ "${1: -1:1}" == "/" ]; then
+      export WORKDIR=${1:: -1}
+    else
+      export WORKDIR=${1}
+    fi
+
+    export SUBJECT=$(echo ${WORKDIR} | sed 's/^.*\(NCANDA_S[0-9]\{5\}\).*$/\1/')
+    export ARM=$(echo ${WORKDIR} | sed 's/^.*NCANDA_S[0-9]\{5\}\/*\([^/]*\)\/.*$/\1/')
+    export VISIT=$(echo ${WORKDIR} | sed 's/^.*NCANDA_S[0-9]\{5\}\/*[^/]*\/*\([^/]*\).*$/\1/')
+    
+    # cases directory - e.g. /path/to/cases
+    export CASESDIR=$(echo ${WORKDIR} | sed "s/${SUBJECT}\/${ARM}\/${VISIT}.*//")
+    # stripping following slashes
+    if [ "${CASESDIR: -1:1}" == "/" ]; then
+      export CASESDIR=${CASESDIR:: -1}
+    fi
+    if [ "$CASESDIR" == "" ]; then
+      export CASESDIR=${PWD}
+    elif [ "${CASESDIR:0:1}" != "/" ]; then
+      export CASESDIR=${PWD}/${CASESDIR}
+    fi
+
+    # check demographics file
+    demographics=${CASESDIR}/${SUBJECT}/${ARM}/${VISIT}/measures/demographics.csv
+    if [ ! -e ${demographics} ]; then
+         echo "ERROR: ${demographics} missing."
+         exit 1
+    fi 
+    export SITE=`cat ${demographics} | tail -1  | cut -d, -f4`
+    
+    # If it is not baseline check that site did not change
+    if [ "${VISIT}" != "baseline" ]; then
+      demoBaseline=${CASESDIR}/${SUBJECT}/${ARM}/baseline/measures/demographics.csv
+      if [ ! -e ${demoBaseline} ]; then
+        echo "ERROR: ${demoBaseline} missing."
+        exit 1
+      fi
+      siteBase=`cat ${demoBaseline} | tail -1  | cut -d, -f4`
+      if [ "${SITE}" != "$siteBase"  ]; then
+        echo "WARNING: ${SUBJECT} changed sites (${VISIT}: ${SITE}, baseline: ${siteBase}). ${SUBJECT}/${ARM}/${VISIT} cannot be processed."
+        exit 1
+      fi
+    fi
+  fi
+fi
+
+#
+# Prepend Python binary directory
+#
+export PATH="@NCANDA_PYTHON_DIR@:${PATH}"
+sanitize_ld_library_path
+
+#
+# Include the Lightweight Data Pipeline script
+#
+export LWDP_DIR=${LWDP_DIR:-@NCANDA_LWDP_DIR@}
+source ${LWDP_DIR}/lwdp.sh
+
+is_manual_file() {
+   if [ "`echo $1 | rev | cut -d/ -f2 | rev`" == "manual" ]; then 
+       echo true 
+   else 
+       echo false
+   fi 
+}
+
+##
+## Determine number of CPUs allocated to this job.
+##
+if [ "${PBS_NUM_PPN}" != "" ]; then
+  export CMTK_NUM_THREADS=${PBS_NUM_PPN}
+  export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=${PBS_NUM_PPN}
+  export OMP_NUM_THREADS=${PBS_NUM_PPN}
+elif [ "${NSLOTS}" != "" ]; then
+  export CMTK_NUM_THREADS=${NSLOTS}
+  export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=${NSLOTS}
+  export OMP_NUM_THREADS=${NSLOTS}
+else
+  export PROC_NUM=`nproc`
+  #export THREAD_NUM=$(($PROC_NUM>4?4:$PROC_NUM))
+  export THREAD_NUM=$PROC_NUM
+
+  export CMTK_NUM_THREADS=${THREAD_NUM}
+  export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=${THREAD_NUM}
+  export OMP_NUM_THREADS=${THREAD_NUM}
+fi
+#echo "NUM_THREADS: $CMTK_NUM_THREADS"
+
+##
+## Determine virtual memory limit and set for Camino/Java
+##
+vmem=$(ulimit -v)
+if [ "${vmem}" != "unlimited" ]; then
+  # divide by 2 to be safe, and by 1000 to go from Kbytes (ulimit) to MBytes (camino/java)
+  javamem=$(expr ${vmem} / 2000)
+  export CAMINO_HEAP_SIZE=${javamem}
+fi
+
+#
+# Set up CMTK
+#
+
+# export CMTKDIR=${CMTKDIR:-@NCANDA_CMTKDIR@}
+export CMTKDIR=@NCANDA_CMTKDIR@
+
+if [ "${CMTKDIR}" = "" ]; then
+  echo "ERROR: must set 'CMTKDIR' environment variable to CMTK install directory"
+  exit 1
+fi
+
+cmtk()
+{
+  # Check if CMTK was built with or without wrapper
+  if [ -e ${CMTKDIR}/bin/cmtk ]; then
+    ${CMTKDIR}/bin/cmtk $*
+  else
+    ${CMTKDIR}/bin/$*
+  fi
+}
+
+#
+# Set up FSL
+#
+
+# export FSLDIR=${FSLDIR:-@NCANDA_FSLDIR@}
+export FSLDIR=@NCANDA_FSLDIR@
+
+if [ "${FSLDIR}" = "" ]; then
+  echo "ERROR: must set 'FSLDIR' environment variable to FSL root directory"
+  exit 1
+fi
+
+FSL_SH=${FSLDIR}/etc/fslconf/fsl.sh
+if [ ! -e ${FSL_SH} ]; then
+  echo "ERROR: FSL configuration script ${FSL_SH} does not exist."
+  exit 1
+fi
+
+source ${FSL_SH}
+sanitize_ld_library_path
+
+fsl()
+{
+  ${FSLDIR}/bin/$*
+}
+
+# Just for right now as eddy sometimes fails for fsl 5.0.6 
+# 05/16/26: Use current FSL CPU eddy implementation.
+# In newer FSL versions, legacy eddy_openmp was renamed/replaced by eddy_cpu.
+export fsl_eddy="$(command -v eddy_cpu)"
+
+fsl_epi_reg()
+{
+   epi_reg "$@"
+}
+#
+# Set up Camino
+#
+
+# export CAMINO_DIR=${CAMINO_DIR:-@NCANDA_CAMINO_DIR@}
+export CAMINO_DIR=@NCANDA_CAMINO_DIR@
+
+if [ "${CAMINO_DIR}" = "" ]; then
+  echo "ERROR: must set 'CAMINO_DIR' environment variable to Camino root directory"
+  exit 1
+fi
+
+camino()
+{
+  ${CAMINO_DIR}/bin/$*
+}
+
+#
+# Set up AFNI
+#
+
+# Do not write log files in home directory !
+export AFNI_DONT_LOGFILE=YES
+export AFNI_DIR=@NCANDA_AFNI_DIR@
+
+if [ "${AFNI_DIR}" = "" ]; then
+  echo "ERROR: must set 'AFNI_DIR' environment variable to AFNI binary directory"
+  exit 1
+fi
+
+afni()
+{
+  ${AFNI_DIR}/$*
+}
+
+#
+# Set up Slicer CLI
+#
+
+export SLICER_CLI=@NCANDA_SLICER_CLI_DIR@
+export LD_LIBRARY_PATH="@NCANDA_SLICER_CLI_DIR@/../:@NCANDA_SLICER_CLI_DIR@:@NCANDA_SLICER_CLI_DIR@/../qt-loadable-modules:@NCANDA_SLICER_CLI_DIR@/../../Python/lib:@NCANDA_SLICER_CLI_DIR@/../../Teem-1.12.0:${LD_LIBRARY_PATH}"
+
+#
+# Set up FreeSurfer
+#
+
+export FREESURFER_HOME=@NCANDA_FREESURFER_HOME@
+
+if [ "${FREESURFER_HOME}" = "" ]; then
+  echo "ERROR: must set 'FREESURFER_HOME' environment variable to FreeSurfer installation directory"
+  exit 1
+fi
+
+source ${FREESURFER_HOME}/SetUpFreeSurfer.sh
+sanitize_ld_library_path
+
+#
+# Prepend Python binary directory again avoid scripts silently ran FSL's Python instead
+#
+
+export PATH="@NCANDA_PYTHON_DIR@:${PATH}"
+sanitize_ld_library_path
+
+freesurfer_err_msg(){
+    FS_SUBJECT_DIR=$1
+    ERR_TXT=$2
+    LOGFILE=$3 
+    echo "$ERR_TXT - see ${LOGFILE} for more info" | ncanda_error_email $FS_SUBJECT_DIR 
+    ERR=`grep -i error ${LOGFILE}`
+    if [ "${ERR}" != "" ]; then 
+	echo "$ERR_TXT - ${LOGFILE} states:" 
+	printf "$ERR"
+	echo " " 
+	echo "Note: Based on the error, you might want to delete entire freesurfer directory and rerun it!" 
+    else 
+	echo "$ERR_TXT - no error messages in ${LOGFILE} so recon-all most likely did not complete !" 
+	echo "Try deleting entire freesurfer directory and rerun it!" 
+    fi 
+    exit 1
+}
+
+freesurfer_already_running() {
+    FS_SUBJECT_DIR=$1
+    is_running_file=${FS_SUBJECT_DIR}/scripts/IsRunning.lh+rh
+    if [ -e $is_running_file ]; then 
+	errTXT="ERROR:${FS_SUBJECT_DIR}: Cannot run freesurfer recon-all as ${is_running_file} exists !" 
+	echo $errTXT | ncanda_error_email ${FS_SUBJECT_DIR} 
+	echo $errTXT 
+	exit 1 
+    fi
+}
+
+# rm all data but in mri/orig and the lock file
+freesurfer_reset() {
+    DIR=$1
+    MRI_FLAG=$2
+
+    if [ "$DIR" == "" ]; then 
+	echo "ERROR:$WORKDIR:freesurfer_reset:DIR not defined"
+	exit 1
+    fi
+
+    DIR_LIST=`ls -1 --color=no $DIR 2> /dev/null`
+    if [ "$MRI_FLAG" != "" ]; then
+	DIR_LIST=`echo -e "$DIR_LIST" | grep -v mri`           
+    fi
+
+    lock_file=`cd $DIR; find . -name "*.lock"`
+    if [ `echo $lock_file | wc -w` -gt 1 ] ; then 
+	#sometimes called without lock file - work on it 
+	echo "ERROR:${DIR}:freesurfer_reset:Number of lock files greater 1 - not sure what do to ! Lock files: \"$lock_file\""
+	exit 1
+    fi
+
+    protect=""
+    if [ `echo $lock_file | wc -w` -eq 1 ] ; then 
+	# determine  FS/$dir
+	# lock_file starts with ./
+	protect=`echo $lock_file | cut -d'/' -f2`
+	#---
+	DIR_LIST=`echo -e "$DIR_LIST" | grep -v $protect`           
+    fi 
+
+    for FILE in $DIR_LIST; do 
+	rm -rf $DIR/$FILE
+    done
+
+    if [ "$MRI_FLAG" != "" ]; then
+	#----
+        DIR_LIST=`ls -1 --color=no $DIR/mri 2> /dev/null | grep -v orig`;
+	if [ "$protect" == "mri" ]; then 
+	    DIR_LIST=`echo -e "$DIR_LIST" | grep -v .lock`
+	fi 
+
+	for FILE in $DIR_LIST; do 
+	    rm -rf $DIR/mri/$FILE
+	done
+	for FILE in `ls --color=no $DIR/mri/orig 2> /dev/null | grep -v 001.mgz`; do 
+	    rm -rf $DIR/mri/orig/$FILE
+	done
+
+	if [ "$protect" == "mri" ]; then 
+	    return
+	fi
+    fi 
+
+    for FILE in `ls -1 --color=no $DIR/$protect 2> /dev/null | grep -v .lock`; do 
+	rm -rf $DIR/$protect/$FILE
+    done
+}
+
+# rm all data but in mri/orig and the lock file  
+freesurfer_create_csv() {
+    FS_DIR=$1 
+    subject=$2 
+    TYPE=$3 
+
+    FS_SUBJECT_DIR=${FS_DIR}/${subject}
+    mkdir -p "${FS_SUBJECT_DIR}/measures"   # 05/21/26:JD added to make sure measures exists
+
+    if [ "${TYPE}" == "cross" ]; then 
+        TEMPLATE_DIR=${NCANDA_DATA_DIR}/freesurfer/templates/cross
+    else 
+        TEMPLATE_DIR=${NCANDA_DATA_DIR}/freesurfer/templates/long
+    fi 
+
+    #
+    # Measurements created by standard freesurfer pipelne 
+    #
+    LIST="aseg lh.aparc.DKTatlas lh.w-g.pct rh.BA_exvivo wmparc lh.BA_exvivo rh.aparc.a2009s rh.BA_exvivo.thresh lh.aparc.a2009s lh.BA_exvivo.thresh rh.aparc lh.aparc rh.aparc.DKTatlas  rh.w-g.pct" 
+    # note longitudinal aseg does not contain: measure_lhsurfaceholes, measure_rhsurfaceholes, measure_surfaceholes
+
+     
+  for STATS_NAME in $LIST; do 
+    IN=${FS_SUBJECT_DIR}/stats/${STATS_NAME}.stats
+    OUT=${FS_SUBJECT_DIR}/measures/${STATS_NAME}.csv
+    TEMPLATE=${TEMPLATE_DIR}/${STATS_NAME}.csv
+
+    if [ ! -e "${IN}" ]; then
+        echo "WARNING:${FS_SUBJECT_DIR}: missing ${IN}; cannot create ${OUT}"
+        continue
+    fi
+
+    if [ ! -e "${TEMPLATE}" ]; then
+        echo "ERROR:${FS_SUBJECT_DIR}: missing template ${TEMPLATE}; cannot create ${OUT}"
+        continue
+    fi
+
+    if LWDP_needs_update_and_lock "${OUT}" "${IN}" "${TEMPLATE}"; then
+        bash "${NCANDA_SOURCE_DIR}/utils/turn_freesurfer_stats_into_csv" "${IN}" "${OUT}" "${TEMPLATE}"
+        chmod u+rw "${OUT}" 2>/dev/null || true
+        LWDP_lockfile_delete "${OUT}"
+    fi
+done
+
+    #
+    # Generate qc measures 
+    #
+
+    # WM SNR 
+    WM_SNR=${FS_SUBJECT_DIR}/measures/wmsnr.e3.csv
+    if LWDP_needs_update_and_lock ${WM_SNR} ${lastfile_stage_3}; then 
+	# creates FS stats file 
+	SUBJECTS_DIR="."
+	pushd $FS_DIR > /dev/null 
+	wm-anat-snr --s ${subject} &> ${subject}/scripts/wm-anat-snr.log
+	popd > /dev/null 
+
+	if [ -e ${FS_SUBJECT_DIR}/stats/wmsnr.e3.dat ]; then 
+	    bash ${NCANDA_SOURCE_DIR}/utils/turn_freesurfer_qc_into_csv wmsnr ${FS_SUBJECT_DIR} > /dev/null
+	fi 
+	LWDP_lockfile_delete ${WM_SNR}
+    fi
+
+  ASEG_OUTLIERS=${FS_SUBJECT_DIR}/measures/qatools-results.csv
+
+  if LWDP_needs_update_and_lock ${ASEG_OUTLIERS} ${lastfile_stage_3}; then 
+    mkdir -p "${FS_SUBJECT_DIR}/measures"
+    mkdir -p "${FS_SUBJECT_DIR}/scripts"
+    tmpdir=$(mktemp -d)
+
+    LOG_FILE_EXT="scripts/qatools_out.log"
+
+    # Run qatools.py from the FreeSurfer subjects directory.
+    pushd "$FS_DIR" > /dev/null
+    SUBJECTS_DIR="."
+    qatools.py \
+        --subjects_dir . \
+        --subjects "${subject}" \
+        --output_dir "${tmpdir}" \
+        &> $subject/$LOG_FILE_EXT
+    popd > /dev/null
+    
+    # Reformat qatools.py output to match NCANDA subject,arm,visit convention.
+    if [ -e "${tmpdir}/qatools-results.csv" ]; then 
+        echo "subject,arm,visit,$(head -n 1 "${tmpdir}/qatools-results.csv" | cut -d, -f2-)" \
+            > "${ASEG_OUTLIERS}"
+        tail -n 1 "${tmpdir}/qatools-results.csv" | awk -F, '
+          BEGIN { OFS="," }
+          {
+              n = split($1, id, "_");
+
+              subject = id[1] "_" id[2];
+              arm = id[3];
+
+              visit = id[4];
+              for (i = 5; i <= n; i++) {
+                  visit = visit "_" id[i];
+              }
+
+              $1 = "";
+              sub(/^,/, "");
+
+              print subject, arm, visit, $0;
+          }
+        ' >> "${ASEG_OUTLIERS}"
+    else
+        TXT="qatools.py did not produce ${tmpdir}/qatools-results.csv"
+        echo "ERROR:$WORKDIR:$TXT - check ${FS_SUBJECT_DIR}/${LOG_FILE_EXT}"
+        echo "WARNING:$TXT"   >> "${FS_SUBJECT_DIR}/${LOG_FILE_EXT}"
+    fi
+    rm -rf "${tmpdir}"
+    LWDP_lockfile_delete "${ASEG_OUTLIERS}"
+  fi
+}
+
+#
+# Set up ITK-SNAP
+#
+
+# export ITKSNAP=${ITKSNAP:-@NCANDA_ITKSNAP@}
+export ITKSNAP=@NCANDA_ITKSNAP@
+
+itksnap()
+{
+  local greyfile=$1
+  local labelfile=$2
+
+  ${ITKSNAP} --grey ${greyfile} --segmentation ${labelfile}
+}
+
+#
+# Set up ROBEX
+#
+
+# export ROBEX_DIR=${ROBEX_DIR:-@NCANDA_ROBEX_DIR@}
+export ROBEX_DIR=@NCANDA_ROBEX_DIR@
+
+robex_strip()
+{
+  local inp=$1
+  local out=$2
+  local msk=$3
+  
+  local tmpdir=$(mktemp -d)
+  cmtk convertx ${inp} ${tmpdir}/input.nii
+
+  pushd ${tmpdir}
+  ln -s ${ROBEX_DIR}/ref_vols .
+  ln -s ${ROBEX_DIR}/dat .
+  ${ROBEX_DIR}/ROBEX input.nii.gz brain.nii mask.nii
+  popd
+  cmtk convertx ${tmpdir}/brain.nii ${out}
+  cmtk convertx ${tmpdir}/mask.nii ${msk}
+  rm -rf ${tmpdir}
+}
+
+#
+# Set up ANTS
+#
+
+# export ANTS_DIR=${ANTS_DIR:-@NCANDA_ANTS_DIR@}
+export ANTS_DIR=@NCANDA_ANTS_DIR@
+
+if [ "${ANTS_DIR}" = "" ]; then
+  echo "ERROR: must set 'ANTS_DIR' environment variable to ANTS binary directory"
+  exit 1
+fi
+
+ants()
+{
+  ${ANTS_DIR}/$*
+}
+
+#
+# Set up C3D
+#
+
+# export C3D_DIR=${C3D_DIR:-@NCANDA_C3D_DIR@}
+export C3D_DIR=@NCANDA_C3D_DIR@
+
+if [ "${C3D_DIR}" = "" ]; then
+  echo "ERROR: must set 'C3D_DIR' environment variable to C3D root directory"
+  exit 1
+fi
+
+c3d()
+{
+  ${C3D_DIR}/bin/$*
+}
+
+#
+# Setup NAONLM
+#
+
+# export NAONLM_DIR=${NAONLM_DIR:-@NCANDA_NAONLM_DIR@}
+export NAONLM_DIR=@NCANDA_NAONLM_DIR@
+
+if [ "${NAONLM_DIR}" = "" ]; then
+  echo "ERROR: must set 'NAONLM_DIR' environment variable to NAONLM root directory"
+  exit 1
+fi
+
+naonlm()
+{
+  ${NAONLM_DIR}/bin/$*
+}
+
+#
+# Setup hcp workbench
+#
+
+# export CARET7_DIR=${CARET7_DIR:-@NCANDA_CARET7_DIR@}
+export CARET7_DIR=@NCANDA_CARET7_DIR@
+
+if [ "${CARET7_DIR}" = "" ]; then
+  echo "ERROR: must set 'CARET7_DIR' environment variable to HCP Workbench root directory"
+  exit 1
+fi
+
+# 05/21/26: JD: Workbench runtime libraries are needed for wb_command,
+# but should not be added globally because they can interfere with Slicer/ANTs.
+caret7()
+{
+  LD_LIBRARY_PATH="${CARET7_DIR}/libs_linux64:${LD_LIBRARY_PATH}" \
+    ${CARET7_DIR}/exe_linux64/$*
+}
+
+# Some pipeline scripts may call wb_command directly instead of through caret7.
+wb_command()
+{
+  LD_LIBRARY_PATH="${CARET7_DIR}/libs_linux64:${LD_LIBRARY_PATH}" \
+    ${CARET7_DIR}/exe_linux64/wb_command "$@"
+}
+
+#
+# Setup msm
+#
+
+# export MSM_DIR=${MSM_DIR:-@NCANDA_MSM_DIR@}
+export MSM_DIR=@NCANDA_MSM_DIR@
+
+if [ "${MSM_DIR}" = "" ]; then
+  echo "ERROR: must set 'MSM_DIR' environment variable to MSM root directory"
+  exit 1
+fi
+
+msm()
+{
+  ${MSM_DIR}/$*
+}
+
+#
+# Set up error mailing
+#
+ncanda_error_email()
+{
+  local addr="@NCANDA_PIPEOP_EMAIL@"
+  local subject="NCANDA Pipeline: $1"
+
+  # -r option does not work with all mailx versions 
+  eval "mailx -s \"${subject}\" ${addr}"
+}
+
+#
+# log mechanism 
+#
+log_and_execute()
+{
+  local cmd=$1
+  local outfile=$2
+  local outdir=`dirname $outfile`
+  mkdir -p $outdir
+  echo "${SVN_VERSION},$CMD" > ${outdir}/`basename ${outfile} | cut -d '.' -f 1`.cmd
+  $CMD 
+}
+

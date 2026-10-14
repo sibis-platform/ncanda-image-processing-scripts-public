@@ -1,0 +1,13 @@
+GE/Siemens diffusion correction maps (NCANDA human phantoms)
+
+Voxelwise correction maps between NCANDA's GE and Siemens scanners, derived from
+NCANDA human phantom scans.
+
+Files: <measure>_GE_Siemens_<method>.nii.gz
+  measure: fa, md, l1, lt
+  method:  local_mul, local_add, local_avg_mul, local_avg_add,
+           local_avg_whole_mul, local_avg_whole_add
+
+The diffusion pipeline applies these only when the site code in a visit's
+measures/demographics.csv is A or D. They are specific to NCANDA's scanners:
+do not apply them to other data.

@@ -1,0 +1,91 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL $
+##  $Revision: 2564 $
+##  $LastChangedDate: 2016-07-25 17:02:58 -0700 (Mon, 25 Jul 2016) $
+##  $LastChangedBy: dj0330 $
+##
+
+if [ "$4" == "" ]; then
+  echo "turns all QC files into a csv file"
+  echo "turn_restingstate_stats_into_csv <type> <workdir> <input file> <output file>  <atlas prefix - only for type=corr>"
+  echo "turn_restingstate_stats_into_csv art ${WORKDIR} ${WORKDIR}/restingstate/rs_specific_processing/qa/art/art.bold_noIntenCorr_4d_outliers.txt ${RESTING_DIR}/measures/rs_qa.csv"
+  echo "turn_restingstate_stats_into_csv cor ${WORKDIR} ${WORKDIR}/restingstate/correlation/sri24_2mm_epi/t1_gm_parc-correlations.txt ${RESTING_DIR}/measures/sro24_epi/sri24_parc116_gm_roi2roi_correlations.csv ${UTIL_DIR}/../data/sri24/parcellation/2mm/sri24_parc116_gm_roi2roi.csv"
+
+  exit 1
+fi
+
+UTIL_DIR=$(dirname $0)
+# source ${UTIL_DIR}/../bin/ncanda_setup.sh $*
+TYPE=$1
+WORKDIR=$2
+IN_FILE=$3
+OUT_FILE=$4
+ATLAS_PREFIX=$5
+
+SUBJECT_HEADER="subject,arm,visit"
+# SUBJECT_ID=`echo $WORKDIR | tr '/' ','`
+SUBJECT_ID=`echo $WORKDIR | sed 's/^.*\(NCANDA_S[0-9]\{5\}\)\/*\([^/]*\)\/*\([^/]*\).*$/\1,\2,\3/'`
+
+
+if [ ! -e  $IN_FILE ]; then
+    echo "ERROR: $IN_FILE is missing !"
+    exit 1
+fi 
+
+if [ "$TYPE" == "art" ]; then  
+    numOutliers=`wc -l ${IN_FILE} | cut -d' ' -f1`
+    echo "${SUBJECT_HEADER},rs_num_outliers" > ${OUT_FILE}  
+    echo "${SUBJECT_ID},$numOutliers" >> ${OUT_FILE}
+    exit 0 
+fi
+
+if [ "$ATLAS_PREFIX" == "" ]; then 
+    echo "ERROR: Please defined atlas prefix!" 
+    exit 1
+fi 
+
+roiIndex=`tail -n1 ${ATLAS_PREFIX}.csv`
+numLines=`echo ${roiIndex} | tr ',' '\n' | wc -l`
+if  [ `wc -l $IN_FILE | cut -d' ' -f1` -ne $numLines ]; then
+    echo "ERROR: Incorrect number of lines in $IN_FILE (is: `wc -l $IN_FILE| cut -d' ' -f1` should: $numLines)"
+    exit 1
+fi 
+
+ROW="$SUBJECT_ID"
+lIndex=0
+vIndex=0
+while IFS='' read -r line || [[ -n "$line" ]]; do
+    if [ `echo $line | wc -w` -ne $numLines ]; then
+	echo "ERROR: Incorrect number of entries in line $line of $IN_FILE"
+	exit 1
+    fi 
+
+    # Skipping lines that are not in the lis - old style t 
+    # lIndex=$((lIndex+1))
+    # if [ "`echo $roiIndex | grep $lIndex`" == "" ]; then
+    #	echo "Info: skip $lIndex"
+    #	continue 
+    # fi 
+    vIndex=$((vIndex+1))
+    # iList=`echo $roiIndex | cut -d',' -f${vIndex}-`
+    # ROW="${ROW},`echo $line| cut -d' ' -f${iList} | tr ' ' ',' | sed 's/nan//g' | tr -d ' '`"
+    ROW="${ROW},`echo $line| cut -d' ' -f${vIndex}- | tr ' ' ',' | sed 's/nan//g' | tr -d ' '`"
+     
+done < $IN_FILE  
+numValues=`echo "$ROW" | tr -cd ',' | wc -c`
+
+# Header
+HEADER="$SUBJECT_HEADER,`head ${ATLAS_PREFIX}_roi2roi.csv`"
+numExpValues=`echo "$HEADER" | tr -cd ',' | wc -c`
+if [  $numValues -ne $numExpValues ]; then
+    echo "ERROR: something went wrong in $IN_FILE (Num Values: $numValues Expected: $numExpValues)" 
+    exit 1
+fi
+
+echo "$HEADER"> ${OUT_FILE}
+echo "$ROW" >> ${OUT_FILE}

@@ -1,0 +1,9 @@
+NCANDA group ICA for resting-state dual regression
+
+0000.nii.gz ... 0024.nii.gz           25 group-level component maps, one per file
+results_8mm_d25_dx/melodic_IC.nii.gz  the group ICA components as a single 4D image
+
+Estimated with FSL MELODIC on NCANDA resting-state data.
+ncanda_restingstate_longitudinal_pipeline uses them for dual regression.
+
+Group-level data only; no individual participant data are included.

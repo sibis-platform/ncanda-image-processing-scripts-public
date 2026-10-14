@@ -1,0 +1,260 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh ""
+
+# Check for command line arguments, print help if none given
+if test $# -lt 2; then
+  echo "Correct distortion and subject motion in diffusion-weighted MR images."
+  echo
+  echo "For this script to be applicable, the b=0 image must have been acquired twice, "
+  echo "once with standard phase encoding direction and once with phase encoding reversed."
+  echo
+  echo "USAGE: $0 outdir b0Reverse b0Forward bX1 [bX2 ...]"
+  exit 2
+fi
+
+outdir=$1
+b0Rev=$2
+b0Fwd=$3
+
+if ! cmtk geomatch -v --tolerance-xlate 5e-2 ${b0Rev} ${b0Fwd}; then
+  TXT="ERROR: the two b=0 images have mismatched geometries or spatial coordinates:\n  ${b0Rev}\n  ${b0Fwd}"
+  echo -e "$TXT"
+  echo -e "$TXT" | ncanda_error_email $(basename $0)
+  exit 1
+fi
+
+shift 3
+bXlist="$*"
+
+#
+# First, do eddy currents by registering all bX images to forward b=0 image
+#
+for bX in ${bXlist}; do
+  base=$(basename $bX)
+  pref=$(echo ${base} | sed 's/\..*//g')
+
+  xform=${outdir}/eddy/${pref}_b0.xform
+  if LWDP_needs_update_and_lock ${xform} ${b0Fwd} ${bX}; then
+    # Compute inverse transformation so image with masked bad slices is the fixed image - this is more stable and leads to better transformations
+    cmtk registrationx --pad-ref -1 --restrict-in-plane xy --dofs 3,3003 --auto-multi-levels 3 --ncc -o ${xform} ${bX} ${b0Fwd}
+    #cmtk registrationx --pad-ref -1 --linear --dofs 6,6 --auto-multi-levels 3 --ncc -o ${xform} ${bX} ${b0Fwd}
+    LWDP_lockfile_delete ${xform}
+  fi
+done
+
+b0FwdCorr=${outdir}/unwarp_eddy/$(basename ${b0Fwd})
+b0RevCorr=${outdir}/unwarp_eddy/$(basename ${b0Rev})
+if LWDP_needs_update_and_lock ${outdir}/dfield_fwd.nrrd ${b0Fwd} ${b0Rev}; then
+  echo "Computing deformation..."
+  cmtk epiunwarp --no-flip --write-jacobian-fwd ${outdir}/jacobian.nii.gz --smooth-sigma-max 16 --smooth-sigma-min 0 --smooth-sigma-diff 0.25 --iterations 5 --smoothness-constraint-weight 1e4 --phase-encode-ap ${b0Fwd} ${b0Rev} ${b0FwdCorr} ${b0RevCorr} ${outdir}/dfield_fwd.nrrd
+  LWDP_lockfile_delete ${outdir}/dfield_fwd.nrrd
+fi
+
+unwarpedList="${b0FwdCorr}"
+for bX in ${bXlist}; do
+  base=$(basename $bX)
+  pref=$(echo ${base} | sed 's/\..*//g')
+  xform=${outdir}/eddy/${pref}_b0.xform
+
+  if LWDP_needs_update_and_lock ${outdir}/unwarp_eddy/${base} ${bX} ${outdir}/dfield_fwd.nrrd ${xform} ${b0FwdCorr}; then
+    tmpdir=$(mktemp -d)
+    # First, reslice using PEpolar unwarp and eddy current correction
+    cmtk reformatx --sinc-cosine -o ${tmpdir}/reslice.nii.gz --pad-floating -1 --floating ${bX} ${b0FwdCorr} ${outdir}/dfield_fwd.nrrd --inverse ${xform}
+    # Second, multiply with Jacobian volume correction field
+    cmtk imagemath --in ${outdir}/jacobian.nii.gz ${tmpdir}/reslice.nii.gz --mul --out ${tmpdir}/reslice_j.nii.gz
+    # Third, make a mask of bad slices (0 - bad slice, 1 - good slice), based on requirement that bad slices be marked as -1
+    cmtk convertx --float --binarize-thresh -0.5 --byte ${bX} ${tmpdir}/mask.nii.gz
+    # Apply bad-slice mask back to resliced and Jacobian-corrected volume
+    cmtk convertx --thresh-below 0 --set-padding -1 --mask ${tmpdir}/mask.nii.gz ${tmpdir}/reslice_j.nii.gz ${outdir}/unwarp_eddy/${base}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${outdir}/unwarp_eddy/${base}
+  fi
+
+  unwarpedList="${unwarpedList} ${outdir}/unwarp_eddy/${base}"
+done
+
+##
+## Motion correction
+##
+
+average=${outdir}/unwarp_eddy/bAverage.nii.gz
+if LWDP_needs_update_and_lock ${average} ${b0FwdCorr} ${b0RevCorr} ${unwarpedList}; then
+  cmtk imagemath --set-padding-value -1 --in ${b0FwdCorr} ${b0RevCorr} ${unwarpedList} --average --out ${average}
+  #list=`echo ${unwarpedList} | cut -d " " -f3-`
+  #cmtk imagemath --set-padding-value -1 --in ${list} --average --out ${average}
+  LWDP_lockfile_delete ${average}
+fi
+
+# Determine non-translational part of image-to-standard space transformation for this series
+average_i2s_xform=${outdir}/unwarp_eddy/bAverage_i2s.xform
+if LWDP_needs_update_and_lock ${average_i2s_xform} ${average}; then
+  tmpdir=$(mktemp -d)
+  # First, get the transformation from on-disk image coordinates to physical space
+  cmtk describe -m ${average} | fgrep I2P | cut -f2-4 | cmtk mat2dof --transpose -3 -o ${tmpdir}/i2p_image
+  # Second, get the transformation from image coordinates to physical space after reorientation to (registration) standard space, RAS
+  cmtk describe -m --read-ras ${average} | fgrep I2P | cut -f2-4 | cmtk mat2dof --transpose -3 -o ${tmpdir}/i2p_standard
+  # Third, make transformation from on-disk to standard image space by concatenation
+  cmtk concat_affine -o ${average_i2s_xform} ${tmpdir}/i2p_image --inverse ${tmpdir}/i2p_standard
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${average_i2s_xform}
+fi
+
+# Check if the input images are 128x128 in-slice. Create template for resampling if not
+template=${average}
+if [ $(cmtk describe -m ${average} | fgrep XDIM | cut -f2) != "128" ]; then
+  template=${outdir}/template128.hdr
+  if LWDP_needs_update_and_lock ${template} ${average}; then
+    zdim=$(cmtk describe -m ${average} | fgrep ZDIM | cut -f2)
+    cmtk mk_nifti_hdr --import ${average} --dims 128,128,$zdim --voxel 1.875,1.875,2.5 ${template}
+    LWDP_lockfile_delete ${template}
+  fi
+fi
+
+# Do motion correction, reslicing, and gradient correction
+motionList=""
+for bX in ${b0Fwd} ${bXlist}; do
+  base=$(basename $bX)
+  bXUnwarp=${outdir}/unwarp_eddy/${base}
+  pref=$(echo ${base} | sed 's/\..*//g')
+
+  xform=${outdir}/motion/${pref}_bAvgUnwarp.xform
+  if [ "${bX}" == "${b0Fwd}" ]; then
+    if LWDP_needs_update_and_lock ${xform} ${average} ${bXUnwarp} ; then
+      # Compute inverse transformation so image with masked bad slices is the fixed image - this is more stable and leads to better transformations
+      cmtk registrationx --pad-ref -1 --linear --dofs 6,6 --auto-multi-levels 3 --ncc -o ${xform} ${bXUnwarp} ${average}
+      LWDP_lockfile_delete ${xform}
+    fi
+  else
+    # For all but the first b=0 image, we should use the eddy current correction as initializer so we don't need to do that part again
+    eddy_xform=${outdir}/eddy/${pref}_b0.xform
+    if LWDP_needs_update_and_lock ${xform} ${average} ${bXUnwarp}; then
+      # Compute inverse transformation so image with masked bad slices is the fixed image - this is more stable and leads to better transformations
+      cmtk registrationx --pad-ref -1 --linear --dofs 6,6 --auto-multi-levels 3 --ncc -o ${xform} --initial ${eddy_xform} ${bXUnwarp} ${average}
+      LWDP_lockfile_delete ${xform}
+    fi
+  fi
+
+  xml_file="$(echo ${bX} | sed 's/\.gz//g').xml"
+  gradient=${outdir}/motion/${pref}.gradient
+  if LWDP_needs_update_and_lock ${gradient} ${xform} ${average_i2s_xform} ${xml_file}; then
+    tmpfile=$(mktemp)
+    # Make a zero-translation copy of motion transform for gradient reorientation
+    if ! (cmtk dof2mat --matrix3x3 ${xform} | cmtk mat2dof --matrix3x3 -o ${tmpfile}); then
+      echo "ERROR: failed to create gradient file ${gradient} on host $(hostname)." | ncanda_error_email $(basename $0)
+      exit 1
+    fi
+
+    if ! (fgrep bVectorImage ${xml_file} | sed 's/^[^<]*<[^<]*>//g; s/<[^<]*>[^<]*$//g' | cmtk streamxform ${average_i2s_xform} ${tmpfile} --inverse ${average_i2s_xform} > ${gradient}); then
+      echo "ERROR: failed to create gradient file ${gradient} on host $(hostname)." | ncanda_error_email $(basename $0)
+      rm ${gradient}
+      exit 1
+    fi
+    rm -f ${tmpfile}
+    LWDP_lockfile_delete ${gradient}
+  fi
+
+  if LWDP_needs_update_and_lock ${outdir}/motion/${base} ${template} ${bXUnwarp} ${xform}; then
+    tmpdir=$(mktemp -d)
+    # First, re-reslice the unwarped image
+    cmtk reformatx --sinc-cosine -o ${tmpdir}/reslice.nii.gz --pad-floating -1 --floating ${bXUnwarp} ${template} --inverse ${xform}
+    # Second, make a mask of bad slices (0 - bad slice, 1 - good slice), based on requirement that bad slices be marked as -1
+    cmtk convertx --float --binarize-thresh -0.5 ${bX} ${tmpdir}/mask.nii.gz
+    # Third, reslice the mask using the same motion xform and interpolation as the image
+    cmtk reformatx --sinc-cosine -o ${tmpdir}/mask_reslice.nii.gz --floating ${tmpdir}/mask.nii.gz ${template} --inverse ${xform}
+    # Fourth, threshold resliced mask to include only those pixels that have more then 50% support
+    cmtk convertx --binarize-thresh 0.5 ${tmpdir}/mask_reslice.nii.gz ${tmpdir}/mask_thresh.nii.gz
+    # Fifth, create final image by masking out pixels with under 50% support
+    cmtk convertx --set-padding -1 --mask ${tmpdir}/mask_thresh.nii.gz --thresh-below 0 ${tmpdir}/reslice.nii.gz ${outdir}/motion/${base}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${outdir}/motion/${base}
+  fi
+
+  motionList+=" ${outdir}/motion/${base}"
+done
+
+# Average the motion-corrected images
+average_motion=${outdir}/motion/bAverage.nii.gz
+if LWDP_needs_update_and_lock ${average_motion} ${motionList}; then
+  cmtk imagemath --set-padding-value -1 --in ${motionList} --average --out ${average_motion}
+  #list=`echo ${motionList} | cut -d " " -f3-`
+  #cmtk imagemath --set-padding-value -1 --in ${list} --average --out ${average_motion}
+  LWDP_lockfile_delete ${average_motion}
+fi
+
+# Do second round of motion correction, reslicing, and gradient correction, using the first-round average image
+for bX in ${b0Fwd} ${bXlist}; do
+  base=$(basename $bX)
+  bXUnwarp=${outdir}/unwarp_eddy/${base}
+  pref=$(echo ${base} | sed 's/\..*//g')
+
+  # Use the first-round correction as initializer so we don't need to do that part again
+  xform=${outdir}/final/${pref}_bAvgMotion.xform
+  first_round_xform=${outdir}/motion/${pref}_bAvgUnwarp.xform
+  if LWDP_needs_update_and_lock ${xform} ${first_round_xform} ${bXUnwarp} ${average_motion}; then
+    # Compute inverse transformation so image with masked bad slices is the fixed image - this is more stable and leads to better transformations
+    cmtk registrationx --pad-ref -1 --linear --dofs 6,6 --auto-multi-levels 2 --ncc -o ${xform} --initial ${first_round_xform} ${bXUnwarp} ${average_motion}
+    LWDP_lockfile_delete ${xform}
+  fi
+
+  xml_file="$(echo ${bX} | sed 's/\.gz//g').xml"
+  gradient=${outdir}/final/${pref}.gradient
+  if LWDP_needs_update_and_lock ${gradient} ${xform} ${average_i2s_xform} ${xml_file}; then
+    tmpfile=$(mktemp)
+    # Make a zero-translation copy of motion transform for gradient reorientation
+    if ! (cmtk dof2mat --matrix3x3 ${xform} | cmtk mat2dof --matrix3x3 -o ${tmpfile}); then
+      echo "ERROR: failed to create gradient file ${gradient} on host $(hostname)." | ncanda_error_email $(basename $0)
+      exit 1
+    fi
+    
+    if ! (fgrep bVectorImage ${xml_file} | sed 's/^[^<]*<[^<]*>//g; s/<[^<]*>[^<]*$//g' | cmtk streamxform ${average_i2s_xform} ${tmpfile} --inverse ${average_i2s_xform} > ${gradient}); then
+      echo "ERROR: failed to create gradient file ${gradient} on host $(hostname)." | ncanda_error_email $(basename $0)
+      rm ${gradient}
+      exit 1
+    fi
+    rm -f ${tmpfile}
+    LWDP_lockfile_delete ${gradient}
+  fi
+
+  if LWDP_needs_update_and_lock ${outdir}/final/${base} ${template} ${bX} ${bXUnwarp} ${xform}; then
+    tmpdir=$(mktemp -d)
+    # First, re-reslice the unwarped image
+    cmtk reformatx --sinc-cosine -o  ${tmpdir}/reslice.nii.gz --pad-floating -1 --floating ${bXUnwarp} ${template} --inverse ${xform}
+    # Second, make a mask of bad slices (0 - bad slice, 1 - good slice), based on requirement that bad slices be marked as -1
+    cmtk convertx --float --binarize-thresh -0.5 ${bX} ${tmpdir}/mask.nii.gz
+    # Third, reslice the mask using the same motion xform and interpolation as the image
+    cmtk reformatx --sinc-cosine -o ${tmpdir}/mask_reslice.nii.gz --floating ${tmpdir}/mask.nii.gz ${template} --inverse ${xform}
+    # Fourth, threshold resliced mask to include only those pixels that have more then 50% support
+    cmtk convertx --binarize-thresh 0.5 ${tmpdir}/mask_reslice.nii.gz ${tmpdir}/mask_thresh.nii.gz
+    # Fifth, create final image by masking out pixels with under 50% support
+    cmtk convertx --set-padding -1 --mask ${tmpdir}/mask_thresh.nii.gz --thresh-below 0 ${tmpdir}/reslice.nii.gz ${outdir}/final/${base}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${outdir}/final/${base}
+  fi
+
+  finalList+=" ${outdir}/final/${base}"
+done
+
+# Average the final images
+average_final=${outdir}/final/bAverage.nii.gz
+if LWDP_needs_update_and_lock ${average_final} ${finalList}; then
+  cmtk imagemath --set-padding-value -1 --in ${finalList} --average --out ${average_final}
+  #list=`echo ${finalList} | cut -d " " -f3-`
+  #cmtk imagemath --set-padding-value -1 --in ${list} --average --out ${average_final}
+  LWDP_lockfile_delete ${average_final}
+fi
+

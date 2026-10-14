@@ -1,0 +1,38 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+path=$1
+if [ ! -d ${path}/diffusion ]; then
+  echo "Provide path to subject/arm/visit"
+  exit 1
+fi
+
+if [ ! -e ${path}/diffusion/native/dti60b1000/dti60-01.nii ] ; then 
+  if [ ! -e ${path}/diffusion/native/dti60b1000/dti60-01.nii.gz ] ; then 
+    echo "Error: could not find file ${path}/diffusion/native/dti60b1000/dti60-01"
+    echo "`ls  ${path}/diffusion/native/dti60b1000/dti60*`"
+    exit 1
+  fi 
+fi 
+
+cmtk make_initial_affine --direction-vectors ${path}/diffusion/native/dti60b1000/dti60-01.nii ${path}/diffusion/native/dti6b500pepolar/dti6-1.nii ${path}/diffusion/native/dti6b500pepolar/manual/dti60-dti6-dicom.xform
+for i in 1 2 3 4 5 6 7; do
+  cmtk reformatx --sinc-cosine -o ${path}/diffusion/native/dti6b500pepolar/manual/dti6-${i}.nii --floating ${path}/diffusion/native/dti6b500pepolar/dti6-${i}.nii ${path}/diffusion/native/dti60b1000/dti60-01.nii ${path}/diffusion/native/dti6b500pepolar/manual/dti60-dti6-dicom.xform
+done
+
+echo "Auto-adjusted location of dti6b500pepolar series to match dti60b1000 series." $(date) >> ${path}/diffusion/native/dti6b500pepolar/manual/README
+
+
+
+if [ -x "$(dirname $0)/upload_pipeline_manual" ]; then
+  "$(dirname $0)/upload_pipeline_manual" ${path}/diffusion
+fi

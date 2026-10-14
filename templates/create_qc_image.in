@@ -1,0 +1,452 @@
+#!/bin/bash
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+source  ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+if ! type "convert" > /dev/null; then
+    echo "ERROR: imagemagic needs to be installed" 
+    exit 1 
+fi 
+
+if ! type "slicesdir_panel" > /dev/null; then
+    echo "ERROR: fsl needs slicesdir_panel installed - a modified version of slicesdir" 
+    exit 1 
+fi 
+
+if [ ! -d $WORKDIR/structural ]; then
+   exit 0 
+fi 
+
+QC_IMG_LABEL=qc_images
+QC_IMG_DIR=$WORKDIR/${QC_IMG_LABEL}
+
+QC_IMG_UPDATE=0
+#
+# Functions 
+#
+LWDP_needs_update_and_lock_flag ()
+{
+    # Hack: so I do not have to keep track of every image  
+    if LWDP_needs_update_and_lock $*; then
+	QC_IMG_UPDATE=1
+	return 0
+    fi
+    return 1 
+}
+ 
+fs_3dmodels()
+{
+    # should be lh or rh 
+    SIDE=$1
+    SIDE_ID=${VISIT_ID}.${SIDE}
+    fs_3dmodels_pic=$FS_IMG_DIR/${SIDE_ID}.lat.hr
+
+    fs_surface=${SUBJECTS_DIR}/${VISIT_ID}/surf/${SIDE}.pial 
+
+    if LWDP_needs_update_and_lock_flag ${fs_3dmodels_pic}.gif  ${fs_surface}; then
+	echo "scale_brain 1.35"							>>$FS_IMG_DIR/tmp.tcl
+	echo "redraw"									>>$FS_IMG_DIR/tmp.tcl
+	echo "save_tiff ${fs_3dmodels_pic}.tif"			>>$FS_IMG_DIR/tmp.tcl
+	echo "rotate_brain_y 180.0"						>>$FS_IMG_DIR/tmp.tcl
+	echo "redraw"									>>$FS_IMG_DIR/tmp.tcl
+	echo "save_tiff $FS_IMG_DIR/${SIDE_ID}.med.hr.tif"			>>$FS_IMG_DIR/tmp.tcl
+	echo "resize_window 300"						>>$FS_IMG_DIR/tmp.tcl
+	echo "rotate_brain_y -180.0"					>>$FS_IMG_DIR/tmp.tcl
+	echo "redraw"									>>$FS_IMG_DIR/tmp.tcl
+	echo "redraw"									>>$FS_IMG_DIR/tmp.tcl
+	echo "save_tiff $FS_IMG_DIR/${SIDE_ID}.lat.lr.tif"			>>$FS_IMG_DIR/tmp.tcl
+	echo "rotate_brain_y 180.0"						>>$FS_IMG_DIR/tmp.tcl
+	echo "redraw"									>>$FS_IMG_DIR/tmp.tcl
+	echo "save_tiff $FS_IMG_DIR/${SIDE_ID}.med.lr.tif"			>>$FS_IMG_DIR/tmp.tcl
+	echo "exit 0"									>>$FS_IMG_DIR/tmp.tcl
+
+	# need to do that bc tksurfer creates log files in current directory  
+	# SUBJECTS_DIR=../${FS_REF}
+	pushd $FS_IMG_DIR > /dev/null
+	tksurfer $VISIT_ID ${SIDE} pial -tcl $FS_IMG_DIR/tmp.tcl &> $FS_IMG_DIR/tksurfer_${SIDE}_pial.log
+	rm $FS_IMG_DIR/tmp.tcl
+	rm -rf .xdebug_tksurfer
+	
+	for FILE in $SIDE_ID.lat.lr $SIDE_ID.med.lr $SIDE_ID.lat.hr $SIDE_ID.med.hr; do 
+	    convert $FS_IMG_DIR/$FILE.tif $FS_IMG_DIR/$FILE.gif
+	    rm $FS_IMG_DIR/$FILE.tif
+	done
+	
+	popd > /dev/null  
+
+	LWDP_lockfile_delete ${fs_3dmodels_pic}.gif
+    fi
+}
+
+change_orientation_to_fslstd() {
+    MRI=$1
+    OUT=$2/`basename $MRI`
+    if [ ! -e $MRI ]; then
+	echo "ERROR: No $MRI" 
+	return 
+    fi 
+
+    fslreorient2std $MRI $OUT
+    echo $OUT
+    return 
+
+}
+
+create_2Dimages() {
+    MRI=$1
+    OUT=$2
+    MASK=$3
+
+    TYPE=structural
+
+    tmpDir=`mktemp -d`
+    logFile=$tmpDir/`basename $OUT`.log
+
+    tmpMRI=`change_orientation_to_fslstd $MRI ${tmpDir}`
+
+    ARGS=
+    if [ "${MASK}" != "" ]; then
+	tmpMASK=`change_orientation_to_fslstd $MASK ${tmpDir}`
+	ARGS="-p ${tmpMASK}"
+    fi
+
+    # needs to be done otherwise puts slicesdir where ever you are exectuing script 
+    pushd $tmpDir > /dev/null  
+    slicesdir $ARGS ${tmpMRI} &> $logFile
+    popd > /dev/null  
+    convert +append $tmpDir/slicesdir/grot*.png ${OUT}.gif
+    rm $tmpDir/slicesdir/*.png
+
+    echo "============== ZOOM =====">> $logFile
+    pushd $tmpDir > /dev/null  
+    slicesdir_panel $ARGS -P ${tmpMRI} &>> $logFile
+    popd > /dev/null
+
+    convert $tmpDir/slicesdir/_tmp_tmp*.png ${OUT}_zoom.gif
+
+    # convert +append $tmpDir/slicesdir/grota.png $tmpDir/slicesdir/grotb.png $tmpDir/slicesdir/grotc.png $tmpDir/slicesdir/zoom_1.gif
+    # convert +append $tmpDir/slicesdir/grotd.png $tmpDir/slicesdir/grote.png $tmpDir/slicesdir/grotf.png $tmpDir/slicesdir/zoom_2.gif
+    # convert +append $tmpDir/slicesdir/grotg.png $tmpDir/slicesdir/groth.png $tmpDir/slicesdir/groti.png $tmpDir/slicesdir/zoom_3.gif
+    # convert -append $tmpDir/slicesdir/zoom_1.gif $tmpDir/slicesdir/zoom_2.gif $tmpDir/slicesdir/zoom_3.gif ${OUT}_zoom.gif
+
+    # $tmpDir/slicesdir/grota.png 
+
+    # pushd $tmpDir > /dev/null    
+    # echo "============= $ZOOM ==========" >> $logFile 
+    # slicesdir $ARGS -S ${tmpMRI} &>> $logFile
+    # popd > /dev/null  
+    # convert -crop 1435x3250+0+1000 $tmpDir/slicesdir/grota.png ${OUT}_zoom.gif
+    # convert $tmpDir/slicesdir/grota.png ${OUT}_zoom.gif
+
+
+    [ -e $logFile ] &&  mv ${logFile} `dirname $OUT`/.
+    rm -rf  $tmpDir
+    return 
+}
+
+print_img_html() {
+    NUMCOLS=$1 
+    IMG=$2
+    ZOOM=$3
+    if [ "$ZOOM" == "" ]; then
+	ZOOM=false
+    fi 
+
+    if [ ${NUMCOLS} -eq 5 ]; then 
+	WIDTH=910 
+    else 
+	WIDTH=150
+    fi 
+
+    if [ -e ${DIR}/${IMG} ]; then 
+	if $ZOOM; then 
+	    LINK=${DIR}/`echo ${IMG} | cut -d. -f1`_zoom.gif
+	else 
+	    LINK=${DIR}/${IMG}
+	fi
+	echo "<td colspan=${NUMCOLS} WIDTH=\"${WIDTH}\"><a href=\"${LINK}\"><img src=\"${DIR}/${IMG}\" WIDTH=\"${WIDTH}\" ></a></td>" 
+    else 
+	echo "<td colspan=${NUMCOLS} WIDTH=\"${WIDTH}\">No ${IMG}</td>"
+    fi
+
+}
+
+print_overview_html() { 
+    DIR=${PWD}/${QC_IMG_DIR} 
+    NUM_IMG_ROWS=5
+
+    echo "<html>" 
+    echo "<table>"
+    echo "<tr>" 
+    echo "<td align=LEFT colspan=6><H1>"$WORKDIR Cross-Sectional"</H1></td>" 
+    echo "</tr>" 
+
+    echo "<tr>"  
+    if $extra_mask; then   
+      echo "<td rowspan=3><h2>Mask </h2></td>"
+      print_img_html ${NUM_IMG_ROWS} mask/voting_mask.gif true
+      echo "</tr>"  
+      echo "<tr>"   
+    else
+      echo "<td rowspan=2><h2>Mask </h2></td>"
+    fi 
+    print_img_html ${NUM_IMG_ROWS} mask/t1_mask.gif true
+    echo "</tr>"  
+    echo "<tr>"   
+    print_img_html ${NUM_IMG_ROWS} mask/t2_mask.gif true
+    echo "</tr>"  
+
+    echo "<tr>"  
+    echo "<td rowspan=2><h2>FA </h2></td>"
+    print_img_html ${NUM_IMG_ROWS} diffusion/fa.gif true
+    echo "</tr>"  
+    echo "<tr>"   
+    print_img_html ${NUM_IMG_ROWS} diffusion/fa_skeleton.gif true
+    echo "</tr>"  
+
+    echo "<tr>"  
+    echo "<td rowspan=1><h2>Bold </h2></td>"
+    print_img_html ${NUM_IMG_ROWS} restingstate/bold_mask.gif true
+    echo "</tr>"  
+
+    echo "<tr>"     
+    echo "<td rowspan=2><h2>FS </h2></td>"	
+    print_img_html 1 ${FS_REF}/aseg_sag.png
+    print_img_html 1 ${FS_REF}/aseg_cor.png
+    print_img_html 1 ${FS_REF}/aseg_axi.png
+    echo "<td> </td>"
+    echo "<td> </td>"
+    echo "</tr>"  
+    echo "<tr>"     
+    print_img_html 1 ${FS_REF}/$VISIT_ID.lh.lat.hr.gif
+    print_img_html 1 ${FS_REF}/$VISIT_ID.lh.med.hr.gif
+    print_img_html 1 ${FS_REF}/$VISIT_ID.rh.lat.hr.gif
+    print_img_html 1 ${FS_REF}/$VISIT_ID.rh.med.hr.gif
+    echo "<td> </td>"
+    echo "</tr>"  
+
+    echo "</table>"	
+    echo "</html>"	
+} 
+
+
+reset_entries() {
+    review="$1" 
+    preserve_end=$2 
+    preserve_start=$((preserve_end+3))
+    START="`echo $review |cut -d, -f1-${preserve_end}`"
+    END="`echo $review |cut -d, -f${preserve_start}-`"
+    if [ "$END" == "" ]; then 
+	echo "${START},,"
+    else 
+	echo "${START},,,${END}"
+    fi 
+} 
+
+# Created original file:  
+#for CASE in NCANDA_S0*/standard/followup_{1,2,3}y; do if [ -e $CASE/qc_images/index.html ]; then review_file=$CASE/qc_images/qc_review.csv; echo "subject,arm,visit,t1_mask_passed,t1_mask_note,t2_alignment_passed,t2_alignment_note,fa_alignment_passed,fa_alignment_note,fa_skeleton_passed,fa_skeleton_note,bold_passed,bold_note,fs_cross_passed,fs_cross_note,fs_longitudinal_passed,fs_longitudinal_note" > $review_file ; DATE=`date +%Y-%m-%d`; RESULT=`echo $CASE | tr "/" ","`,$DATE,,$DATE,,$DATE,,$DATE,,$DATE,,$DATE,; if [ -e $CASE/qc_images/index_longitudinal.html ]; then  echo "${RESULT},$DATE," >> $review_file; else echo "${RESULT},," >> $review_file; fi; fi; done
+
+review_file=${QC_IMG_DIR}/qc_review.csv 
+if [ -e $review_file ]; then
+    orig_review="`tail -n1 $review_file`" 
+    review="$orig_review"
+else 
+    orig_review=""
+    review="`echo $WORKDIR | tr "/" ","`,,,,,,,,,,,,,,"
+fi    
+
+
+#
+# Brain Mask  
+#
+
+[ -d  ${QC_IMG_DIR}/mask ] || mkdir -p ${QC_IMG_DIR}/mask
+
+T1=$PWD/$WORKDIR/structural/native/t1.nii.gz
+if [ -e $T1 ]; then 
+  if [ -d $PWD/$WORKDIR/structural/stripped/manual ]; then 
+    extra_mask=true 
+    ALT_MASK=$(LWDP_get_override_file $PWD/$WORKDIR/structural/stripped/voting/vote_brain_mask.nii.gz)
+    VOTING_MASK=${QC_IMG_DIR}/mask/voting_mask
+    if LWDP_needs_update_and_lock_flag ${VOTING_MASK}_zoom.gif ${ALT_MASK} ${T1}; then 
+	create_2Dimages ${T1} ${VOTING_MASK} ${ALT_MASK} 
+	LWDP_lockfile_delete ${VOTING_MASK}_zoom.gif
+    fi   
+  else 
+    extra_mask=false
+  fi 
+
+  MASK=$(LWDP_get_override_file $PWD/$WORKDIR/structural/stripped/t1_brain_mask.nii.gz)
+  T1_MASK=${QC_IMG_DIR}/mask/t1_mask
+  if LWDP_needs_update_and_lock_flag ${T1_MASK}_zoom.gif ${MASK} ${T1}; then 
+      review=`reset_entries "$review" 3` 
+      create_2Dimages ${T1} ${T1_MASK} ${MASK} 
+      LWDP_lockfile_delete ${T1_MASK}_zoom.gif
+  fi
+
+  T2=$(LWDP_get_override_file $PWD/$WORKDIR/structural/denoised/t2_affine_refined.nii.gz)
+  if [ -e $T2 ]; then 
+    T2_MASK=${QC_IMG_DIR}/mask/t2_mask
+    if LWDP_needs_update_and_lock_flag ${T2_MASK}_zoom.gif ${MASK} ${T2}; then 
+	review=`reset_entries "$review" 5` 
+	create_2Dimages ${T2} ${T2_MASK} ${MASK}  
+	LWDP_lockfile_delete ${T2_MASK}_zoom.gif
+    fi
+  fi
+else 
+    review=`reset_entries "$review" 3` 
+    review=`reset_entries "$review" 5` 
+fi   
+
+FA=$(LWDP_get_override_file $PWD/$WORKDIR/diffusion/pepolar/reslice/sri24_padded/fa.nii.gz)
+if [ -e $FA ]; then 
+    FA_IMG=${QC_IMG_DIR}/diffusion/fa
+    if LWDP_needs_update_and_lock_flag ${FA_IMG}_zoom.gif ${FA}; then 
+	review=`reset_entries "$review" 7` 
+	create_2Dimages ${FA} ${FA_IMG} 
+	LWDP_lockfile_delete ${FA_IMG}_zoom.gif
+    fi
+else 
+    review=`reset_entries "$review" 7`   
+fi
+
+FA_SKEL_DATA=$(LWDP_get_override_file $PWD/$WORKDIR/diffusion/pepolar/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/fa_skeleton.nii.gz)
+if [ -e $FA_SKEL_DATA ]; then 
+  FA_SKEL_IMG=${QC_IMG_DIR}/diffusion/fa_skeleton
+  if LWDP_needs_update_and_lock_flag ${FA_SKEL_IMG}_zoom.gif ${FA_SKEL_DATA}; then 
+    review=`reset_entries "$review" 9` 
+    create_2Dimages ${FA_SKEL_DATA}  ${FA_SKEL_IMG} 
+    LWDP_lockfile_delete  ${FA_SKEL_IMG}_zoom.gif 
+  fi 
+else
+    review=`reset_entries "$review" 9` 
+fi 
+
+BOLD_DATA=$(LWDP_get_override_file $PWD/$WORKDIR/restingstate/bold/3_unwarped/bold_noIntenCorr_mean.nii.gz)
+BOLD_MASK=$PWD/$WORKDIR/restingstate/reslice/bold/t1_brain_mask.nii.gz
+if [ -e ${BOLD_DATA} -a -e $BOLD_MASK ]; then 
+  BOLD_IMG=${QC_IMG_DIR}/restingstate/bold_mask
+  if LWDP_needs_update_and_lock_flag ${BOLD_IMG}_zoom.gif ${BOLD_MASK} ${BOLD_DATA}; then 
+    review=`reset_entries "$review" 11` 
+    create_2Dimages ${BOLD_DATA} ${BOLD_IMG} ${BOLD_MASK}
+    LWDP_lockfile_delete ${BOLD_IMG}_zoom.gif
+  fi
+else 
+    review=`reset_entries "$review" 11` 
+fi 
+
+
+#
+# 3D FREESURFER Parcellation 
+#
+
+FS_REF=freesurfer_refined
+VISIT_ID=`echo $WORKDIR | sed 's/\//_/g'`
+
+SUBJECTS_DIR=${PWD}/$WORKDIR/structural/${FS_REF}
+FS_IMG_DIR=${PWD}/${QC_IMG_DIR}/${FS_REF}
+[ -d ${FS_IMG_DIR} ] || mkdir -p ${FS_IMG_DIR}
+
+fs_3dmodels lh
+fs_3dmodels rh
+
+
+#
+# 2D FREESURFER Parcellation 
+# 
+FS_MRI_DIR=${SUBJECTS_DIR}/${VISIT_ID}/mri 
+FS_ASEG_AXI=${FS_IMG_DIR}/aseg_axi 
+
+if LWDP_needs_update_and_lock_flag ${FS_ASEG_AXI}.png ${FS_MRI_DIR}/T1.mgz ${FS_MRI_DIR}/aseg.mgz; then
+  review=`reset_entries "$review" 13` 
+
+  ### Ehsan's Solution to get the image in center:
+  tmpDir=`mktemp -d`
+  mri_convert ${FS_MRI_DIR}/brainmask.mgz ${tmpDir}/brainmask.nii.gz &> /dev/null
+  read V1a V2a V3a <<< $(fslstats ${tmpDir}/brainmask.nii.gz -c)
+  rm -rf $tmpDir
+
+  # -layout 1 
+  # 
+  FS_VW_OPT="-viewsize 500 500 -v ${FS_MRI_DIR}/T1.mgz ${FS_MRI_DIR}/aseg.mgz:colormap=lut:opacity=0.2" 
+  freeview -zoom 1.4  $FS_VW_OPT -ras $V1a $V2a $V3a -viewport x -ss ${FS_IMG_DIR}/aseg_sag
+  freeview -zoom 1.4  $FS_VW_OPT -ras $V1a $V2a $V3a -viewport y -ss ${FS_IMG_DIR}/aseg_cor
+  freeview -zoom 1.15 $FS_VW_OPT -ras $V1a $V2a $V3a -viewport z -ss ${FS_ASEG_AXI}  
+
+  LWDP_lockfile_delete ${FS_ASEG_AXI}.png
+fi 
+
+# code for finding center of gravity of structures and pring them in 2D 
+# mri_convert ${FS_MRI_DIR}/rh.hippoSfLabels-${TYPE}.v10.mgz ${FS_MRI_DIR}/rh.hippoSfLabels-${TYPE}.v10.nii.gz
+# read V1a V2a V3a <<< $(fslstats ${FS_MRI_DIR}/rh.hippoSfLabels-${TYPE}.v10.nii.gz -c)
+# FS_VW_OPT="-zoom 3 -layout 1 -viewsize 500 500 -v ${FS_MRI_DIR}/nu.mgz  -v ${FS_MRI_DIR}/rh.hippoSfLabels-${TYPE}.v10.mgz:colormap=lut" 
+# FS_VW_OPT2="-zoom 3 -layout 1 -viewsize 500 500 -v ${FS_MRI_DIR}/nu.mgz" 
+# freeview ${FS_VW_OPT}  -ras $V1a 0 $V3a  -viewport x  -ss ${FS_IMG_DIR}/hip_${TYPE}_sag
+# freeview ${FS_VW_OPT}  -v ${FS_MRI_DIR}/lh.hippoSfLabels-${TYPE}.v10.mgz:colormap=lut -ras 0 0 $V3a -viewport y -ss ${FS_IMG_DIR}/hip_${TYPE}_cor
+# freeview ${FS_VW_OPT}  -v ${FS_MRI_DIR}/lh.hippoSfLabels-${TYPE}.v10.mgz:colormap=lut -ras 0 0 $V3a -viewport z -ss ${FS_IMG_DIR}/hip_${TYPE}_axi
+# freeview ${FS_VW_OPT2}  -ras $V1a 0 $V3a  -viewport x  -ss ${FS_IMG_DIR}/orig_${TYPE}_sag
+# freeview ${FS_VW_OPT2}  -ras 0 0 $V3a -viewport y -ss ${FS_IMG_DIR}/orig_${TYPE}_cor
+# freeview ${FS_VW_OPT2}  -ras 0 0 $V3a -viewport z -ss ${FS_IMG_DIR}/orig_${TYPE}_axi
+
+
+
+#
+# Overview 
+#
+
+# So do not do that as otherwise if something fails the entire index page is not created 
+# if LWDP_needs_update_and_lock_flag ${OVERVIEW_HTML} $FS_IMG_DIR/lh.lat.hr.gif $FS_IMG_DIR/rh.lat.hr.gif  ${FS_ASEG_AXI}.png  ${MASK_HTML}; then 
+if [ "${orig_review}" != "$review" ]; then 
+    echo "========================================================================"
+    echo "CREATE $review_file"
+    echo "========================================================================"
+    echo "subject,arm,visit,t1_mask_passed,t1_mask_note,t2_alignment_passed,t2_alignment_note,fa_alignment_passed,fa_alignment_note,fa_skeleton_passed,fa_skeleton_note,bold_passed,bold_note,fs_cross_passed,fs_cross_note,fs_longitudinal_passed,fs_longitudinal_note" > $review_file
+    echo "$review" >> $review_file
+fi 
+
+# Only create/update if gif were created/updated 
+if [ $QC_IMG_UPDATE -eq 1 ]; then
+    OVERVIEW_HTML=${QC_IMG_DIR}/index.html
+    echo "========================================================================"
+    echo "CREATE ${OVERVIEW_HTML}"
+    echo "========================================================================"
+    print_overview_html > ${OVERVIEW_HTML}
+fi
+
+# QC_IMG_DIR=$WORKDIR/diffusion/${QC_IMG_LABEL}
+# and then also of longitudinal results at some point 
+
+# create_mask_structural() {
+#     MASK=$1
+#     MRI=$2
+#     OUT=$3
+#     TYPE=structural
+# 
+#     # Need to move to parent directory otherwise names of images are ugly and cannot run multiple of these scripts   
+#     pushd $WORKDIR/$TYPE
+#     mkdir slicesdir 
+#     logFile=slicesdir/`basename $OUT`.log
+# 
+#     if [ "${MASK}" == "" ]; then  
+# 	slicesdir ${MRI} &> $logFile 
+#     else
+# 	slicesdir -p ${MASK} ${MRI} &> $logFile
+#     fi 
+# 
+#     convert -rotate 90 slicesdir/grota.png slicesdir/grot4.gif
+#     convert -rotate 90 slicesdir/grotb.png slicesdir/grot5.gif
+#     convert -rotate 90 slicesdir/grotc.png slicesdir/grot6.gif
+#     convert -rotate -90 slicesdir/grotd.png slicesdir/grot9.gif
+#     convert -rotate -90 slicesdir/grote.png slicesdir/grot8.gif
+#     convert -rotate -90 slicesdir/grotf.png slicesdir/grot7.gif
+#     convert -flip slicesdir/grotg.png slicesdir/grot3.gif
+#     convert -flip slicesdir/groth.png slicesdir/grot2.gif
+#     convert -flip slicesdir/groti.png slicesdir/grot1.gif
+# 
+#     popd
+#     convert +append $WORKDIR/$TYPE/slicesdir/*.gif $OUT
+#     [ -e $WORKDIR/$TYPE/${logFile} ] &&  mv $WORKDIR/$TYPE/${logFile} `dirname $OUT`/.
+# 
+#     rm -rf  $WORKDIR/$TYPE/slicesdir
+# }
+

@@ -1,0 +1,140 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+Usage() {
+  cat <<EOF
+
+Usage: check_restingstate_output <case>/<arm>/<timepoint> <type>
+       <type> = DATA or VISUAL 
+Example: check_restingstate_output <subject>/standard/baseline DATA
+
+EOF
+    exit 1
+}
+
+[ "$2" = "" ] && Usage
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+NCANDA_SOURCE_DIR=@NCANDA_SOURCE_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+#
+# Setup branch configuration options
+#
+
+export RESTING_DIR=${WORKDIR}/restingstate
+export CHECK_TYPE=$2
+
+# REF: http://www.ibm.com/developerworks/aix/library/au-usingtraps/
+function remove_tmp_dir
+{
+  rm -rf ${tmpdir}
+}
+
+function standard_info 
+{
+  local FILE=${RESTING_DIR}/$1
+  local DATA_CHECK_TYPE=$2
+
+  if [ -e $FILE -o -e ${FILE}.gz ]; then  
+    echo  "== $FILE =="
+
+    DATATYPE="`fsl fslhd $FILE | grep datatype | sed 's/datatype//g'| tr -d ' '`"
+    if [ "${DATA_CHECK_TYPE}" != "${DATATYPE}" ]; then 
+      # echo -ne "\e[1m>>>>"
+      echo -ne ">>>>"
+    fi 
+    # echo -e "TYPE:\t${DATATYPE}\e[0m"
+    printValue "TYPE" "${DATATYPE}"
+
+    DIM="`fsl fslhd $FILE | grep dim | head -4 | tail -3 | sed 's/dim//g' | sed 's/.//' | tr '\n' '\t'| tr -d ' ' | sed 's/[ \t]*$//'`" 
+    printValue "DIM" "$DIM"
+
+    NTP="`fsl fslhd $FILE | grep dim4 | head -1 | sed 's/dim4//g'| tr -d '\n' | tr -d ' ' `" 
+    if [ "$3" != "" ]; then 
+      if [ $NTP -lt $3 -o $NTP -gt $4 ]; then 
+        echo -ne ">>>>"
+      fi   
+    fi 
+    printValue "NumTP" "$NTP"
+
+    printValue "PIX" "`fsl fslhd $FILE | grep pixdim | head -5 | tail -4 | sed 's/pixdim//g' | sed 's/.//' | tr '\n' '\t' | tr -d ' ' | sed 's/[ \t]*$//'`" 
+    RANGE=`fsl fslstats $FILE -R | tr ' ' '\t' | sed 's/[ \t]*$//'`
+    minInt=`echo -e "$RANGE" | cut -f 1`
+    if [ $(echo " $minInt < 0 " | bc) -eq 1 ]; then 
+      echo -ne ">>>>"
+    fi
+    printValue "Range" "${RANGE}"
+    
+    printValue "98% R" "`fsl fslstats $FILE -r | tr ' ' '\t' | sed 's/[ \t]*$//'`"
+  else 
+     echo ">> $FILE missing"
+  fi 
+}
+
+function entropy
+{
+  local FILE=${RESTING_DIR}/$1
+  if [ -e $FILE -o -e ${FILE}.gz ]; then  
+    ENTROPY=`fsl fslstats $FILE -E | tr ' ' '\t'`
+    printValue "Entrp" "$ENTROPY"
+  fi   
+} 
+
+function initSummary 
+{
+  SUMMARY="Summary\t$SUBJECT\t$1" 
+}
+
+function printSummary 
+{
+  echo -e "$SUMMARY\n"   
+}
+
+function printValue
+{
+  echo -e "${1}:\t$2"
+  SUMMARY="$SUMMARY\t$2"
+}
+
+# ==========================================
+#      Main 
+# =========================================
+
+if [ "${CHECK_TYPE}" == "DATA" ]; then
+  # FILE_LIST="mcflirt/bold_mcf_mean.nii  native/rs-fMRI/bold-001.nii  fieldmap/fieldmap_warp.nii" 
+  # fieldmap/fieldmap.nii fieldmap/shiftmap.nii  fieldmap/icorrmap.nii"
+
+  FILE=prepared/bold_4d.nii.gz
+  initSummary $FILE
+  standard_info $FILE 8 274 275
+  printSummary
+
+  FILE_LIST="final_bold/native_res/bold_noIntenCorr_4d.nii final_bold/native_res/bold_withIntenCorr_4d.nii" 
+  for FILE in ${FILE_LIST}; do  
+    initSummary $FILE 
+    standard_info $FILE 8 
+    printSummary
+  done 
+
+  FILE_LIST="final_bold/native_res/bold_noIntenCorr_mean.nii final_bold/native_res/bold_withIntenCorr_mean.nii" 
+  for FILE in $FILE_LIST; do  
+    initSummary $FILE 
+    standard_info $FILE 16
+    entropy $FILE 
+    printSummary   
+  done 
+fi 
+

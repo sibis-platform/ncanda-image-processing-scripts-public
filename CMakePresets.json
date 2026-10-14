@@ -1,0 +1,32 @@
+{
+        "version": 3,
+        "cmakeMinimumRequired": {
+                "major": 2,
+                "minor": 8,
+                "patch": 0
+        },
+        "configurePresets": [
+                {
+                        "name": "docker",
+                        "displayName": "Docker",
+                        "description": "Docker default",
+                        "generator": "Unix Makefiles",
+                        "binaryDir": "${sourceDir}",
+                        "cacheVariables": {
+                                "NCANDA_AFNI_DIR": { "type": "PATH", "value": "/usr/local/tools/afni/abin" },
+                                "NCANDA_ANTS_DIR": { "type": "PATH", "value": "/usr/local/tools/ants/install/bin" },
+                                "NCANDA_C3D_DIR": { "type": "PATH", "value": "/usr/local/tools/c3d/c3d-1.3.0-Linux-gcc64" },
+                                "NCANDA_CAMINO_DIR": { "type": "PATH", "value": "/usr/local/tools/camino" },
+                                "NCANDA_CMTKDIR": { "type": "PATH", "value": "/usr/local/tools/cmtk/build" },
+                                "NCANDA_FREESURFER_HOME": { "type": "PATH", "value": "/usr/local/tools/freesurfer" },
+                                "NCANDA_FSLDIR": { "type": "PATH", "value": "/usr/local/tools/fsl" },
+                                "NCANDA_LWDP_DIR": { "type": "PATH", "value": "/usr/local/tools/lwdp/r23" },
+                                "NCANDA_NAONLM_DIR": { "type": "PATH", "value": "/usr/local/tools/naonlm3d" },
+                                "NCANDA_PYTHON_DIR": { "type": "PATH", "value": "/usr/local/tools/miniconda/envs/ncanda-3.0.0/bin" },
+                                "NCANDA_ROBEX_DIR": { "type": "PATH", "value": "/usr/local/tools/robex/v1.2/ROBEX" },
+                                "NCANDA_SLICER_CLI_DIR": { "type": "PATH", "value": "/usr/local/tools/slicer/r24545/Ubuntu14/lib/Slicer-4.4/cli-modules"},
+                                "NCANDA_CARET7_DIR": {"type": "PATH", "value": "/usr/local/tools/connectome/workbench"}
+                        }
+                }
+        ]
+}

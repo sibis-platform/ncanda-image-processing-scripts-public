@@ -1,0 +1,42 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+#
+# Setup input and output
+#
+
+# remove trailing "/"
+if [ "${1: -1:1}" == "/" ]; then
+  export WORKDIR=${1:: -1}
+else
+  export WORKDIR=${1}
+fi
+
+FREESURFER_LONGITUDINAL_FLAG=$2 
+# structural processing
+for CMD in ncanda_structural_pipeline ncanda_structural_reformat_to_template ncanda_freesurfer_pipeline ncanda_structural_cerebellum_pipeline; do  
+  FULL_CMD="${NCANDA_BINARY_DIR}/${CMD} ${WORKDIR}"
+  if [ "$CMD" == "ncanda_freesurfer_pipeline" ]; then 
+     FULL_CMD="${FULL_CMD} ${FREESURFER_LONGITUDINAL_FLAG}"
+  fi 
+
+  bash ${FULL_CMD} 
+  # Exit with error 
+  if [ $? -ne 0 ] ; then
+    if [ "$CMD" == "ncanda_structural_pipeline" ]; then 
+       echo "Warning: ncanda_structural_all_pipelines: $WORKDIR skipping rest of pipeline!"  
+       exit 1
+    fi
+  fi 
+done 
+exit 0

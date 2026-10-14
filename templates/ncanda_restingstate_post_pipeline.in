@@ -1,0 +1,851 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+NCANDA_SOURCE_DIR=@NCANDA_SOURCE_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+#
+# setup input
+#
+
+RESTING_DIR=${WORKDIR}/restingstate
+
+FMRI_DIR=${RESTING_DIR}/native/rs-fMRI
+FIELDMAP_DIR=${RESTING_DIR}/native/fieldmap
+if [ ! -d ${FMRI_DIR} -o ! -d ${FIELDMAP_DIR} ]; then
+  echo "ERROR: No FMRI data: ${WORKDIR}"
+  exit 1
+fi
+if [ ! -d ${RESTING_DIR}/bold/3_unwarped ]; then
+  echo "ERROR: No FMRI unwarped data: ${WORKDIR}"
+  exit 1
+fi
+
+FreeSurferFolder=${WORKDIR}/structural/freesurfer_refined/${SUBJECT}_${ARM}_${VISIT}
+if [ ! -d ${FreeSurferFolder} ]; then
+  echo "ERROR: No freesurfer_refined data: ${WORKDIR}"
+  exit 1
+fi
+
+hcp_mni_atlas_t1=${DATA_DIR}/hcp/templates/MNI152_T1_1mm.nii.gz
+hcp_mni_atlas_t1_brain=${DATA_DIR}/hcp/templates/MNI152_T1_1mm_brain_compact.nii.gz
+hcp_mni_atlas_t1_2mm=${DATA_DIR}/hcp/templates/MNI152_T1_2mm.nii.gz
+hcp_mni_atlas_t1_2mm_brainmask=${DATA_DIR}/hcp/templates/MNI152_T1_2mm_brain_compact_mask.nii.gz
+
+# from freesurfer post pipeline
+hcp_t1_hcp_mni_affine=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/hcp_t1_hcp_mni/ants_0GenericAffine.mat)
+hcp_t1_hcp_mni_warp=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/hcp_t1_hcp_mni/ants_1Warp.nii.gz)
+hcp_t1_hcp_mni_warp_inv=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/hcp_t1_hcp_mni/ants_1InverseWarp.nii.gz)
+if [ ! -e  ${hcp_t1_hcp_mni_affine} ] ; then
+  echo "ERROR: ${hcp_t1_hcp_mni_affine} is missing."
+  exit 1
+fi
+if [ ! -e  ${hcp_t1_hcp_mni_warp} ] ; then
+  echo "ERROR: ${hcp_t1_hcp_mni_warp} is missing."
+  exit 1
+fi
+if [ ! -e  ${hcp_t1_hcp_mni_warp_inv} ] ; then
+  echo "ERROR: ${hcp_t1_hcp_mni_warp_inv} is missing."
+  exit 1
+fi
+if [ "${VISIT}" == "baseline" ]; then
+  hcp_t1_hcp_mni_mtx="${hcp_t1_hcp_mni_warp} ${hcp_t1_hcp_mni_affine}"
+  hcp_mni_hcp_t1_mtx="[${hcp_t1_hcp_mni_affine},1] ${hcp_t1_hcp_mni_warp_inv}"
+else
+  hcp_t1_brain_to_baseline_affine=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/hcp_t1_brain_to_baseline/ants_0GenericAffine.mat)
+  hcp_t1_brain_to_baseline_warp=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/hcp_t1_brain_to_baseline/ants_1Warp.nii.gz)
+  hcp_t1_brain_to_baseline_warp_inv=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/hcp_t1_brain_to_baseline/ants_1InverseWarp.nii.gz)
+  if [ ! -e  ${hcp_t1_brain_to_baseline_affine} ] ; then
+    echo "ERROR: ${hcp_t1_brain_to_baseline_affine} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${hcp_t1_brain_to_baseline_warp} ] ; then
+    echo "ERROR: ${hcp_t1_brain_to_baseline_warp} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${hcp_t1_brain_to_baseline_warp_inv} ] ; then
+    echo "ERROR: ${hcp_t1_brain_to_baseline_warp_inv} is missing."
+    exit 1
+  fi
+  hcp_t1_hcp_mni_mtx="${hcp_t1_brain_to_baseline_warp} ${hcp_t1_brain_to_baseline_affine} ${hcp_t1_hcp_mni_warp} ${hcp_t1_hcp_mni_affine}"
+  hcp_mni_hcp_t1_mtx="[${hcp_t1_hcp_mni_affine},1] ${hcp_t1_hcp_mni_warp_inv} [${hcp_t1_brain_to_baseline_affine},1] ${hcp_t1_brain_to_baseline_warp_inv}"
+fi
+hcp_t1_hcp_mni_concat=${WORKDIR}/structural/registration/hcp_t1_hcp_mni/concat/ants_0Warp.nii.gz
+hcp_mni_hcp_t1_concat=${WORKDIR}/structural/registration/hcp_mni_hcp_t1/concat/ants_0Warp.nii.gz
+
+#
+# prepare reorient images
+#
+
+inp[1]=$(LWDP_get_override_file ${RESTING_DIR}/bold/3_unwarped/bold_noIntenCorr_4d.nii.gz)
+inp[2]=$(LWDP_get_override_file ${RESTING_DIR}/bold/3_unwarped/bold_noIntenCorr_mean.nii.gz)
+inp[3]=$(LWDP_get_override_file ${RESTING_DIR}/rs_specific_processing/timeseries/bold_noIntenCorr_4d_filtermotart_cleaned_bp.nii.gz)
+out[1]=${RESTING_DIR}/hcp/hcp_bold/bold_4d.nii.gz
+out[2]=${RESTING_DIR}/hcp/hcp_bold/bold_mean.nii.gz
+out[3]=${RESTING_DIR}/hcp/hcp_bold/bold_noIntenCorr_4d_filtermotart_cleaned_bp.nii.gz
+#for i in 1 2; do
+for i in 2 3; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]}; then
+    # adopted from fslreorient2std procedure
+    prefix=`echo ${out[${i}]} | rev | cut -d . -f3- | rev`
+    scode=`fsl fslval ${inp[${i}]} sform_code | tr -d " "`
+    qcode=`fsl fslval ${inp[${i}]} qform_code | tr -d " "`
+    if [ "${scode}" == "0" -a "${qcode}" == "0" ]; then
+      echo "ERROR: Orientation information not stored in ${inp[${i}]}!"
+      exit 1
+    fi
+    pattern=sto_xyz
+    if [ "${scode}" == "0" ]; then
+      pattern=qto_xyz
+    fi
+    fsl fslhd ${inp[${i}]} | grep ${pattern} | awk '{ print $2 " " $3 " " $4 " " $5  }' > ${prefix}.mat
+    det=`fsl avscale ${prefix}.mat | grep Determinant | awk '{ print $3 }'`
+    echo "# Determinant: ${det}" > ${prefix}.log
+    if [ X`echo "if ( $det < 0 ) { 1 }" | bc -l` = X1 ]; then
+      # radiological case (negative determinant)
+      echo "fsl fslswapdim ${inp[${i}]} RL PA IS ${out[${i}]}" >> ${prefix}.log
+      fsl fslswapdim ${inp[${i}]} RL PA IS ${out[${i}]}
+    else
+      echo "fsl fslswapdim ${inp[${i}]} LR PA IS ${out[${i}]}" >> ${prefix}.log
+      fsl fslswapdim ${inp[${i}]} LR PA IS ${out[${i}]}
+    fi
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+hcp_bold=${out[1]}
+hcp_bold_mean=${out[2]}
+hcp_bold_processed=${out[3]}
+
+#
+# align bold and hcp_t1
+#
+
+fs_ribbon=${FreeSurferFolder}/mri/ribbon.mgz
+hcp_t1_mrbias=${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias.nii.gz
+hcp_t1_brain=${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias_brain.nii.gz
+
+hcp_t1_to_hcp_bold_pfx=${RESTING_DIR}/registration/hcp_t1_to_hcp_bold/epi_reg
+hcp_t1_to_hcp_bold_affine=${hcp_t1_to_hcp_bold_pfx}.mat
+if LWDP_needs_update_and_lock ${hcp_t1_to_hcp_bold_affine} ${fs_ribbon} ${hcp_bold_mean} ${hcp_t1_mrbias} ${hcp_t1_brain}; then
+  tmpdir=$(mktemp -d)
+  mri_convert -rt nearest -rl ${hcp_t1_mrbias} ${fs_ribbon} ${tmpdir}/ribbon.nii.gz
+  # djk: create epi_reg_fast_wmseg.nii.gz file to turn around a bug of epi_reg (fsl 5.0.6)
+  c3d c3d ${tmpdir}/ribbon.nii.gz -replace 2 1 3 0 41 1 42 0 -o ${hcp_t1_to_hcp_bold_pfx}_fast_wmseg.nii.gz
+  fsl epi_reg --epi=${hcp_bold_mean} --t1=${hcp_t1_mrbias} --t1brain=${hcp_t1_brain} --wmseg=${hcp_t1_to_hcp_bold_pfx}_fast_wmseg.nii.gz --noclean -v --out=${hcp_t1_to_hcp_bold_pfx} >& ${hcp_t1_to_hcp_bold_pfx}.log
+  # djk: remove dangling link
+  rm ${hcp_t1_to_hcp_bold_pfx}_fast_wmseg
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${hcp_t1_to_hcp_bold_affine}
+fi
+# convert fsl mtx to itk tfm
+hcp_t1_to_hcp_bold_affine_tfm=${hcp_t1_to_hcp_bold_pfx}.tfm
+if LWDP_needs_update_and_lock ${hcp_t1_to_hcp_bold_affine_tfm} ${hcp_t1_to_hcp_bold_affine} ${hcp_bold_mean} ${hcp_t1_mrbias}; then
+  c3d c3d_affine_tool -ref ${hcp_t1_mrbias} -src ${hcp_bold_mean} ${hcp_t1_to_hcp_bold_affine} -fsl2ras -oitk ${hcp_t1_to_hcp_bold_affine_tfm}
+  LWDP_lockfile_delete ${hcp_t1_to_hcp_bold_affine_tfm}
+fi
+
+hcp_mni_to_hcp_bold_concat=${RESTING_DIR}/registration/hcp_mni_to_hcp_bold/concat/ants_0Warp.nii.gz
+if LWDP_needs_update_and_lock ${hcp_mni_to_hcp_bold_concat} ${hcp_mni_atlas_t1} ${hcp_t1_hcp_mni_mtx} ${hcp_t1_to_hcp_bold_affine_tfm}; then
+  ants antsApplyTransforms -d 3 -o [${hcp_mni_to_hcp_bold_concat},1] -r ${hcp_mni_atlas_t1} -t ${hcp_mni_hcp_t1_mtx} ${hcp_t1_to_hcp_bold_affine_tfm}
+  LWDP_lockfile_delete ${hcp_mni_to_hcp_bold_concat}
+fi
+hcp_bold_to_hcp_mni_concat=${RESTING_DIR}/registration/hcp_bold_to_hcp_mni/concat/ants_0Warp.nii.gz
+if LWDP_needs_update_and_lock ${hcp_bold_to_hcp_mni_concat} ${hcp_bold_mean} ${hcp_t1_hcp_mni_mtx} ${hcp_t1_to_hcp_bold_affine_tfm}; then
+  ants antsApplyTransforms -d 3 -o [${hcp_bold_to_hcp_mni_concat},1] -r ${hcp_bold_mean} -t [${hcp_t1_to_hcp_bold_affine_tfm},1] ${hcp_t1_hcp_mni_mtx} 
+  LWDP_lockfile_delete ${hcp_bold_to_hcp_mni_concat}
+fi
+
+# align hcp_t1 wmparc to hcp_bold
+# align hcp_t1 t1_seg to hcp_bold
+# align hcp_t1 t1_brainmask to hcp_bold
+inp[1]=${WORKDIR}/structural/hcp/hcp_t1/wmparc.nii.gz
+inp[2]=${WORKDIR}/structural/hcp/hcp_t1/t1_seg.nii.gz
+out[1]=${RESTING_DIR}/hcp/hcp_bold/wmparc.nii.gz
+out[2]=${RESTING_DIR}/hcp/hcp_bold/t1_seg.nii.gz
+for i in 1 2; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_bold_mean} ${hcp_t1_to_hcp_bold_affine_tfm}; then
+    ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${i}]} -r ${hcp_bold_mean} -o ${out[${i}]} -t [${hcp_t1_to_hcp_bold_affine_tfm},1]
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+inp[1]=${WORKDIR}/structural/hcp/hcp_t1/t1_brain_mask.nii.gz
+out[1]=${RESTING_DIR}/hcp/hcp_bold/t1_brain_mask.nii.gz
+for i in 1; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_bold_mean} ${hcp_t1_to_hcp_bold_affine_tfm}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${hcp_bold_mean} -o ${out[${i}]} -t [${hcp_t1_to_hcp_bold_affine_tfm},1]
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+inp[1]=${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias.nii.gz
+out[1]=${RESTING_DIR}/hcp/hcp_bold/t1_mrbias.nii.gz
+for i in 1; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_bold_mean} ${hcp_t1_to_hcp_bold_affine_tfm}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${hcp_bold_mean} -o ${out[${i}]} -t [${hcp_t1_to_hcp_bold_affine_tfm},1]
+    c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+
+# align hcp_t1 wmparc to hcp_mni
+# align hcp_t1 t1_seg to hcp_mni
+# align hcp_t1 t1_brainmask to hcp_mni
+inp[1]=${WORKDIR}/structural/hcp/hcp_t1/wmparc.nii.gz
+inp[2]=${WORKDIR}/structural/hcp/hcp_t1/t1_seg.nii.gz
+out[1]=${RESTING_DIR}/hcp/hcp_mni/wmparc.nii.gz
+out[2]=${RESTING_DIR}/hcp/hcp_mni/t1_seg.nii.gz
+for i in 1 2; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_mni_atlas_t1_2mm} ${hcp_mni_hcp_t1_concat}; then
+    ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${i}]} -r ${hcp_mni_atlas_t1_2mm} -o ${out[${i}]} -t ${hcp_mni_hcp_t1_concat}
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+inp[1]=${WORKDIR}/structural/hcp/hcp_t1/t1_brain_mask.nii.gz
+out[1]=${RESTING_DIR}/hcp/hcp_mni/t1_brain_mask.nii.gz
+for i in 1; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_mni_atlas_t1_2mm} ${hcp_mni_hcp_t1_concat}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${hcp_mni_atlas_t1_2mm} -o ${out[${i}]} -t ${hcp_mni_hcp_t1_concat}
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+inp[1]=${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias.nii.gz
+out[1]=${RESTING_DIR}/hcp/hcp_mni/t1_mrbias.nii.gz
+for i in 1; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_mni_atlas_t1_2mm} ${hcp_mni_hcp_t1_concat}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${hcp_mni_atlas_t1_2mm} -o ${out[${i}]} -t ${hcp_mni_hcp_t1_concat}
+    c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+hcp_mni_t1_brainmask=${RESTING_DIR}/hcp/hcp_mni/t1_brain_mask.nii.gz
+
+if true; then
+  # using 5mm smoothing
+  fwhm=5
+  hcp_mni_bold_processed=${RESTING_DIR}/hcp/hcp_mni/bold_noIntenCorr_4d_filtermotart_cleaned_bp_smooth${fwhm}mm_stripped.nii.gz
+  if LWDP_needs_update_and_lock ${hcp_mni_bold_processed} ${hcp_bold_processed} ${hcp_mni_atlas_t1_2mm} ${hcp_mni_t1_brainmask} ${hcp_mni_to_hcp_bold_concat}; then
+    tmpdir=$(mktemp -d)
+    ants antsApplyTransforms -d 3 -e 3 -i ${hcp_bold_processed} -r ${hcp_mni_atlas_t1_2mm} -o ${tmpdir}/bold_4d.nii.gz -t ${hcp_mni_to_hcp_bold_concat}
+    # smoothing and stripping
+    sigma=`python3 -c "import numpy; print('%.5f' % (${fwhm} / numpy.sqrt(8 * numpy.log(2))))"`
+    fsl fslmaths ${tmpdir}/bold_4d.nii.gz -s ${sigma} ${tmpdir}/bold_4d_s${fwhm}.nii.gz
+    fsl fslmaths ${tmpdir}/bold_4d_s${fwhm}.nii.gz -mul ${hcp_mni_t1_brainmask} ${hcp_mni_bold_processed}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${hcp_mni_bold_processed}
+  fi
+
+  tr=`fslval ${RESTING_DIR}/bold/3_unwarped/bold_noIntenCorr_4d.nii.gz pixdim4 | tr -d " "`
+
+  #
+  # surface processing
+  #
+
+  AtlasSpaceFolder=${WORKDIR}/structural/hcp/hcp_mni
+  NativeFolder=Native
+  GrayordinatesSpaceDIR=${DATA_DIR}/hcp/templates/91282_Greyordinates
+  
+  LowResMesh=32
+  DownsampleFolder=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k
+  ROIFolder=${AtlasSpaceFolder}/ROIs
+  
+  WorkingDirectory=${RESTING_DIR}/hcp/hcp_mni/surf_smooth${fwhm}mm
+  
+  RegName=MSMSulc
+
+  SmoothingFWHM=2 # recommended to be roughly the grayordinates spacing, i.e 2mm on HCP data
+  GrayordinatesResolution=2
+
+  goodvoxels=${hcp_mni_t1_brainmask}
+  
+  for Hemisphere in L R ; do
+    mid_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+    white_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.white.native.surf.gii
+    pial_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.pial.native.surf.gii
+    roi_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+    sphere_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.${RegName}.native.surf.gii
+    sphere_lowres=${DownsampleFolder}/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+    mid_lowres=${DownsampleFolder}/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+    atlasroi_lowres=${DownsampleFolder}/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+
+    out=${WorkingDirectory}/bold.${Hemisphere}.native.func.gii
+    if LWDP_needs_update_and_lock ${out} ${hcp_mni_bold_processed} ${goodvoxels} ${mid_native} ${white_native} ${pial_native} ${roi_native}; then
+      caret7 wb_command -volume-to-surface-mapping ${hcp_mni_bold_processed} ${mid_native} ${out} -ribbon-constrained ${white_native} ${pial_native} -volume-roi ${goodvoxels}
+      caret7 wb_command -metric-dilate ${out} ${mid_native} 10 ${out} -nearest
+      caret7 wb_command -metric-mask ${out} ${roi_native} ${out}
+      LWDP_lockfile_delete ${out}
+    fi
+    out_lowres=${WorkingDirectory}/bold.${Hemisphere}.${LowResMesh}k_fs_LR.func.gii
+    if LWDP_needs_update_and_lock ${out_lowres} ${out} ${sphere_native} ${sphere_lowres} ${mid_native} ${mid_lowres} ${roi_native} ${atlasroi_lowres}; then
+      caret7 wb_command -metric-resample ${out} ${sphere_native} ${sphere_lowres} ADAP_BARY_AREA ${out_lowres} -area-surfs ${mid_native} ${mid_lowres} -current-roi ${roi_native}
+      caret7 wb_command -metric-mask ${out_lowres} ${atlasroi_lowres} ${out_lowres}
+      LWDP_lockfile_delete ${out_lowres}
+    fi
+
+    # surface smoothing
+    out_lowres_s=${WorkingDirectory}/bold_s${SmoothingFWHM}.${Hemisphere}.${LowResMesh}k_fs_LR.func.gii
+    if LWDP_needs_update_and_lock ${out_lowres_s} ${out_lowres} ${mid_lowres} ${atlasroi_lowres}; then
+      Sigma=`echo "${SmoothingFWHM}/(2*(sqrt(2*l(2))))" | bc -l`
+      caret7 wb_command -metric-smoothing ${mid_lowres} ${out_lowres} ${Sigma} ${out_lowres_s} -roi ${atlasroi_lowres}
+      LWDP_lockfile_delete ${out_lowres_s}
+    fi
+  done
+
+  # generate dense timeseries
+  inps="${WorkingDirectory}/bold_s${SmoothingFWHM}.L.${LowResMesh}k_fs_LR.func.gii ${DownsampleFolder}/L.atlasroi.${LowResMesh}k_fs_LR.shape.gii ${WorkingDirectory}/bold_s${SmoothingFWHM}.R.${LowResMesh}k_fs_LR.func.gii ${DownsampleFolder}/R.atlasroi.${LowResMesh}k_fs_LR.shape.gii"
+  dtseries=${WorkingDirectory}/bold_s${SmoothingFWHM}.${LowResMesh}k_fs_LR.dtseries.nii
+  if LWDP_needs_update_and_lock ${dtseries} ${inps}; then
+    caret7 wb_command -cifti-create-dense-timeseries ${dtseries} -left-metric ${WorkingDirectory}/bold_s${SmoothingFWHM}.L.${LowResMesh}k_fs_LR.func.gii -roi-left ${DownsampleFolder}/L.atlasroi.${LowResMesh}k_fs_LR.shape.gii -right-metric ${WorkingDirectory}/bold_s${SmoothingFWHM}.R.${LowResMesh}k_fs_LR.func.gii -roi-right ${DownsampleFolder}/R.atlasroi.${LowResMesh}k_fs_LR.shape.gii -timestep ${tr}
+    LWDP_lockfile_delete ${dtseries}
+  fi
+
+  # generate parcellate timeseries for subcortex
+  inps="${ROIFolder}/ROIs.${GrayordinatesResolution}.nii.gz ${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz"
+  ptseries_sc=${WorkingDirectory}/bold_s${SmoothingFWHM}.SC.ptseries.nii
+  if LWDP_needs_update_and_lock ${ptseries_sc} ${hcp_mni_bold_processed} ${inps}; then
+    tmpdir=$(mktemp -d)
+    #tmpdir=${WorkingDirectory}/tmp
+    #mkdir -p ${tmpdir}
+    
+    caret7 wb_command -cifti-create-dense-timeseries ${tmpdir}/bold_temp_subject.dtseries.nii -volume ${hcp_mni_bold_processed} ${ROIFolder}/ROIs.${GrayordinatesResolution}.nii.gz
+    caret7 wb_command -cifti-create-label ${tmpdir}/bold_temp_template.dlabel.nii -volume ${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz ${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz
+    Sigma=`echo "${SmoothingFWHM}/(2*(sqrt(2*l(2))))" | bc -l`
+    caret7 wb_command -cifti-smoothing ${tmpdir}/bold_temp_subject.dtseries.nii 0 ${Sigma} COLUMN ${tmpdir}/bold_temp_subject_smooth.dtseries.nii -fix-zeros-volume
+
+    echo "9 18 8 17 6 3 13 1 11 10 19 7 16 5 15 4 14 2 12" >> ${tmpdir}/reorder.txt
+    caret7 wb_command -cifti-parcellate ${tmpdir}/bold_temp_subject_smooth.dtseries.nii ${tmpdir}/bold_temp_template.dlabel.nii COLUMN ${tmpdir}/bold_temp_subject_smooth.ptseries.nii
+    caret7 wb_command -cifti-reorder ${tmpdir}/bold_temp_subject_smooth.ptseries.nii COLUMN ${tmpdir}/reorder.txt ${ptseries_sc}
+  
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${ptseries_sc}
+  fi
+
+  for map in MMP1.0 aparc aparc.a2009s; do
+    # generate parcellated timeseries
+    if [ "${map}" == "MMP1.0" ]; then
+      parcels=${DATA_DIR}/hcp/templates/MMP_1.0/Q1-Q6_RelatedParcellation210.CorticalAreas_dil_Final_Final_Areas_Group_Colors.32k_fs_LR.dlabel.nii
+    elif [ "${map}" == "aparc" ] || [ "${map}" == "aparc.a2009s" ]; then
+      parcels=${DATA_DIR}/hcp/templates/freesurfer/${map}.32k_fs_LR.dlabel.nii
+    fi
+    if [ ! -e "${parcels}" ]; then
+      echo "INFO: ${parcels} not found (download from BALSA); skipping ${map} parcellation"
+      continue
+    fi
+    ptseries=${WorkingDirectory}/bold_s${SmoothingFWHM}.${LowResMesh}k_fs_LR.${map}.ptseries.nii
+    if LWDP_needs_update_and_lock ${ptseries} ${dtseries} ${parcels}; then
+      caret7 wb_command -cifti-parcellate ${dtseries} ${parcels} COLUMN ${ptseries}
+      LWDP_lockfile_delete ${ptseries}
+    fi
+
+    # ptseries x dtseries correlation
+    #pdconn=${WorkingDirectory}/bold_s${SmoothingFWHM}.${LowResMesh}k_fs_LR.${map}.pdconn.nii
+    #if LWDP_needs_update_and_lock ${pdconn} ${ptseries} ${dtseries}; then
+    #  caret7 wb_command -cifti-cross-correlation ${ptseries} ${dtseries} ${pdconn}
+    #  LWDP_lockfile_delete ${pdconn}
+    #fi
+
+    # combine parcellate timeseries
+    ptseries_combined=${WorkingDirectory}/bold_s${SmoothingFWHM}.${map}_SC.ptseries.nii
+    if LWDP_needs_update_and_lock ${ptseries_combined} ${ptseries} ${ptseries_sc}; then
+      caret7 wb_command -cifti-merge-parcels COLUMN ${ptseries_combined} -cifti ${ptseries} -cifti ${ptseries_sc}
+      LWDP_lockfile_delete ${ptseries_combined}
+    fi
+
+    # ptseries x ptseries correlation
+    pconn=${WorkingDirectory}/bold_s${SmoothingFWHM}.${map}_SC.pconn.nii
+    if LWDP_needs_update_and_lock ${pconn} ${ptseries_combined}; then
+      caret7 wb_command -cifti-cross-correlation ${ptseries_combined} ${ptseries_combined} ${pconn}
+      LWDP_lockfile_delete ${pconn}
+    fi
+  done
+else
+  hcp_mni_bold_stripped=${RESTING_DIR}/hcp/hcp_mni/bold_4d_stripped.nii.gz
+  if LWDP_needs_update_and_lock ${hcp_mni_bold_stripped} ${hcp_bold} ${hcp_mni_atlas_t1_2mm} ${hcp_mni_t1_brainmask} ${hcp_mni_to_hcp_bold_concat}; then
+    tmpdir=$(mktemp -d)
+    ants antsApplyTransforms -n BlackmanWindowedSinc -d 3 -e 3 -i ${hcp_bold} -r ${hcp_mni_atlas_t1_2mm} -o ${tmpdir}/bold_4d.nii.gz -t ${hcp_mni_to_hcp_bold_concat} --float
+    fsl fslmaths ${tmpdir}/bold_4d.nii.gz -mul ${hcp_mni_t1_brainmask} ${hcp_mni_bold_stripped}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${hcp_mni_bold_stripped}
+  fi
+  
+  hcp_mni_bold_stripped_mean=${RESTING_DIR}/hcp/hcp_mni/bold_stripped_mean.nii.gz
+  if LWDP_needs_update_and_lock ${hcp_mni_bold_stripped_mean} ${hcp_mni_bold_stripped}; then
+    fsl fslmaths ${hcp_mni_bold_stripped} -Tmean ${hcp_mni_bold_stripped_mean} -odt float
+    LWDP_lockfile_delete ${hcp_mni_bold_stripped_mean}
+  fi
+
+  #
+  # running ica fix
+  #
+  
+  FSL_FIXDIR=/usr/local/tools/fix/1.062b/Ubuntu14
+  . ${FSL_FIXDIR}/settings.sh
+  R_DIR=/usr/local/tools/r/3.3.0/Ubuntu14/bin
+  
+  tr=`fslval ${hcp_bold} pixdim4 | tr -d " "`
+  fwhm=5
+  hp=100
+  
+  #for hcp_space in hcp_bold hcp_mni; do
+  for hcp_space in hcp_mni; do
+    if [ "${hcp_space}" == "hcp_bold" ]; then
+      bold=${hcp_bold}
+      bold_mean=${hcp_bold_mean}
+      bold_mask=${RESTING_DIR}/hcp/${hcp_space}/t1_brain_mask.nii.gz
+    elif [ "${hcp_space}" == "hcp_mni" ]; then
+      bold=${hcp_mni_bold_stripped}
+      bold_mean=${hcp_mni_bold_stripped_mean}
+      bold_mask=${hcp_mni_t1_brainmask}
+      #bold_mask=${hcp_mni_atlas_t1_2mm_brainmask}
+    fi
+    bold_seg=${RESTING_DIR}/hcp/${hcp_space}/t1_seg.nii.gz
+    bold_wmparc=${RESTING_DIR}/hcp/${hcp_space}/wmparc.nii.gz
+  
+    # intensity normalization?
+  
+    # applying highpass filter
+    bold_filtered=${RESTING_DIR}/hcp/${hcp_space}/bold_4d_hp${hp}_smooth${fwhm}mm_stripped.nii.gz
+    if LWDP_needs_update_and_lock ${bold_filtered} ${bold} ${bold_mask}; then
+      tmpdir=$(mktemp -d)
+      hptr=`echo "10 k ${hp} 2 / ${tr} / p" | dc -`
+      sigma=`python3 -c "import numpy; print('%.5f' % (${fwhm} / numpy.sqrt(8 * numpy.log(2))))"`
+      fsl fslmaths ${bold} -bptf ${hptr} -1 -s ${sigma} -mas ${bold_mask} ${bold_filtered}
+      LWDP_lockfile_delete ${bold_filtered}
+    fi
+    
+    # running melodic
+    melodic_dir=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/filtered_func_data.ica
+    melodic_ic=${melodic_dir}/melodic_IC.nii.gz
+    if LWDP_needs_update_and_lock ${melodic_ic} ${bold_filtered} ${bold_mask}; then
+      #fsl melodic -i ${bold_filtered} -o ${melodic_dir} -m ${bold_mask} -d -250 --nobet --report --Oall --tr=${tr} -v
+      fsl melodic -i ${bold_filtered} -o ${melodic_dir} --nobet --bgthreshold=3 --tr=${tr} --report -d 0 --mmthresh=0.5 --Ostats
+      LWDP_lockfile_delete ${melodic_ic}
+    fi
+  
+    # running ica fix
+    # fix_0a_create_edge_masks
+    out=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix/edge5.nii.gz
+    if LWDP_needs_update_and_lock ${out} ${bold_mask}; then
+      echo ${FIXVERSION} > ${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix/.version
+      folder=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm
+      pushd ${folder}
+      ln -s ../`basename ${bold_mask}` mask.nii.gz
+      popd
+    
+      fsl fslmaths ${folder}/mask -eroF ${folder}/fix/maske1
+      fsl fslmaths ${folder}/fix/maske1 -eroF ${folder}/fix/maske2
+      fsl fslmaths ${folder}/fix/maske2 -eroF ${folder}/fix/maske3
+      fsl fslmaths ${folder}/fix/maske3 -eroF ${folder}/fix/maske4
+      fsl fslmaths ${folder}/fix/maske4 -eroF ${folder}/fix/maske5
+    
+      fsl fslmaths ${folder}/mask -sub ${folder}/fix/maske1 ${folder}/fix/edge1
+      fsl fslmaths ${folder}/mask -sub ${folder}/fix/maske2 ${folder}/fix/edge2
+      fsl fslmaths ${folder}/mask -sub ${folder}/fix/maske3 ${folder}/fix/edge3
+      fsl fslmaths ${folder}/mask -sub ${folder}/fix/maske4 ${folder}/fix/edge4
+      fsl fslmaths ${folder}/mask -sub ${folder}/fix/maske5 ${folder}/fix/edge5
+    
+      LWDP_lockfile_delete ${out}
+    fi
+    
+    # fix_0b_apply_fast
+    out=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix/hr2exf.nii.gz
+    if LWDP_needs_update_and_lock ${out} ${bold_seg} ${bold_wmparc}; then
+      folder=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm
+      cp -p ${bold_seg} ${folder}/fix/fastsg_pveseg.nii.gz
+    
+      fsl fslmaths ${bold_wmparc} -mul 0 ${folder}/fix/subcort.nii.gz
+      for f in 10 11 12 13 49 50 51 52 26 58 ; do
+        fsl fslmaths ${bold_wmparc} -thr ${f} -uthr ${f} -bin -add ${folder}/fix/subcort.nii.gz -bin ${folder}/fix/subcort.nii.gz
+      done
+      fsl fslmaths ${folder}/fix/subcort.nii.gz -mul -1 -add 1 -mul ${folder}/fix/fastsg_pveseg.nii.gz -add ${folder}/fix/subcort.nii.gz -add ${folder}/fix/subcort.nii.gz ${folder}/fix/fastsg_pveseg.nii.gz
+    
+      pushd ${folder}/fix
+      ln -s fastsg_pveseg.nii.gz hr2exf.nii.gz
+      popd
+      LWDP_lockfile_delete ${out}
+    fi
+    
+    # fix_0c_reg_masks
+    # align sag_mask to bold
+    for m in 0 1 2 3 ; do
+      inp[1]=${FSL_FIXDIR}/mask_files/sag_mask${m}.nii.gz
+      inp[2]=${FSL_FIXDIR}/mask_files/sag_mask${m}dil.nii.gz
+      inp[3]=${FSL_FIXDIR}/mask_files/sag_mask${m}dil2.nii.gz
+      out[1]=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix/std1mm2exfunc${m}.nii.gz
+      out[2]=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix/std1mm2exfunc${m}dil.nii.gz
+      out[3]=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix/std1mm2exfunc${m}dil2.nii.gz
+      for i in 1 2 3; do
+        if [ "${hcp_space}" == "hcp_bold" ]; then
+          if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${bold_mask} ${hcp_bold_to_hcp_mni_concat}; then
+            ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${i}]} -r ${bold_mask} -o ${out[${i}]} -t ${hcp_bold_to_hcp_mni_concat}
+            c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+            LWDP_lockfile_delete ${out[${i}]}
+          fi
+        elif [ "${hcp_space}" == "hcp_mni" ]; then
+          if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${bold_mask}; then
+            ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${i}]} -r ${bold_mask} -o ${out[${i}]}
+            c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+            LWDP_lockfile_delete ${out[${i}]}
+          fi
+        fi
+      done
+    done
+  
+    ## Make 4dfp style motion parameter and derivative regressors for timeseries
+    ## Take the backwards temporal derivative in column $1 of input $2 and output it as $3
+    ## Vectorized Matlab: d=[zeros(1,size(a,2));(a(2:end,:)-a(1:end-1,:))];
+    ## Bash version of above algorithm
+    #function DeriveBackwards {
+    #  i="$1"
+    #  in="$2"
+    #  out="$3"
+    #  # Var becomes a string of values from column $i in $in. Single space separated
+    #  Var=`cat "$in" | sed s/"  "/" "/g | cut -d " " -f $i`
+    #  Length=`echo $Var | wc -w`
+    #  # TCS becomes an array of the values from column $i in $in (derived from Var)
+    #  TCS=($Var)
+    #  # random is a random file name for temporary output
+    #  random=$RANDOM
+    #
+    #  # Cycle through our array of values from column $i
+    #  j=0
+    #  while [ $j -lt $Length ] ; do
+    #    if [ $j -eq 0 ] ; then
+    #      # Backward derivative of first volume is set to 0
+    #      Answer=`echo "0"`
+    #    else
+    #      # Compute the backward derivative of non-first volumes
+    #
+    #      # Format numeric value (convert scientific notation to decimal) jth row of ith column
+    #      # in $in (mcpar)
+    #      Forward=`echo ${TCS[$j]} | awk -F"E" 'BEGIN{OFMT="%10.10f"} {print $1 * (10 ^ $2)}'`
+    #    
+    #      # Similarly format numeric value for previous row (j-1)
+    #      Back=`echo ${TCS[$(($j-1))]} | awk -F"E" 'BEGIN{OFMT="%10.10f"} {print $1 * (10 ^ $2)}'`
+    #
+    #      # Compute backward derivative as current minus previous
+    #      Answer=`echo "scale=10; $Forward - $Back" | bc -l`
+    #    fi
+    #    # 0 prefix the resulting number
+    #    Answer=`echo $Answer | sed s/"^\."/"0."/g | sed s/"^-\."/"-0."/g`
+    #    echo `printf "%10.6f" $Answer` >> $random
+    #    j=$(($j + 1))
+    #  done
+    #  paste -d " " $out $random > ${out}_
+    #  mv ${out}_ ${out}
+    #  rm $random
+    #}
+    #
+    #motion_par=${RESTING_DIR}/bold/2_motion_corrected/bold_mcf.par
+    #motion_reg=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/mc/Movement_Regressors.txt
+    #if LWDP_needs_update_and_lock ${motion_reg} ${motion_par}; then
+    #  cat ${motion_par} | sed s/"  "/" "/g > ${motion_reg}
+    #  i=1
+    #  while [ $i -le 6 ] ; do
+    #    DeriveBackwards $i ${motion_par} ${motion_reg}
+    #    i=`echo "$i + 1" | bc`
+    #  done
+    #  
+    #  cat ${motion_reg} | awk '{for(i=1;i<=NF;i++)printf("%10.6f ",$i);printf("\n")}' > ${motion_reg}_
+    #  mv ${motion_reg}_ ${motion_reg}
+    #  
+    #  awk -f /fs/data15/djk/programming/hcp_pipelines/global/scripts/mtrendout.awk ${motion_reg} > ${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/mc/Movement_Regressors_dt.txt
+    #  
+    #  cat ${motion_reg} | awk '{ print $4 " " $5 " " $6 " " $1 " " $2 " " $3}' > ${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/mc/prefiltered_func_data_mcf.par
+    #
+    #  LWDP_lockfile_delete ${motion_reg}
+    #fi
+    motion_par=${RESTING_DIR}/bold/2_motion_corrected/bold_mcf.par
+    motion_reg=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/mc/prefiltered_func_data_mcf.par
+    if LWDP_needs_update_and_lock ${motion_reg} ${motion_par}; then
+      cp -p ${motion_par} ${motion_reg}
+      LWDP_lockfile_delete ${motion_reg}
+    fi
+    
+    fix_features=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix/features.csv
+    if LWDP_needs_update_and_lock ${fix_features} ${bold_filtered} ${bold_mean}; then
+      pushd ${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm
+      ln -s ../`basename ${bold_filtered}` filtered_func_data.nii.gz
+      ln -s ../`basename ${bold_mean}` mean_func.nii.gz
+      popd
+    
+      ${FSL_FIXDIR}/call_matlab.sh -l ${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix/logMatlab.txt -f fix_1a_extract_features ${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm
+    
+      LWDP_lockfile_delete ${fix_features}
+    fi
+  done
+  
+  TRAIN=ncanda_baseline
+  THRESH=10
+  
+  for hcp_space in hcp_bold hcp_mni; do
+    train_file=/fs/neurosci01/djk/ncanda/icafix_training/${hcp_space}/hp100_smooth5mm_full/${TRAIN}.RData
+    if [ ! -e ${train_file} ]; then
+      echo "ERROR: ${train_file} is missing"
+      exit 1
+    fi
+  
+    fix_class=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm/fix4melview_${TRAIN}_thr${THRESH}.txt
+    if LWDP_needs_update_and_lock ${fix_class} ${fix_features} ${train_file}; then
+      MELOUT=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm
+      #${FSL_FIXDIR}/fix -c ${MELOUT} ${train_file} ${THRESH}
+      ${R_DIR}/R CMD BATCH "--no-restore --no-save --args ${FSL_FIXDIR} ${MELOUT} ${train_file} ${THRESH}" ${FSL_FIXDIR}/fix_2b_predict.R ${MELOUT}/.fix_2b_predict.log
+      LWDP_lockfile_delete ${fix_class}
+    fi
+    
+    cleaned=${RESTING_DIR}/hcp/${hcp_space}/bold_4d_hp${hp}_smooth${fwhm}mm_stripped_cleaned.nii.gz
+    if LWDP_needs_update_and_lock ${cleaned} ${fix_class}; then
+      #${FSL_FIXDIR}/fix -a ${fix_class}
+      aggressive=0
+      domot=1
+      MELOUT=${RESTING_DIR}/hcp/${hcp_space}/icafix_hp${hp}_smooth${fwhm}mm
+      tail -n 1 ${fix_class} | sed 's/\[//g' | sed 's/\]//g' | sed 's/,//g' > ${MELOUT}/.fix
+      pushd ${MELOUT}
+      ${FSL_FIXDIR}/call_matlab.sh -l .fix_3_clean.log -f fix_3_clean .fix ${aggressive} ${domot} ${hp}
+      popd
+      #
+      output=${MELOUT}/filtered_func_data_clean.nii.gz
+      if [ -e ${output} ]; then
+        mv ${output} ${cleaned}
+      else
+        echo "ERROR: fix_3_clean failed"
+        LWDP_lockfile_delete ${cleaned}
+        exit 1
+      fi
+      LWDP_lockfile_delete ${cleaned}
+    fi
+  done
+  
+  hcp_mni_bold_cleaned=${RESTING_DIR}/hcp/hcp_mni/bold_4d_hp${hp}_smooth${fwhm}mm_stripped_cleaned.nii.gz
+
+  #
+  # surface processing
+  #
+  
+  AtlasSpaceFolder=${WORKDIR}/structural/hcp/hcp_mni
+  NativeFolder=Native
+  GrayordinatesSpaceDIR=${DATA_DIR}/hcp/templates/91282_Greyordinates
+  
+  LowResMesh=32
+  DownsampleFolder=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k
+  ROIFolder=${AtlasSpaceFolder}/ROIs
+  
+  WorkingDirectory=${RESTING_DIR}/hcp/hcp_mni/surf
+  
+  RegName=MSMSulc
+  NeighborhoodSmoothing=5
+  Factor=0.5
+  
+  LeftGreyRibbonValue=1
+  RightGreyRibbonValue=1
+  
+  SmoothingFWHM=2 # recommended to be roughly the grayordinates spacing, i.e 2mm on HCP data
+  GrayordinatesResolution=2
+  #FinalfMRIResolution=2.5
+  FinalfMRIResolution=2
+  
+  hcp_mni_bold_mean=${WorkingDirectory}/mean.nii.gz
+  if LWDP_needs_update_and_lock ${hcp_mni_bold_mean} ${hcp_mni_bold_cleaned}; then
+    fsl fslmaths ${hcp_mni_bold_cleaned} -Tmean ${hcp_mni_bold_mean} -odt float
+    LWDP_lockfile_delete ${hcp_mni_bold_mean}
+  fi
+  
+  # ribbon volume to surface mapping
+  inps="${AtlasSpaceFolder}/${NativeFolder}/L.white.native.surf.gii ${AtlasSpaceFolder}/${NativeFolder}/R.white.native.surf.gii ${AtlasSpaceFolder}/${NativeFolder}/L.pial.native.surf.gii ${AtlasSpaceFolder}/${NativeFolder}/R.pial.native.surf.gii"
+  ribbon_only=${WorkingDirectory}/ribbon_only.nii.gz
+  if LWDP_needs_update_and_lock ${ribbon_only} ${inps} ${hcp_mni_bold_mean}; then
+    tmpdir=$(mktemp -d)
+  
+    for Hemisphere in L R; do
+      if [ ${Hemisphere} = "L" ]; then
+        GreyRibbonValue=${LeftGreyRibbonValue}
+      elif [ ${Hemisphere} = "R" ]; then
+        GreyRibbonValue=${RightGreyRibbonValue}
+      fi
+      caret7 wb_command -create-signed-distance-volume ${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.white.native.surf.gii ${hcp_mni_bold_mean} ${tmpdir}/${Hemisphere}.white.native.nii.gz
+      caret7 wb_command -create-signed-distance-volume ${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.pial.native.surf.gii ${hcp_mni_bold_mean} ${tmpdir}/${Hemisphere}.pial.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.white.native.nii.gz -thr 0 -bin -mul 255 ${tmpdir}/${Hemisphere}.white_thr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.white_thr0.native.nii.gz -bin ${tmpdir}/${Hemisphere}.white_thr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.pial.native.nii.gz -uthr 0 -abs -bin -mul 255 ${tmpdir}/${Hemisphere}.pial_uthr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.pial_uthr0.native.nii.gz -bin ${tmpdir}/${Hemisphere}.pial_uthr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.pial_uthr0.native.nii.gz -mas ${tmpdir}/${Hemisphere}.white_thr0.native.nii.gz -mul 255 ${tmpdir}/${Hemisphere}.ribbon.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.ribbon.nii.gz -bin -mul ${GreyRibbonValue} ${tmpdir}/${Hemisphere}.ribbon.nii.gz
+    done
+    fsl fslmaths ${tmpdir}/L.ribbon.nii.gz -add ${tmpdir}/R.ribbon.nii.gz ${ribbon_only}
+  
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${ribbon_only}
+  fi
+  
+  hcp_mni_bold_cov=${WorkingDirectory}/cov.nii.gz
+  if LWDP_needs_update_and_lock ${hcp_mni_bold_cov} ${hcp_mni_bold_cleaned} ${hcp_mni_bold_mean}; then
+    fsl fslmaths ${hcp_mni_bold_cleaned} -Tstd ${WorkingDirectory}/std.nii.gz -odt float
+    fsl fslmaths ${WorkingDirectory}/std.nii.gz -div ${hcp_mni_bold_mean} ${hcp_mni_bold_cov}
+    LWDP_lockfile_delete ${hcp_mni_bold_cov}
+  fi
+  
+  goodvoxels=${WorkingDirectory}/goodvoxels.nii.gz
+  if LWDP_needs_update_and_lock ${goodvoxels} ${hcp_mni_bold_cov} ${ribbon_only} ${hcp_mni_bold_mean}; then
+    tmpdir=$(mktemp -d)
+  
+    fsl fslmaths ${hcp_mni_bold_cov} -mas ${ribbon_only} ${tmpdir}/cov_ribbon.nii.gz
+    fsl fslmaths ${tmpdir}/cov_ribbon.nii.gz -div `fsl fslstats ${tmpdir}/cov_ribbon.nii.gz -M` ${tmpdir}/cov_ribbon_norm.nii.gz
+    fsl fslmaths ${tmpdir}/cov_ribbon_norm.nii.gz -bin -s ${NeighborhoodSmoothing} ${tmpdir}/SmoothNorm.nii.gz
+    fsl fslmaths ${tmpdir}/cov_ribbon_norm.nii.gz -s ${NeighborhoodSmoothing} -div ${tmpdir}/SmoothNorm.nii.gz -dilD ${tmpdir}/cov_ribbon_norm_s${NeighborhoodSmoothing}.nii.gz
+    fsl fslmaths ${hcp_mni_bold_cov} -div `fsl fslstats ${tmpdir}/cov_ribbon.nii.gz -M` -div ${tmpdir}/cov_ribbon_norm_s${NeighborhoodSmoothing}.nii.gz ${tmpdir}/cov_norm_modulate.nii.gz
+    fsl fslmaths ${tmpdir}/cov_norm_modulate.nii.gz -mas ${ribbon_only} ${tmpdir}/cov_norm_modulate_ribbon.nii.gz
+    
+    STD=`fsl fslstats ${tmpdir}/cov_norm_modulate_ribbon.nii.gz -S`
+    echo ${STD}
+    MEAN=`fsl fslstats ${tmpdir}/cov_norm_modulate_ribbon.nii.gz -M`
+    echo ${MEAN}
+    Lower=`echo "${MEAN} - (${STD} * ${Factor})" | bc -l`
+    echo ${Lower}
+    Upper=`echo "${MEAN} + (${STD} * ${Factor})" | bc -l`
+    echo ${Upper}
+  
+    fsl fslmaths ${hcp_mni_bold_mean} -bin ${tmpdir}/mask.nii.gz
+    fsl fslmaths ${tmpdir}/cov_norm_modulate.nii.gz -thr ${Upper} -bin -sub ${tmpdir}/mask.nii.gz -mul -1 ${goodvoxels}
+  
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${goodvoxels}
+  fi
+  
+  for Hemisphere in L R ; do
+    mid_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+    white_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.white.native.surf.gii
+    pial_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.pial.native.surf.gii
+    roi_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+    sphere_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.${RegName}.native.surf.gii
+    sphere_lowres=${DownsampleFolder}/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+    mid_lowres=${DownsampleFolder}/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+    atlasroi_lowres=${DownsampleFolder}/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+
+    for Map in mean cov ; do
+      inp_map="${WorkingDirectory}/${Map}.nii.gz"
+      out=${WorkingDirectory}/${Hemisphere}.${Map}.native.func.gii
+      if LWDP_needs_update_and_lock ${out} ${inp_map} ${mid_native} ${white_native} ${pial_native} ${roi_native}; then
+        caret7 wb_command -volume-to-surface-mapping ${inp_map} ${mid_native} ${out} -ribbon-constrained ${white_native} ${pial_native} -volume-roi ${goodvoxels}
+        caret7 wb_command -metric-dilate ${out} ${mid_native} 10 ${out} -nearest
+        caret7 wb_command -metric-mask ${out} ${roi_native} ${out}
+        LWDP_lockfile_delete ${out}
+      fi
+      out_lowres=${WorkingDirectory}/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.func.gii
+      if LWDP_needs_update_and_lock ${out_lowres} ${out} ${sphere_native} ${sphere_lowres} ${mid_native} ${mid_lowres} ${roi_native} ${atlasroi_lowres}; then
+        caret7 wb_command -metric-resample ${out} ${sphere_native} ${sphere_lowres} ADAP_BARY_AREA ${out_lowres} -area-surfs ${mid_native} ${mid_lowres} -current-roi ${roi_native}
+        caret7 wb_command -metric-mask ${out_lowres} ${atlasroi_lowres} ${out_lowres}
+        LWDP_lockfile_delete ${out_lowres}
+      fi
+  
+      out=${WorkingDirectory}/${Hemisphere}.${Map}_all.native.func.gii
+      if LWDP_needs_update_and_lock ${out} ${inp_map} ${mid_native} ${white_native} ${pial_native} ${roi_native}; then
+        caret7 wb_command -volume-to-surface-mapping ${inp_map} ${mid_native} ${out} -ribbon-constrained ${white_native} ${pial_native}
+        caret7 wb_command -metric-mask ${out} ${roi_native} ${out}
+        LWDP_lockfile_delete ${out}
+      fi
+      out_lowres=${WorkingDirectory}/${Hemisphere}.${Map}_all.${LowResMesh}k_fs_LR.func.gii
+      if LWDP_needs_update_and_lock ${out_lowres} ${out} ${sphere_native} ${sphere_lowres} ${mid_native} ${mid_lowres} ${roi_native} ${atlasroi_lowres}; then
+        caret7 wb_command -metric-resample ${out} ${sphere_native} ${sphere_lowres} ADAP_BARY_AREA ${out_lowres} -area-surfs ${mid_native} ${mid_lowres} -current-roi ${roi_native}
+        caret7 wb_command -metric-mask ${out_lowres} ${atlasroi_lowres} ${out_lowres}
+        LWDP_lockfile_delete ${out_lowres}
+      fi
+    done
+  
+    out=${WorkingDirectory}/${Hemisphere}.goodvoxels.native.func.gii
+    if LWDP_needs_update_and_lock ${out} ${goodvoxels} ${mid_native} ${white_native} ${pial_native} ${roi_native}; then
+      caret7 wb_command -volume-to-surface-mapping ${goodvoxels} ${mid_native} ${out} -ribbon-constrained ${white_native} ${pial_native}
+      caret7 wb_command -metric-mask ${out} ${roi_native} ${out}
+      LWDP_lockfile_delete ${out}
+    fi
+    out_lowres=${WorkingDirectory}/${Hemisphere}.goodvoxels.${LowResMesh}k_fs_LR.func.gii
+    if LWDP_needs_update_and_lock ${out_lowres} ${out} ${sphere_native} ${sphere_lowres} ${mid_native} ${mid_lowres} ${roi_native} ${atlasroi_lowres}; then
+      caret7 wb_command -metric-resample ${out} ${sphere_native} ${sphere_lowres} ADAP_BARY_AREA ${out_lowres} -area-surfs ${mid_native} ${mid_lowres} -current-roi ${roi_native}
+      caret7 wb_command -metric-mask ${out_lowres} ${atlasroi_lowres} ${out_lowres}
+      LWDP_lockfile_delete ${out_lowres}
+    fi
+  
+    out=${WorkingDirectory}/bold.${Hemisphere}.native.func.gii
+    if LWDP_needs_update_and_lock ${out} ${hcp_mni_bold_cleaned} ${goodvoxels} ${mid_native} ${white_native} ${pial_native} ${roi_native}; then
+      caret7 wb_command -volume-to-surface-mapping ${hcp_mni_bold_cleaned} ${mid_native} ${out} -ribbon-constrained ${white_native} ${pial_native} -volume-roi ${goodvoxels}
+      caret7 wb_command -metric-dilate ${out} ${mid_native} 10 ${out} -nearest
+      caret7 wb_command -metric-mask ${out} ${roi_native} ${out}
+      LWDP_lockfile_delete ${out}
+    fi
+    out_lowres=${WorkingDirectory}/bold.${Hemisphere}.${LowResMesh}k_fs_LR.func.gii
+    if LWDP_needs_update_and_lock ${out_lowres} ${out} ${sphere_native} ${sphere_lowres} ${mid_native} ${mid_lowres} ${roi_native} ${atlasroi_lowres}; then
+      caret7 wb_command -metric-resample ${out} ${sphere_native} ${sphere_lowres} ADAP_BARY_AREA ${out_lowres} -area-surfs ${mid_native} ${mid_lowres} -current-roi ${roi_native}
+      caret7 wb_command -metric-mask ${out_lowres} ${atlasroi_lowres} ${out_lowres}
+      LWDP_lockfile_delete ${out_lowres}
+    fi
+  
+    # surface smoothing
+    out_lowres_s=${WorkingDirectory}/bold_s${SmoothingFWHM}.${Hemisphere}.${LowResMesh}k_fs_LR.func.gii
+    if LWDP_needs_update_and_lock ${out_lowres_s} ${out_lowres} ${mid_lowres} ${atlasroi_lowres}; then
+      Sigma=`echo "${SmoothingFWHM}/(2*(sqrt(2*l(2))))" | bc -l`
+      caret7 wb_command -metric-smoothing ${mid_lowres} ${out_lowres} ${Sigma} ${out_lowres_s} -roi ${atlasroi_lowres}
+      LWDP_lockfile_delete ${out_lowres_s}
+    fi
+  done
+  
+  # subcortical processing, generate subject-roi space fMRI cifti for subcortical
+  inps="${ROIFolder}/ROIs.${GrayordinatesResolution}.nii.gz ${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz"
+  out=${WorkingDirectory}/bold_AtlasSubcortical_s${SmoothingFWHM}.nii.gz
+  if LWDP_needs_update_and_lock ${out} ${hcp_mni_bold_cleaned} ${inps}; then
+    tmpdir=$(mktemp -d)
+    
+    if [[ `echo "${GrayordinatesResolution} == ${FinalfMRIResolution}" | bc -l | cut -f1 -d.` == "1" ]]; then
+      echo "Creating subject-roi subcortical cifti at same resolution as output"
+      caret7 wb_command -cifti-create-dense-timeseries ${tmpdir}/bold_temp_subject.dtseries.nii -volume ${hcp_mni_bold_cleaned} ${ROIFolder}/ROIs.${GrayordinatesResolution}.nii.gz
+    else
+      echo "Creating subject-roi subcortical cifti at differing fMRI resolution"
+      caret7 wb_command -volume-affine-resample ${ROIFolder}/ROIs.${GrayordinatesResolution}.nii.gz ${FSLDIR}/etc/flirtsch/ident.mat ${hcp_mni_bold_cleaned} ENCLOSING_VOXEL ${tmpdir}/ROIs.${FinalfMRIResolution}.nii.gz
+      caret7 wb_command -cifti-create-dense-timeseries ${tmpdir}/bold_temp_subject.dtseries.nii -volume ${hcp_mni_bold_cleaned} ${tmpdir}/ROIs.${FinalfMRIResolution}.nii.gz
+    fi
+  
+    echo "Dilating out zeros"
+    # dilate out any exact zeros in the input data, for instance if the brain mask is wrong
+    caret7 wb_command -cifti-dilate ${tmpdir}/bold_temp_subject.dtseries.nii COLUMN 0 10 ${tmpdir}/bold_temp_subject_dilate.dtseries.nii
+  
+    echo "Generate atlas subcortical template cifti"
+    caret7 wb_command -cifti-create-label ${tmpdir}/bold_temp_template.dlabel.nii -volume ${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz ${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz
+  
+    Sigma=`echo "${SmoothingFWHM}/(2*(sqrt(2*l(2))))" | bc -l`
+    if [[ `echo "${Sigma} > 0" | bc -l | cut -f1 -d.` == "1" ]]; then
+      echo "Smoothing and resampling"
+      caret7 wb_command -cifti-smoothing ${tmpdir}/bold_temp_subject_dilate.dtseries.nii 0 ${Sigma} COLUMN ${tmpdir}/bold_temp_subject_smooth.dtseries.nii -fix-zeros-volume
+      caret7 wb_command -cifti-resample ${tmpdir}/bold_temp_subject_smooth.dtseries.nii COLUMN ${tmpdir}/bold_temp_template.dlabel.nii COLUMN ADAP_BARY_AREA CUBIC ${tmpdir}/bold_temp_atlas.dtseries.nii -volume-predilate 10
+    else
+      echo "Resampling"
+      caret7 wb_command -cifti-resample ${tmpdir}/bold_temp_subject_dilate.dtseries.nii COLUMN ${tmpdir}/bold_temp_template.dlabel.nii COLUMN ADAP_BARY_AREA CUBIC ${tmpdir}/bold_temp_atlas.dtseries.nii -volume-predilate 10
+    fi
+  
+    caret7 wb_command -cifti-separate ${tmpdir}/bold_temp_atlas.dtseries.nii COLUMN -volume-all ${out}
+  
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${out}
+  fi
+  
+  # generation of dense timeseries
+  inps="${WorkingDirectory}/bold_AtlasSubcortical_s${SmoothingFWHM}.nii.gz ${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz ${WorkingDirectory}/bold_s${SmoothingFWHM}.L.${LowResMesh}k_fs_LR.func.gii ${DownsampleFolder}/L.atlasroi.${LowResMesh}k_fs_LR.shape.gii ${WorkingDirectory}/bold_s${SmoothingFWHM}.R.${LowResMesh}k_fs_LR.func.gii ${DownsampleFolder}/R.atlasroi.${LowResMesh}k_fs_LR.shape.gii"
+  out=${WorkingDirectory}/bold_Atlas.dtseries.nii
+  if LWDP_needs_update_and_lock ${out} ${inps}; then
+    caret7 wb_command -cifti-create-dense-timeseries ${out} -volume ${WorkingDirectory}/bold_AtlasSubcortical_s${SmoothingFWHM}.nii.gz ${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz -left-metric ${WorkingDirectory}/bold_s${SmoothingFWHM}.L.${LowResMesh}k_fs_LR.func.gii -roi-left ${DownsampleFolder}/L.atlasroi.${LowResMesh}k_fs_LR.shape.gii -right-metric ${WorkingDirectory}/bold_s${SmoothingFWHM}.R.${LowResMesh}k_fs_LR.func.gii -roi-right ${DownsampleFolder}/R.atlasroi.${LowResMesh}k_fs_LR.shape.gii -timestep ${tr}
+    LWDP_lockfile_delete ${out}
+  fi
+fi
+

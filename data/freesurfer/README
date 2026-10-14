@@ -1,0 +1,113 @@
+
+freesurfer_lut=/fs/tools/freesurfer/5.3.0/Ubuntu14/FreeSurferColorLUT.txt
+num_lines=`cat ${freesurfer_lut} | wc -l`
+
+freesurfer_lut_selected=FreeSurferColorLUT_Connectivity.txt
+label_selected_list=`cat freesurfer_connectivity_labels.txt`
+
+if [ ! -e ${freesurfer_lut_selected} ]; then
+  for idx in `seq 1 ${num_lines}`; do
+    line=`sed "${idx}q;d" ${freesurfer_lut}`
+    label=`echo ${line} | tr "\t" " " | tr -s " " | cut -d " " -f2`
+    for label_test in ${label_selected_list}; do
+      if [ "${label}" == "${label_test}" ]; then
+        echo ${line} >> ${freesurfer_lut_selected}
+      fi
+    done
+  done
+fi
+
+freesurfer_lut_selected=FreeSurferColorLUT_WM.txt
+label_num_list="2 7 16 29 32 41 46 61 64 59 60 27 28 `seq 77 88` `seq 100 117` `seq 155 158` `seq 195 196` `seq 199 200` `seq 203 204` 212 219 223 `seq 250 255`"
+
+if [ ! -e ${freesurfer_lut_selected} ]; then
+  for idx in `seq 1 ${num_lines}`; do
+    line=`sed "${idx}q;d" ${freesurfer_lut}`
+    label_num=`echo ${line} | tr "\t" " " | tr -s " " | cut -d " " -f1`
+    for label_num_test in ${label_num_list}; do
+      if [ "${label_num}" == "${label_num_test}" ]; then
+        echo ${line} >> ${freesurfer_lut_selected}
+      fi
+    done
+  done
+fi
+
+freesurfer_lut_selected=FreeSurferColorLUT_Ventricles.txt
+label_num_list="4 5 14 15 31 43 44 63 72"
+
+if [ ! -e ${freesurfer_lut_selected} ]; then
+  for idx in `seq 1 ${num_lines}`; do
+    line=`sed "${idx}q;d" ${freesurfer_lut}`
+    label_num=`echo ${line} | tr "\t" " " | tr -s " " | cut -d " " -f1`
+    for label_num_test in ${label_num_list}; do
+      if [ "${label_num}" == "${label_num_test}" ]; then
+        echo ${line} >> ${freesurfer_lut_selected}
+      fi
+    done
+  done
+fi
+
+# cbm merged labels
+#
+#601 cbm-anterior
+#
+#601 Cbm_Left_I_IV
+#603 Cbm_Left_V
+#602 Cbm_Right_I_IV
+#604 Cbm_Right_V
+#
+#
+#605 cbm-lh-superiorposterior
+#
+#605 Cbm_Left_VI
+#608 Cbm_Left_CrusI
+#611 Cbm_Left_CrusII
+#614 Cbm_Left_VIIb
+#
+#
+#606 cbm-vermis-superiorposterior
+#
+#606 Cbm_Vermis_VI
+#609 Cbm_Vermis_CrusI
+#612 Cbm_Vermis_CrusII
+#615 Cbm_Vermis_VIIb
+#
+#
+#607 cbm-rh-superiorposterior
+#
+#607 Cbm_Right_VI
+#610 Cbm_Right_CrusI
+#613 Cbm_Right_CrusII
+#616 Cbm_Right_VIIb
+#
+#
+#617 cbm-lh-inferiorposterior
+#
+#617 Cbm_Left_VIIIa
+#620 Cbm_Left_VIIIb
+#623 Cbm_Left_IX
+#626 Cbm_Left_X
+#
+#
+#618 cbm-vermis-inferiorposterior
+#
+#618 Cbm_Vermis_VIIIa
+#621 Cbm_Vermis_VIIIb
+#624 Cbm_Vermis_IX
+#627 Cbm_Vermis_X
+#
+#
+#619 cbm-rh-inferiorposterior
+#
+#619 Cbm_Right_VIIIa
+#622 Cbm_Right_VIIIb
+#625 Cbm_Right_IX
+#628 Cbm_Right_X
+#
+#
+# merged flocculonodular (X) to inferriorposterior
+#626 cbm-flocculonodular
+#
+#626 Cbm_Left_X
+#627 Cbm_Vermis_X
+#628 Cbm_Right_X

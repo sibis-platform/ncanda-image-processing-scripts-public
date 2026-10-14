@@ -1,0 +1,33 @@
+#!/bin/bash
+
+##
+##  Copyright 2021 Stanford 
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+# only call with <case>/<arm>
+# e.g. ../scripts/image_processing/bin/create_qc_images_all_visits <subject>/standard 
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+
+# remove trailing "/"
+if [ "${1: -1:1}" == "/" ]; then
+  export ARMDIR=${1:: -1}
+else
+  export ARMDIR=${1}
+fi
+
+LAST_VISIT_YEAR=11
+
+for STRUC in `ls -d $ARMDIR/*/structural`; do 
+    WORKDIR=`dirname $STRUC`
+    VISIT=`basename $WORKDIR`
+    if [ $VISIT != "baseline" ]; then  
+	YEAR=`echo $VISIT | cut -d'_' -f2 | cut -d'y' -f1`
+	if [ "$YEAR" != "" -a $YEAR -gt $LAST_VISIT_YEAR ]; then 
+	    break
+	fi
+    fi
+    ${NCANDA_BINARY_DIR}/create_qc_image $WORKDIR
+done
+
+${NCANDA_BINARY_DIR}/create_qc_longitudinal_images $ARMDIR/followup_${LAST_VISIT_YEAR}y

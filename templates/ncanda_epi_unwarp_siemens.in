@@ -1,0 +1,55 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+NCANDA_DATA_DIR=@NCANDA_DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh ""
+
+#
+# Setup input and output
+#
+
+# ./ncanda_epi_unwarp_siemens <MAGNITUDE FILE> <B0 FILE> <Field Map> <DWELL Time> <DeltaTS> <OUTPUT - Corrected B) File> 
+# this script unwarps the B0 scan based on the fieldmap. Scans must be from a siemerns scanner 
+# DWELL Time = Divide Echo Spacing (dwell time)  by any acceleration factor. Echo spacing is the same as EPI dwell time per phase-encode. Time should be given in seconds 
+# <deltaTE> is the echo time difference of the fieldmap sequence - *usually* 2.46ms on SIEMENS 
+
+# example call ./ncanda_epi_unwarp_siemens <magnitude.nii> <epi.nii.gz> <fieldmap.nii> 0.000345 2.46 <output.nii.gz>
+
+export INPUT_M=$1
+export INPUT_B0=$2
+export INPUT_F=$3
+export DWELL=$4
+export DELTA_TS=$5
+export OUTPUT_B0_CORRECTED=$6
+
+if LWDP_needs_update_and_lock ${OUTPUT_B0_CORRECTED}; then
+  tmpdir=`mktemp -d`
+  
+  # create brain mask from magnitude image
+  fsl bet ${INPUT_M} ${tmpdir}/m-strip -m -f 0.5 -g -0.0
+  # Brain strip B0
+  cmtk imagemath --in ${tmpdir}/m-strip_mask.nii.gz ${INPUT_B0} --mul --out ${tmpdir}/b-strip.nii.gz
+  # Prepare fieldmap for fugue
+  # fsl_prepare_fieldmap <scanner> <phase_image> <magnitude_image> <out_image> <deltaTE (in ms)> 
+  fsl fsl_prepare_fieldmap SIEMENS ${INPUT_F}  ${tmpdir}/m-strip.nii  ${tmpdir}/f-for-fugue ${DELTA_TS}
+
+  # --dwell =  Divide Echo Spacing (dwell time)  by any acceleration factor - Echo spacing is the same as EPI dwell time per phase-encode
+  fsl fugue -i  ${tmpdir}/b-strip.nii.gz --dwell=${DWELL}  --unwarpdir=y- --loadfmap=${tmpdir}/f-for-fugue.nii.gz  -s 0.5 -u ${OUTPUT_B0_CORRECTED} -v
+  rm -rf ${tmpdir}
+  echo "Wrote epi corrected map to  ${OUTPUT_B0_CORRECTED}"    
+
+  LWDP_lockfile_delete ${OUTPUT_B0_CORRECTED}
+fi
+

@@ -1,0 +1,184 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+t1_sri24_affine=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_0GenericAffine.mat)
+t1_sri24_warp=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_1Warp.nii.gz)
+t1_sri24_warp_inv=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_1InverseWarp.nii.gz)
+if [ ! -e  ${t1_sri24_affine} ] ; then
+  echo "ERROR: ${WORKDIR}: ${t1_sri24_affine} is missing."
+  exit 1
+fi
+if [ ! -e  ${t1_sri24_warp} ] ; then
+  echo "ERROR: ${WORKDIR}: ${t1_sri24_warp} is missing."
+  exit 1
+fi
+if [ ! -e  ${t1_sri24_warp_inv} ] ; then
+  echo "ERROR: ${WORKDIR}: ${t1_sri24_warp_inv} is missing."
+  exit 1
+fi
+if [ "${VISIT}" == "baseline" ]; then
+  t1_sri24_mtx="${t1_sri24_warp} ${t1_sri24_affine}"
+  t1_sri24_mtx_affine="${t1_sri24_affine}"
+  sri24_t1_mtx="[${t1_sri24_affine},1] ${t1_sri24_warp_inv}"
+  sri24_t1_mtx_affine="[${t1_sri24_affine},1]"
+else
+  t1_brain_to_baseline_affine=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_0GenericAffine.mat)
+  t1_brain_to_baseline_warp=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_1Warp.nii.gz)
+  t1_brain_to_baseline_warp_inv=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_1InverseWarp.nii.gz)
+  if [ ! -e  ${t1_brain_to_baseline_affine} ] ; then
+    echo "ERROR: ${WORKDIR}: ${t1_brain_to_baseline_affine} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${t1_brain_to_baseline_warp} ] ; then
+    echo "ERROR: ${WORKDIR}: ${t1_brain_to_baseline_warp} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${t1_brain_to_baseline_warp_inv} ] ; then
+    echo "ERROR: ${WORKDIR}: ${t1_brain_to_baseline_warp_inv} is missing."
+    exit 1
+  fi
+  t1_sri24_mtx="${t1_brain_to_baseline_warp} ${t1_brain_to_baseline_affine} ${t1_sri24_warp} ${t1_sri24_affine}"
+  t1_sri24_mtx_affine="${t1_brain_to_baseline_warp} ${t1_brain_to_baseline_affine} ${t1_sri24_affine}"
+  sri24_t1_mtx="[${t1_sri24_affine},1] ${t1_sri24_warp_inv} [${t1_brain_to_baseline_affine},1] ${t1_brain_to_baseline_warp_inv}"
+  sri24_t1_mtx_affine="[${t1_sri24_affine},1] [${t1_brain_to_baseline_affine},1] ${t1_brain_to_baseline_warp_inv}"
+fi
+
+sri24_t1=${DATA_DIR}/sri24/sri24_t1.nii.gz
+t1_mrbias=$(LWDP_get_override_file ${WORKDIR}/structural/mrbias/t1.nii.gz)
+t2_mrbias=$(LWDP_get_override_file ${WORKDIR}/structural/mrbias/t2.nii.gz)
+t1_brainmask=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain_mask.nii.gz)
+if [ "${VISIT}" == "baseline" ]; then
+  t1_brain=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain.nii.gz)
+else
+  t1_brain=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/corrected/t1_brain.nii.gz)
+fi
+t1_denoised=$(LWDP_get_override_file ${WORKDIR}/structural/denoised/t1.nii.gz)
+# t2_affine_refined_denoised=${WORKDIR}/structural/denoised/t2_affine_refined.nii.gz
+# t2_affine_refined_brain_exp_mask=${WORKDIR}/structural/reslice/subject_t1/t2_affine_refined_brain_exp_mask.nii.gz
+
+#
+# reformat using affine transformations
+#
+
+[ -d ${WORKDIR}/structural/reslice/sri24/affine ] || mkdir -p ${WORKDIR}/structural/reslice/sri24/affine
+
+inp[1]=${t1_brainmask}
+out[1]=${WORKDIR}/structural/reslice/sri24/affine/t1_brain_mask.nii.gz
+inp[2]=${t1_brain}  
+out[2]=${WORKDIR}/structural/reslice/sri24/affine/t1_brain.nii.gz
+inp[3]=${t1_mrbias}
+out[3]=${WORKDIR}/structural/reslice/sri24/affine/t1.nii.gz
+inp[4]=${t2_mrbias}
+out[4]=${WORKDIR}/structural/reslice/sri24/affine/t2.nii.gz
+inp[5]=${WORKDIR}/structural/segment/subject_t1/fast/t1_seg.nii.gz
+out[5]=${WORKDIR}/structural/reslice/sri24/affine/fast/t1_seg.nii.gz
+inp[6]=${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg.nii.gz
+out[6]=${WORKDIR}/structural/reslice/sri24/affine/atropos/t1_seg.nii.gz
+inp[7]=${WORKDIR}/structural/reslice/subject_t1/sri24/parc116.nii.gz
+out[7]=${WORKDIR}/structural/reslice/sri24/affine/parc116.nii.gz
+
+for i in 1; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_t1} ${t1_sri24_mtx}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${sri24_t1} -o ${out[${i}]} -t ${sri24_t1_mtx_affine}
+    c3d c3d ${out[${i}]} -type uchar -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 2; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_t1} ${t1_sri24_mtx} ${out[1]}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${sri24_t1} -o ${out[${i}]} -t ${sri24_t1_mtx_affine}
+    c3d c3d ${out[${i}]} ${out[1]} -multiply -clip 0 inf -type float -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 3 4; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_t1} ${t1_sri24_mtx}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${sri24_t1} -o ${out[${i}]} -t ${sri24_t1_mtx_affine}
+    c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 5 6 7; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_t1} ${t1_sri24_mtx}; then
+    # choose MultiLabel params which preserves boundaries close to NN, but applying some mild smoothness
+    ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${i}]} -r ${sri24_t1} -o ${out[${i}]} -t ${sri24_t1_mtx_affine}
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+
+#
+# reformat using nonrigid transformations
+#
+
+atlas_type[1]="sri24"
+atlas_mr[1]=${sri24_t1}
+
+atlas_type[2]="sri24_2mm"
+atlas_mr[2]=${DATA_DIR}/sri24/connectivity/2mm/sri24_brainmask.nii.gz
+
+for index in 1 2; do
+  [ -d ${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp ] || mkdir -p ${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp
+
+  inp[1]=${t1_brainmask}
+  out[1]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/t1_brain_mask.nii.gz
+  #
+  inp[2]=${t1_brain}
+  out[2]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/t1_brain.nii.gz
+  #
+  inp[3]=${WORKDIR}/structural/segment/subject_t1/fast/t1_seg.nii.gz
+  out[3]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/fast/t1_seg.nii.gz
+  inp[4]=${WORKDIR}/structural/segment/subject_t1/fast/t1_ven_parc.nii.gz
+  out[4]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/fast/t1_ven_parc.nii.gz
+  inp[5]=${WORKDIR}/structural/segment/subject_t1/fast/t1_gm_parc.nii.gz
+  out[5]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/fast/t1_gm_parc.nii.gz
+  inp[6]=${WORKDIR}/structural/segment/subject_t1/fast/t1_wm_parc.nii.gz
+  out[6]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/fast/t1_wm_parc.nii.gz
+  inp[7]=${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg.nii.gz
+  out[7]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/atropos/t1_seg.nii.gz
+  inp[8]=${WORKDIR}/structural/segment/subject_t1/atropos/t1_ven_parc.nii.gz
+  out[8]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/atropos/t1_ven_parc.nii.gz
+  inp[9]=${WORKDIR}/structural/segment/subject_t1/atropos/t1_gm_parc.nii.gz
+  out[9]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/atropos/t1_gm_parc.nii.gz
+  inp[10]=${WORKDIR}/structural/segment/subject_t1/atropos/t1_wm_parc.nii.gz
+  out[10]=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/atropos/t1_wm_parc.nii.gz
+
+  for i in 1; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${atlas_mr[${index}]} ${t1_sri24_mtx}; then
+      ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${atlas_mr[${index}]} -o ${out[${i}]} -t ${sri24_t1_mtx}
+      c3d c3d ${out[${i}]} -type uchar -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done 
+  for i in 2; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${atlas_mr[${index}]} ${t1_sri24_mtx} ${out[1]}; then
+      ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${atlas_mr[${index}]} -o ${out[${i}]} -t ${sri24_t1_mtx}
+      c3d c3d ${out[${i}]} ${out[1]} -multiply -clip 0 inf -type float -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+  for i in 3 4 5 6 7 8 9 10; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${atlas_mr[${index}]} ${t1_sri24_mtx}; then
+      # choose MultiLabel params which preserves boundaries close to NN, but applying some mild smoothness
+      ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${i}]} -r ${atlas_mr[${index}]} -o ${out[${i}]} -t ${sri24_t1_mtx}
+      c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+done
+

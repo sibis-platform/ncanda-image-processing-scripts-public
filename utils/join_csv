@@ -1,0 +1,48 @@
+#!/usr/bin/env python
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+# Set up command line parser
+import argparse
+parser = argparse.ArgumentParser( description="Join multiple CSV files into one." )
+parser.add_argument( "-v", "--verbose", help="Verbose operation", action="store_true")
+parser.add_argument( "--index", help="Labels of column(s) in the input files to be used as the table index(es). Multiple labels can be separated by commas (',').", default="subject,arm,visit")
+parser.add_argument( "-o", "--csvout", help="Output .csv file." )
+parser.add_argument( "-s", "--suffix",help="suffix to be used for overlapping variable names (first two files) - by default '_x','_y'",default="")
+parser.add_argument( "csvin", help="Input .csv file.", nargs="+" )
+args = parser.parse_args()
+
+# Parse index labels
+index_labels = args.index.split( ',' )
+if args.suffix== "" : 
+    suffix=[]
+else :
+    suffix=args.suffix.split(',')
+
+# Read input file
+import pandas
+joined = pandas.DataFrame()
+
+for next in args.csvin:
+    # new_data=pandas.read_csv( next,low_memory=False ).reset_index().set_index( index_labels )
+    new_data=pandas.read_csv( next,low_memory=False, index_col=index_labels )
+    if joined.empty :
+        joined = new_data
+    elif suffix  != [] :
+        suffix_select= suffix[0:2]
+        suffix=suffix[1:]
+
+        joined = pandas.merge( joined, new_data, how='outer', left_index=True, right_index=True, suffixes=suffix_select)
+    else : 
+        joined = pandas.merge( joined, new_data, how='outer', left_index=True, right_index=True)
+
+joined.reset_index().to_csv( args.csvout, index=False )
+

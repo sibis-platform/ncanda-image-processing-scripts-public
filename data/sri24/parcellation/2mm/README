@@ -1,0 +1,38 @@
+c3d ../sri24_parc116.nii.gz -pad 0x0x1 0x0x0 0 -interpolation NearestNeighbor -resample 120x120x78 -flip x -orient RPI -origin 0x0x0mm -o sri24_parc116.nii.gz
+c3d ../../sri24_t1.nii.gz -pad 0x0x1 0x0x0 0 -resample 120x120x78 -flip x -orient RPI -origin 0x0x0mm -o sri24_t1.nii.gz
+c3d ../../sri24_brainmask.nii.gz -pad 0x0x1 0x0x0 0 -interpolation NearestNeighbor -resample 120x120x78 -flip x -orient RPI -origin 0x0x0mm -o sri24_brainmask.nii.gz
+c3d ../../sri24_pbmap_CSF.nii.gz -pad 0x0x1 0x0x0 0 -resample 120x120x78 -flip x -orient RPI -origin 0x0x0mm -o sri24_pbmap_CSF.nii.gz
+c3d ../../sri24_pbmap_GM.nii.gz -pad 0x0x1 0x0x0 0 -resample 120x120x78 -flip x -orient RPI -origin 0x0x0mm -o sri24_pbmap_GM.nii.gz
+c3d ../../sri24_pbmap_WM.nii.gz -pad 0x0x1 0x0x0 0 -resample 120x120x78 -flip x -orient RPI -origin 0x0x0mm -o sri24_pbmap_WM.nii.gz
+c3d ../../sri24_tissues.nii.gz -pad 0x0x1 0x0x0 0 -interpolation NearestNeighbor -resample 120x120x78 -flip x -orient RPI -origin 0x0x0mm -o sri24_tissues.nii.gz
+# taking out 75 and 76 as they are too small to be meaningful - the other ones are white matter structures
+c3d sri24_parc116.nii.gz -replace 75 0 76 0 131 0 132 0 133 0 134 0 -o /tmp/blub.nii.gz
+fslmaths sri24_tissues.nii.gz -thr 2 -uthr 2 -bin -mul /tmp/blub.nii.gz sri24_parc116_gm.nii.gz
+
+# Create csv file 
+## tail -n1 ../sri24_parc116_gm.csv | tr ',' '\n' | grep -n -e 75 -e 76
+# 75:75
+# 76:76
+## cat  ../sri24_parc116_gm.csv | cut -d',' -f 75,76
+# Pallidum_L,Pallidum_R
+# 75,76
+
+cat  ../sri24_parc116_gm.csv | cut -d',' -f 1-74,77- > sri24_parc116_gm.csv
+
+# ROI to ROI csv
+index=1
+initial=1
+LIST=`head -n1 sri24_parc116_gm.csv | tr ',' ' ' `
+for LABEL in $LIST; do 
+    sLIST=`echo $LIST| cut -d' ' -f${index}-`
+    for sLABEL in $sLIST; do 
+       if [ $initial -eq 1 ]; then 
+         echo -n "${LABEL}-${sLABEL}" > sri24_parc116_gm_roi2roi.csv
+	 initial=0
+       else 
+         echo -n ",${LABEL}-${sLABEL}" >> sri24_parc116_gm_roi2roi.csv
+       fi
+    done 
+    index=$((index+1))
+done 
+echo "" >> sri24_parc116_gm_roi2roi.csv

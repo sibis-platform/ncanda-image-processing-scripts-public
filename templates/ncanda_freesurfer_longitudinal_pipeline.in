@@ -1,0 +1,265 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+
+if [ $# -lt 2 ]; then
+  echo "ERROR: insufficient number of arguments"
+  echo "ERROR: input arguments need to be <baseline> <followup_y1> ... <followup_yn>"
+  exit 1
+fi
+
+# 
+# Functions 
+# 
+pushd () {
+  command pushd "$@" > /dev/null
+}
+popd () {
+  command popd "$@" > /dev/null
+}
+
+
+freesurfer_run_longitudinal_base() {
+    FS_DIR=$1 
+    TEMPLATE=$2 
+    scan_num=$3
+    lastfiles_cross=$4
+
+    FS_LOG_FILE=${FS_DIR}/${TEMPLATE}_recon_base.log
+    FS_TEMPLATE_DIR=${FS_DIR}/${TEMPLATE}
+
+    firstFileGeneratedByReconBase=${FS_TEMPLATE_DIR}/mri/norm_template.mgz
+    if [ -d $firstFileGeneratedByReconBase ]; then
+       # make sure that results are not outdated
+       for crossFile in ${lastfiles_cross}; do 
+	   if [ -e $crossFile -a  $crossFile -nt $firstFileGeneratedByReconBase ]; then  
+		echo "INFO:${FS_TEMPLATE_DIR}: Resetting  directory as  ${crossFile} (`stats -c %y  $crossFile`) is newer than $firstFileGeneratedByReconBase (`stats -c %y $firstFileGeneratedByReconBase`)" 
+		freesurfer_reset ${FS_TEMPLATE_DIR} 1
+	       break 
+	   fi
+       done
+    fi 
+
+    # This is what we believe to be the last file created by freesurfer
+    lastfile_template=${FS_TEMPLATE_DIR}/label/rh.entorhinal_exvivo.label
+    # Need to do it this wasy as ${FS_TEMPLATE_DIR} gets deleted/i.e., also the lock if we ${lastfile_template}
+    template_dir_flag=${FS_TEMPLATE_DIR}.done
+        
+    if LWDP_needs_update_and_lock ${template_dir_flag} ${lastfiles_cross}; then
+	# freesurfer_reset ${FS_TEMPLATE_DIR}
+	rm -rf ${FS_TEMPLATE_DIR}
+	echo "INFO:${FS_TEMPLATE_DIR}: Started freesurfer longitudinal template at `date` ..."
+
+	manual_overwrite=${FS_DIR}/manual/${TEMPLATE}
+	if [ -e ${manual_overwrite} ]; then       
+	    echo "INFO:${FS_TEMPLATE_DIR}: Copying files from ${manual_overwrite}!" 
+	    rsync -rtaL ${manual_overwrite}/ ${FS_TEMPLATE_DIR}
+	fi
+ 
+	pushd ${FS_DIR} > /dev/null
+
+	cmd="recon-all -norandomness -rng-seed 1234 -openmp ${OMP_NUM_THREADS} -sd ${FS_DIR} -base ${TEMPLATE}"
+	for i in `seq 1 $scan_num`; do
+	    cmd=${cmd}" -tp ${VISIT_S_ARR[$i]}"
+	done
+
+	cmd=${cmd}" -all"
+
+	echo ${cmd}
+
+	if ! ${cmd} &> ${FS_LOG_FILE}; then
+	    echo "WARNING:${FS_TEMPLATE_DIR}: freesurfer recon-all -base failed, running again with -use-new-fixer"
+	    # Template file needs to be deleted for Freesurfer V6 or higher 
+	    rm -rf ${FS_TEMPLATE_DIR}
+	    if ! ${cmd} -use-new-fixer &> ${FS_LOG_FILE}; then
+		freesurfer_err_msg ${FS_TEMPLATE_DIR} "ERROR:${FS_TEMPLATE_DIR}: freesurfer recon-all -base failed" ${FS_LOG_FILE}
+	    fi
+	fi
+
+	if [ "`tail -1 ${FS_LOG_FILE}`" != "done" ]; then 
+	    freesurfer_err_msg ${FS_TEMPLATE_DIR} "ERROR:${FS_TEMPLATE_DIR}: freesurfer did not complete correctly - possible solution provided in this script!" ${FS_LOG_FILE}
+	    # if it fails bc of Talairach Transform review the corresponding instructions in ncanda_freesurfer_pipeline
+	fi
+	popd &> /dev/null
+
+	if [ -e ${lastfile_template} ]; then
+	    echo "INFO:${FS_TEMPLATE_DIR}: freesurfer longitudinal completed"
+	    touch $template_dir_flag
+	fi
+	
+	LWDP_lockfile_delete ${template_dir_flag}
+    fi
+}
+
+freesurfer_run_longitudinal_visit() {
+    FS_DIR=$1 
+    TEMPLATE=$2 
+    SUBJECT=$3
+    lastfiles_cross=$4
+    FS_SUBJECT_DIR=${FS_DIR}/${SUBJECT}.long.${TEMPLATE}
+
+    lastfile_long=${FS_SUBJECT_DIR}/label/rh.entorhinal_exvivo.label
+    lastfile_template=${FS_DIR}/${TEMPLATE}/mri/brainmask.mgz
+
+    FS_LOG_FILE=${FS_DIR}/${TEMPLATE}_recon_long_${SUBJECT}.log
+
+    # check here first result is not outdated  ! 
+    # it can happen that first result is outdated but last one is not  
+    firstFileGeneratedByReconLong=${FS_SUBJECT_DIR}/mri/norm_template.mgz
+    if [ -e $firstFileGeneratedByReconLong ]; then 
+	for FILE in ${lastfile_template} ${lastfiles_cross}; do 
+	    if [ -e $FILE -a $FILE -nt $firstFileGeneratedByReconLong ]; then  
+		echo "INFO:${FS_SUBJECT_DIR}: Resetting  directory as ${FILE} (`stats -c %y ${FILE}`) is newer than $firstFileGeneratedByReconLong (`stats -c %y $firstFileGeneratedByReconLong`)" 
+		freesurfer_reset ${FS_SUBJECT_DIR} 1
+		break 
+	    fi
+	done
+    fi
+
+
+    if LWDP_needs_update_and_lock ${lastfile_long} ${lastfile_template} ${lastfiles_cross}; then
+	freesurfer_already_running ${FS_SUBJECT_DIR}
+
+	# reset everything 
+	freesurfer_reset ${FS_SUBJECT_DIR} 1
+
+	echo "INFO:${FS_SUBJECT_DIR}: Started freesurfer longitudinal at `date` ..."  
+	pushd ${FS_DIR} > /dev/null
+	cmd="recon-all -norandomness -rng-seed 1234 -openmp ${OMP_NUM_THREADS} -sd ${FS_DIR} -long ${SUBJECT} ${TEMPLATE} -all"
+	echo ${cmd}
+	if ! ${cmd} &> ${FS_LOG_FILE}; then
+	    freesurfer_err_msg ${FS_SUBJECT_DIR} "ERROR:${FS_SUBJECT_DIR}: freesurfer recon-all -long failed!" ${FS_LOG_FILE}
+	fi  
+
+	if [ "`tail -1 ${FS_LOG_FILE}`" != "done" ]; then 
+	    freesurfer_err_msg ${FS_SUBJECT_DIR} "ERROR:${FS_SUBJECT_DIR}: freesurfer recon-all -long did not complete correctly!" ${FS_LOG_FILE}
+	fi
+       
+	echo "INFO:${FS_SUBJECT_DIR}: freesurfer long completed"
+	popd > /dev/null
+	LWDP_lockfile_delete ${lastfile_long}
+    fi
+} 
+
+freesurfer_run_longitudinal_all() {
+   FS_DIR=$1
+   template=$2 
+   scan_num=$3  
+
+   if [ ! -d ${FS_DIR} ]; then
+       mkdir -p ${FS_DIR}
+   else
+       # if it does not exist
+       if [ ! -d ${FS_DIR}/${template} ]; then
+	   # clean FS_DIR inside to remove results from other templates
+	   rm -rf ${FS_DIR}/*
+       fi
+   fi
+
+   for i in `seq 1 ${scan_num}`; do
+       if [ ! -e ${FS_DIR}/${VISIT_S_ARR[$i]} ]; then
+	   pushd ${FS_DIR}
+	   ln -s ../../../../../../${SUBJECT_ARR[$i]}/${ARM_ARR[$i]}/${VISIT_ARR[$i]}/structural/freesurfer_refined/${SUBJECT_ARR[$i]}_${ARM_ARR[$i]}_${VISIT_ARR[$i]} ${VISIT_S_ARR[$i]}
+	   popd
+       fi
+   done
+
+   lastfiles_cross= 
+   for i in `seq 1 ${scan_num}`; do
+       lastfiles_cross="${lastfiles_cross} ${FS_DIR}/${VISIT_S_ARR[$i]}/label/rh.entorhinal_exvivo.label"
+   done
+
+   # This was needed for Freesurfer Version 5 
+   # if [ ! -d ${FS_DIR}/${template} ]; then
+   #    mkdir -p ${FS_DIR}/${template}
+   # fi
+
+   freesurfer_run_longitudinal_base ${FS_DIR} ${template} $scan_num "${lastfiles_cross}"
+   for i in `seq 1 $scan_num`; do
+       freesurfer_run_longitudinal_visit ${FS_DIR} ${template} ${VISIT_S_ARR[$i]} "${lastfiles_cross}"
+       freesurfer_create_csv ${FS_DIR} ${VISIT_S_ARR[$i]}.long.${template} long 
+   done
+}
+
+#
+# Main 
+#
+
+# pass the last argument
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh ${!#}
+
+# parsing inputs
+template=template
+scan_num=0
+for i in `seq 1 $#`; do
+  # remove trailing "/"
+  if [ "${!i: -1:1}" == "/" ]; then
+    WORKDIR_ARR[$i]=${!i:: -1}
+  else
+    WORKDIR_ARR[$i]=${!i}
+  fi
+  #echo ${WORKDIR_ARR[$i]}
+  
+  SUBJECT_ARR[$i]=$(echo ${WORKDIR_ARR[$i]} | sed 's/^.*\(NCANDA_S[0-9]\{5\}\).*$/\1/')
+  ARM_ARR[$i]=$(echo ${WORKDIR_ARR[$i]} | sed 's/^.*NCANDA_S[0-9]\{5\}\/*\([^/]*\)\/.*$/\1/')
+  VISIT_ARR[$i]=$(echo ${WORKDIR_ARR[$i]} | sed 's/^.*NCANDA_S[0-9]\{5\}\/*[^/]*\/*\([^/]*\).*$/\1/')
+  #echo ${SUBJECT_ARR[$i]} ${ARM_ARR[$i]} ${VISIT_ARR[$i]}
+
+  if [ $i -eq 1 ]; then
+    if [ "${VISIT_ARR[$i]}" != "baseline" ]; then
+      echo "ERROR: input arguments need to be <baseline> <followup_y1> ... <followup_yn>"
+      exit 1
+    fi
+
+    VISIT_S_ARR[$i]="baseline"
+  else
+    VISIT_S_ARR[$i]=`echo ${VISIT_ARR[$i]} | cut -d _ -f 2`
+  fi
+  if [ -z "${VISIT_S_ARR[$i]}" ]; then
+    echo "ERROR: input arguments need to be <baseline> <followup_y1> ... <followup_yn>"
+    exit 1
+  fi
+
+  # check cross-sectional results
+  # for DIR in ${WORKDIR_ARR[$i]}/structural/freesurfer ${WORKDIR_ARR[$i]}/structural/freesurfer_refined; do 
+  for DIR in ${WORKDIR_ARR[$i]}/structural/freesurfer_refined; do 
+      scan=$DIR/${SUBJECT_ARR[$i]}_${ARM_ARR[$i]}_${VISIT_ARR[$i]}
+      if [ ! -d ${scan} ]; then
+	  echo "ERROR: no freesurfer result in ${scan}"
+	  exit 1
+      fi
+  done
+
+  template=${template}_${VISIT_S_ARR[$i]}
+
+  let scan_num++
+done
+
+#
+# Running longitudinal freesurfer for original mask - no need to generate those anymore - they are not used for anything as far as I am aware of 
+#
+# freesurfer_run_longitudinal_all ${WORKDIR_ARR[${scan_num}]}/structural/longitudinal/freesurfer ${template} $scan_num 
+
+#
+# Running longitudinal freesurfer for refined brain mask
+#
+
+FS_WORKDIR=${WORKDIR_ARR[${scan_num}]}/structural/longitudinal/freesurfer_refined
+if [ -e ${FS_WORKDIR}/${template}.failed ]; then 
+   echo "WARNING:${WORKDIR_ARR[${scan_num}]}:Skipping longitudinal freesurfer as it previously failed! Remove ${FS_WORKDIR}/${template}.failed to re-run."
+   exit 1
+fi  
+
+freesurfer_run_longitudinal_all ${FS_WORKDIR} ${template} $scan_num

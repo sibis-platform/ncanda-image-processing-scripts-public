@@ -1,0 +1,123 @@
+#!/usr/bin/env python
+
+import os
+import sys
+
+import numpy as np
+import scipy as sp
+import nibabel as nb
+
+
+def printStep(t,m):
+    if t%m==0:
+        print('step '+str(t))
+
+
+def parcellation_compute_timeseries(file_pfx,parcellation,output_prefix):
+    nt=1
+    while os.path.isfile(file_pfx+str(nt).zfill(4)+'.nii.gz'):
+        nt=nt+1
+
+    if nt==1:
+        print('ERROR:rsfmri_correlations_computation: could not find any nifti files starting with ' + file_pfx + "!")                
+        sys.exit()
+    nt=nt-1 
+
+    p = np.asanyarray(nb.load(parcellation).dataobj)
+    parcels=np.unique(p[p > 0])
+    parcels=np.sort(parcels)
+    dim=len(parcels)
+
+    # compute time series   
+    timeseries_file=output_prefix+'-timeseries.txt'
+    timeseries=np.zeros((dim,nt))
+    for t in range(0,nt):
+        # printStep(t,25)
+        a = np.asanyarray(nb.load(file_pfx + str(t+1).zfill(4) + '.nii.gz').dataobj)
+        for x in range(0,dim):
+            timeseries[x,t]=np.sum(a[p==parcels[x]])
+    np.savetxt(timeseries_file,timeseries, fmt="%.10f")
+
+    # normalize timeseries
+    timeseriesNorm_file = output_prefix + '-timeseries_normalized.txt'
+
+    # Remove global mean signal direction
+    me = np.mean(timeseries, axis=0)
+    me_norm = np.sqrt(np.sum(me * me))
+    if me_norm != 0:
+        me = me / me_norm
+
+    tmp = me * np.sum(timeseries[0, :] * me)
+    for i in range(dim - 1):
+        tmp = np.vstack((tmp, me * np.sum(timeseries[i + 1, :] * me)))
+
+    timeseries = timeseries - tmp
+
+    # Remove ROI mean and normalize by variance
+    stdX = np.std(timeseries, axis=1)
+    stdX[stdX == 0] = 1.
+    stdX[np.isnan(stdX)] = 1.
+    stdX[np.isinf(stdX)] = 1.
+
+    me = np.mean(timeseries, axis=1)
+    tmp = me
+    tmq = stdX
+
+    for i in range(nt - 1):
+        tmp = np.vstack((tmp, me))
+        tmq = np.vstack((tmq, stdX))
+
+    tmp = np.transpose(tmp)
+    tmq = np.transpose(tmq)
+
+    timeseries = (timeseries - tmp) / tmq / np.sqrt(nt)
+    np.savetxt(timeseriesNorm_file, timeseries, fmt="%.10f")
+    
+    # compute correlations
+    correlations_file=output_prefix+'-correlations.txt'
+    correlations=timeseries.dot(np.transpose(timeseries))
+    lambd=0.0
+    pp=timeseries.shape[0]
+    nn=timeseries.shape[1]
+    l=np.trace(correlations);
+    ll=np.trace(correlations.dot(np.transpose(correlations)));
+    lambd=min( ( (1.0-2.0/pp)*ll+l*l )/( (nn+1.0-2.0/pp)*(ll-l*l/pp) ),1.0);
+    correlations=(1.0-lambd)*correlations+lambd*np.eye(pp)
+
+    lambda_file=output_prefix+'-lambda_correlations.txt'        
+    fi=open(lambda_file,'w')
+    fi.write(str(lambd))
+    fi.close()
+    for i in range(pp):
+        correlations[i,i]=1.0
+    np.savetxt(correlations_file,correlations, fmt="%.10f")
+
+    # compute partial correlations
+    partial_correlations_file=output_prefix+'-partial_correlations.txt'
+    precisions=np.linalg.inv(correlations)
+
+    partial_correlations=precisions
+    for i in range(correlations.shape[0]-1):
+        for j in range(i+1,correlations.shape[0]):
+            partial_correlations[i,j]=-precisions[i,j]/np.sqrt(precisions[i,i]*precisions[j,j])
+            partial_correlations[j,i]=partial_correlations[i,j]
+    for i in range(correlations.shape[0]):
+        partial_correlations[i,i]=1.0
+    np.savetxt(partial_correlations_file,partial_correlations, fmt="%.10f")
+
+    
+    
+#####################################################################################
+
+if __name__ == "__main__":
+    from argparse import ArgumentParser, RawTextHelpFormatter
+    parser = ArgumentParser(description="Compute ROI to ROI correlations and partial correlations (linear covariance shrinkage is applied to improve the estimation of the correlations and ensure their invertibility)",
+                            formatter_class=RawTextHelpFormatter)
+    parser.add_argument("-b", "--bold_prefix", help="Prefix of the nifti files containing the full resolution BOLD measurements", required=True)
+    parser.add_argument("-p", "--parcellation", help="Parcellation to use when computing ROI correlations", required=True)
+    parser.add_argument("-o", "--output_prefix", help="The prefix used for saving the computed correlation", required=True)
+    args = parser.parse_args()
+    parcellation_compute_timeseries(args.bold_prefix,args.parcellation,args.output_prefix)
+    
+    
+

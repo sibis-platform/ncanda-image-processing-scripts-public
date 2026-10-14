@@ -1,0 +1,178 @@
+#!/bin/bash
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+
+# enter <subject>/<arm>/<visit> 
+# if visit for subject does not exist then looks for earlier one automatically 
+
+INPUT=$1
+shift
+source  ${NCANDA_BINARY_DIR}/ncanda_setup.sh
+
+if ! type "convert" > /dev/null; then
+    echo "ERROR: imagemagic needs to be installed" 
+    exit 1 
+fi 
+
+if [ `echo ${INPUT} | grep NCANDA_S | wc -l` -eq 1 ]; then
+    # remove trailing "/"
+    if [ "${INPUT: -1:1}" == "/" ]; then
+      export WORKDIR=${INPUT:: -1}
+    else
+      export WORKDIR=${INPUT}
+    fi
+
+    export SUBJECT=$(echo ${WORKDIR} | sed 's/^.*\(NCANDA_S[0-9]\{5\}\).*$/\1/')
+    export ARM=$(echo ${WORKDIR} | sed 's/^.*NCANDA_S[0-9]\{5\}\/*\([^/]*\)\/.*$/\1/')
+    export VISIT=$(echo ${WORKDIR} | sed 's/^.*NCANDA_S[0-9]\{5\}\/*[^/]*\/*\([^/]*\).*$/\1/')
+else
+   echo "ERROR: Wrong input" 
+   exit 0 
+fi     
+
+reset_entries() {
+    review="$1"
+    preserve_end=$2 
+    preserve_start=$((preserve_end+3))
+    START="`echo $review |cut -d, -f1-${preserve_end}`"
+    END="`echo $review |cut -d, -f${preserve_start}-`"
+    if [ "$END" == "" ]; then 
+	echo "${START},,"
+    else 
+	echo "${START},,,${END}"
+    fi 
+} 
+
+VISIT_YEAR=`echo ${VISIT} | cut -d "_" -f2 | cut -d "y" -f1`
+LAST_LFS_VISIT=""
+for year in `seq ${VISIT_YEAR} -1 1 `; do
+    LAST_LFS_DIR=${SUBJECT}/${ARM}/followup_${year}y/structural/longitudinal/freesurfer_refined
+    if [ `ls --color=never ${LAST_LFS_DIR}/template_baseline_*${year}y 2> /dev/null | wc -l` -gt 0 ]; then
+	LAST_LFS_VISIT=$year
+	break 
+    fi
+done
+
+if [ "$LAST_LFS_VISIT" == "" ]; then 
+    echo "INFO: $WORKDIR: no longitudinal freesurfer output for any of the followup visits so exiting script"
+    exit 0 
+fi 
+
+if [ $LAST_LFS_VISIT -ne $VISIT_YEAR ]; then
+    VISIT=followup_${LAST_LFS_VISIT}y
+    LAST_LFS_WD=${SUBJECT}/${ARM}/${VISIT}
+    echo "INFO: $WORKDIR: latest longitudinal freesurfer output in ${LAST_LFS_WD}!"
+    WORKDIR=$LAST_LFS_WD
+fi 
+
+LFS_VISIT_PATTERN="long.template_baseline_*" 
+LFS_VISIT_LIST=`cd ${LAST_LFS_DIR}; ls -d1 --color=never baseline.${LFS_VISIT_PATTERN}`
+LFS_VISIT_LIST="$LFS_VISIT_LIST `cd ${LAST_LFS_DIR}; ls -d1 --color=never *y.${LFS_VISIT_PATTERN}`"
+
+QC_IMG_LABEL=qc_images
+QC_IMG_DIR=$WORKDIR/${QC_IMG_LABEL}/longitudinal
+[ -d ${QC_IMG_DIR} ] || mkdir -p ${QC_IMG_DIR}
+
+review_file=$WORKDIR/${QC_IMG_LABEL}/qc_review.csv 
+if [ -e $review_file ]; then
+    orig_review="`tail -n1 $review_file`" 
+    review="$orig_review"
+else 
+    orig_review=""
+    review="`echo $WORKDIR | tr "/" ","`,,,,,,,,,,,,,,"
+fi    
+
+
+
+#
+# 2D FREESURFER Parcellation 
+# 
+
+QC_IMG_UPDATE=0
+
+for VISIT_ID in ${LFS_VISIT_LIST}; do
+    LFS_VISIT=`echo $VISIT_ID | cut -d. -f1`
+    if [ "${LFS_VISIT}" == "baseline" ]; then 
+	FS_ASEG=${QC_IMG_DIR}/baseline-aseg
+    else 
+	FS_ASEG=${QC_IMG_DIR}/followup_${LFS_VISIT}-aseg
+    fi 
+    FS_ASEG_AXI=${FS_ASEG}_axi 
+    FS_MRI_DIR=${PWD}/${LAST_LFS_DIR}/${VISIT_ID}/mri 
+
+    if LWDP_needs_update_and_lock ${FS_ASEG_AXI}.png ${FS_MRI_DIR}/T1.mgz ${FS_MRI_DIR}/aseg.mgz; then
+	QC_IMG_UPDATE=1
+        review=`reset_entries "$review" 15` 
+
+	# -layout 1  
+	FS_VW_OPT="-viewsize 500 500 -slice 120 128 97 -v ${FS_MRI_DIR}/T1.mgz ${FS_MRI_DIR}/aseg.mgz:colormap=lut:opacity=0.2" 
+	freeview -zoom 1.4  $FS_VW_OPT  -viewport x -ss ${FS_ASEG}_sag
+	freeview -zoom 1.4  $FS_VW_OPT  -viewport y -ss ${FS_ASEG}_cor
+	freeview -zoom 1.15 $FS_VW_OPT  -viewport z  -ss ${FS_ASEG_AXI}  
+
+	LWDP_lockfile_delete ${FS_ASEG_AXI}.png
+    fi 
+done
+
+# functions 
+print_img_html() {
+    IMG=$1
+    WIDTH=250
+    if [ -e ${DIR}/${IMG} ]; then 
+	echo "<td WIDTH=\"${WIDTH}\"><a href=\"${DIR}/${IMG}\"><img src=\"${DIR}/${IMG}\" WIDTH=\"${WIDTH}\" ></a></td>" 
+    else 
+	echo "<td WIDTH=\"${WIDTH}\">No ${IMG}</td>"
+    fi
+
+}
+
+print_overview_html() { 
+    DIR=`cd ${QC_IMG_DIR}; echo ${PWD}` 
+    echo "<html>" 
+    echo "<table>"
+    echo "<tr>" 
+    echo "<td align=LEFT colspan=5><H1>"$WORKDIR Longitudinal FS"</H1></td>" 
+    echo "</tr>" 
+
+    for VISIT_ID in ${LFS_VISIT_LIST}; do
+	LFS_VISIT=`echo $VISIT_ID | cut -d. -f1`
+	if [ "${LFS_VISIT}" == "baseline" ]; then 
+	    VISIT_NAME=baseline
+	else 
+	    VISIT_NAME=followup_${LFS_VISIT}
+	fi 
+	FS_ASEG=${VISIT_NAME}-aseg
+
+	echo "<tr>"     
+	echo "<td rowspan=1><h2>${VISIT_NAME} </h2></td>"	
+	print_img_html ${FS_ASEG}_sag.png
+	print_img_html ${FS_ASEG}_cor.png
+	print_img_html ${FS_ASEG}_axi.png
+        echo "<td> </td>" 
+	echo "</tr>" 
+    done
+    
+    echo "</table>"	
+    echo "</html>"	
+} 
+
+#
+# Overview 
+#
+
+if [ "${orig_review}" != "$review" ]; then 
+    echo "========================================================================"
+    echo "CREATE $review_file"
+    echo "========================================================================"
+    echo "subject,arm,visit,t1_mask_passed,t1_mask_note,t2_alignment_passed,t2_alignment_note,fa_alignment_passed,fa_alignment_note,fa_skeleton_passed,fa_skeleton_note,bold_passed,bold_note,fs_cross_passed,fs_cross_note,fs_longitudinal_passed,fs_longitudinal_note" > $review_file
+    echo "$review" >> $review_file
+fi 
+
+# Only create/update if gif were created/updated 
+if [ $QC_IMG_UPDATE -eq 1 ]; then
+    OVERVIEW_HTML=${QC_IMG_DIR}/../index_longitudinal.html
+    echo "========================================================================"
+    echo "CREATE ${OVERVIEW_HTML}"
+    echo "========================================================================"
+    print_overview_html > ${OVERVIEW_HTML}
+fi 

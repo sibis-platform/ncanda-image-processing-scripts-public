@@ -1,0 +1,106 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL $
+##  $Revision: 2564 $
+##  $LastChangedDate: 2016-07-25 17:02:58 -0700 (Mon, 25 Jul 2016) $
+##  $LastChangedBy: dj0330 $
+##
+
+if [ "$2" == "" ]; then
+  echo "turns all QC files into a csv file"
+  echo "turn_freesurfer_qc_into_csv <TYPE> <FSPATH>"
+  echo "<TYPE>=wmsnr or aseg" 
+  echo "turn_freesurfer_qc_into_csv wmsnr <subject>/standard/baseline/structural/freesurfer-refined/<subject>_standard_baseline " 
+  exit 1
+fi
+
+UTIL_DIR=$(dirname $0)
+TYPE=${1}
+FS_SUB_DIR=${2}
+
+if [ ! -e $FS_SUB_DIR ]; then
+  echo "ERROR:  ${FS_SUB_DIR} does not exist"
+  exit 1
+fi
+
+# now works also if full path is given 
+partDIR=`echo ${FS_SUB_DIR} | sed 's/\(.*freesurfer\).*/\1/'`
+SUBJECT=$(echo $partDIR | sed 's/^.*\(NCANDA_S[0-9]\{5\}\).*$/\1/')
+ARM=$(echo $partDIR | sed 's/^.*NCANDA_S[0-9]\{5\}\/*\([^/]*\)\/.*$/\1/')
+
+longIndex=`echo ${FS_SUB_DIR} | tr '/' '\n' | grep -n .long. | head -n1 | cut -d: -f1`
+if [ "$longIndex" == "" ]; then  
+   VISIT=$(echo $partDIR | sed 's/^.*NCANDA_S[0-9]\{5\}\/*[^/]*\/*\([^/]*\).*$/\1/')
+else 
+   VISIT_TMP=$(echo ${FS_SUB_DIR}  | cut -d'/' -f$longIndex | cut -d'.' -f1)
+   if [ "${VISIT_TMP}" == "baseline" ]; then 
+     VISIT=${VISIT_TMP}
+   else   
+     VISIT=followup_${VISIT_TMP}
+   fi  
+fi 
+
+IDENTITY="$SUBJECT,$ARM,$VISIT" 
+outDir="${FS_SUB_DIR}/measures" 
+[ ! -d $outDir ] && mkdir -p $outDir 
+
+if [ "$TYPE" == "wmsnr" ]; then   
+    inFile=${FS_SUB_DIR}/stats/wmsnr.e3.dat
+    if [ ! -e $inFile ]; then
+	exit 0 
+    fi 
+
+    outFile=${outDir}/wmsnr.e3.csv
+    echo "subject,arm,visit,SNR,meanWM,stdWM,voxWM" > $outFile
+    echo "${IDENTITY},`cat $inFile | tr -s ' ' | tr ' ' ',' | cut -d, -f2-5`" >> $outFile
+    echo Created $outFile
+
+elif [ "$TYPE" == "aseg" ]; then   
+    inFile=${FS_SUB_DIR}/stats/aseg_outliers.log
+    labelFile=${FS_SUB_DIR}/stats/aseg.stats
+    if [ ! -e $inFile -o ! -e ${labelFile} ]; then 
+	echo "ERROR:turn_freesurfer_qc_into_csv:$inFile or ${labelFile} missing !"
+	exit 1 
+    fi
+
+    outlierFlagList=
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+       if [ "`echo $line | grep -v "no outliers detected" | grep outlier`" == "" ]; then 
+	   continue 
+       fi
+       outlierFlagList="${outlierFlagList}`echo $line  | tr -s ' ' | cut -d' ' -f2` "
+    done < "$inFile"
+
+    HEADER="subject,arm,visit"
+    VAL="${IDENTITY}"
+    ccNumOutlier=0
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+       if [ "`echo $line | grep '#'`" != "" ]; then 
+	   continue 
+       fi
+       LABEL=`echo $line | tr -s ' ' | cut -d' ' -f5`
+       HEADER="${HEADER},${LABEL}-Outlier"
+       if [ "`echo $outlierFlagList | grep $LABEL`" != "" ]; then 
+	   VAL="${VAL},1"
+	   if [ "${LABEL:0:3}" == "CC_" ]; then
+	       ccNumOutlier=$((ccNumOutlier+1))
+	   fi 
+       else 
+	   VAL="${VAL},0"
+       fi 
+    done < "$labelFile"
+ 
+    outFile=${outDir}/aseg_outliers.csv
+    
+    echo "${HEADER},CC-Num-Outliers,Total-Num-Outliers" > $outFile
+    echo "${VAL},$ccNumOutlier,`echo $outlierFlagList | wc -w`" >> $outFile
+    echo Created $outFile 
+else 
+    echo "ERROR: Type $TYPE is not implemented!"
+    exit 1  
+fi 
+exit 0

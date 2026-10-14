@@ -1,0 +1,301 @@
+#!/usr/bin/env python
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+import os
+import sys
+import argparse
+from os import path
+
+import numpy as np
+import matplotlib  # has to be set up here otherwise get warnings
+matplotlib.use('AGG')
+from scipy.special import legendre
+
+import nibabel as nib
+from nipype.algorithms import rapidart
+from nipype.interfaces.fsl import GLM
+from nipype.utils.filemanip import filename_to_list
+
+#
+# Functions
+#
+
+
+def get_absolute_file_name(inputFile):
+    if path.exists(inputFile):
+        return path.abspath(inputFile)
+    else:
+        print "ERROR: %s does not exist !" % inputFile
+        sys.exit(1)
+
+
+def get_nii_file_name(inputFile):
+    filename = inputFile
+    if not path.exists(filename):
+        filename += ".gz"
+        if not path.exists(filename):
+            print "ERROR: %s does not exist !" % inputFile
+            sys.exit(1)
+
+    return get_absolute_file_name(filename)
+
+
+def get_number_of_vols(fourD_file):
+    try:
+      img = nib.load(fourD_file)
+    except:
+        print 'ERROR: Could not load %s' % fourD_file
+        sys.exit(1)
+    hdr = img.get_header()
+    value = hdr.get_data_shape()[3]
+    return int(value)
+
+
+def make_conn_tb_compatible_cov_file(bold_4d, outlier_file, output_file, verbose):
+    
+    num_vols = get_number_of_vols(bold_4d)
+    try:
+       outliers = np.loadtxt(outlier_file, int, ndmin=1)
+    except:
+       print 'ERROR: Could not load %s' % outlier_file
+       sys.exit(1)
+
+    num_outliers = outliers.shape[0]
+    
+    covariate = np.zeros((num_vols, num_outliers), np.int16)
+
+    for i in range(num_outliers):
+        covariate[outliers[i], i] = 1
+
+    np.savetxt(output_file, covariate, fmt='%f') 
+    # scipy.io.savemat(output_file, {'R':covariate}, oned_as='column')
+    if verbose:
+        print "Created regression file %s" % output_file
+
+#
+# Perform Artifact Detect
+#
+
+
+def art_wrapper(bold_4d, mask, motion_file, z_threshold, movement_threshold, verbose):
+
+    art = rapidart.ArtifactDetect()
+        
+    # art.inputs.norm_threshold = 0.3 
+    # art.inputs.zintensity_threshold = 5
+
+    art.inputs.realigned_files = bold_4d
+    art.inputs.mask_file = mask
+    art.inputs.realignment_parameters = motion_file
+    art.inputs.norm_threshold = movement_threshold
+    art.inputs.zintensity_threshold = z_threshold
+
+    art.inputs.parameter_source = 'FSL'
+    art.inputs.use_differences = [True, False]
+    art.inputs.mask_type = 'file'
+    # Do not set true if motion parameters are computed with fsl 
+    art.inputs.bound_by_brainmask=False
+
+    if verbose:
+        print art.inputs
+        print "Start Artifect Detection ..."
+
+    art_output = art.run()
+
+    if verbose:
+        print "... end"
+        print(art_output.outputs)
+
+    return art_output.outputs.get()
+
+# Perfom Motion Filtering
+
+
+def get_motion_regressors(motion_params, order=0, derivatives=1, verbose=None):
+    """Compute motion regressors upto given order and derivative
+
+    motion + d(motion)/dt + d2(motion)/dt2 (linear + quadratic)
+    """
+    if verbose:
+        print "Extracting Motion Regressors..."
+        print "Using motion par file: {0}".format(motion_params)
+        print "Using Order={0} and Derivative={1}".format(order, derivatives)
+
+    out_files = []
+    for idx, filename in enumerate(filename_to_list(motion_params)):
+        params = np.genfromtxt(filename)
+        out_params = params
+        for d in range(1, derivatives + 1):
+            cparams = np.vstack((np.repeat(params[0, :][None, :], d, axis=0),
+                                 params))
+            out_params = np.hstack((out_params, np.diff(cparams, d, axis=0)))
+        out_params2 = out_params
+        for i in range(2, order + 1):
+            out_params2 = np.hstack((out_params2, np.power(out_params, i)))
+        filename = os.path.join(os.getcwd(), "motion_regressor%02d.txt" % idx)
+        np.savetxt(filename, out_params2, fmt="%.10f")
+        out_files.append(filename)
+
+    if verbose:
+        print "Generated regressor files: {0}".format(out_files)
+        print "...finished!"
+
+    return out_files
+
+
+def make_motion_filter(motion_params, comp_norm, outliers, detrend_poly=None, verbose=None):
+    """Builds a regressor set comprisong motion parameters, composite norm and
+    outliers
+
+    The outliers are added as a single time point column for each outlier
+
+    Parameters
+    ----------
+
+    motion_params: a text file containing motion parameters and its derivatives
+    comp_norm: a text file containing the composite norm
+    outliers: a text file containing 0-based outlier indices
+    detrend_poly: number of polynomials to add to detrend
+
+    Returns
+    -------
+    components_file: a text file containing all the regressors
+    """
+    if verbose:
+        print "Making Motion Filter..."
+        print "Motion Parameters: {0}".format(motion_params)
+        print "Composite Norm: {0}".format(comp_norm)
+        print "Outliers: {0}".format(outliers)
+
+    out_files = []
+    for idx, filename in enumerate(filename_to_list(motion_params)):
+        if verbose:
+            print "."
+        params = np.genfromtxt(filename)
+        norm_val = np.genfromtxt(filename_to_list(comp_norm)[idx])
+        out_params = np.hstack((params, norm_val[:, None]))
+        try:
+            outlier_val = np.genfromtxt(filename_to_list(outliers)[idx])
+        except IOError:
+            outlier_val = np.empty(0)
+        for index in np.atleast_1d(outlier_val):
+            outlier_vector = np.zeros((out_params.shape[0], 1))
+            outlier_vector[index] = 1
+            out_params = np.hstack((out_params, outlier_vector))
+        if detrend_poly:
+            timepoints = out_params.shape[0]
+            X = np.ones((timepoints, 1))
+            for i in range(detrend_poly):
+                X = np.hstack((X, legendre(
+                    i + 1)(np.linspace(-1, 1, timepoints))[:, None]))
+            out_params = np.hstack((out_params, X))
+        filename = os.path.join(os.getcwd(), "filter_regressor%02d.txt" % idx)
+        np.savetxt(filename, out_params, fmt="%.10f")
+        out_files.append(filename)
+    if verbose:
+        print "Generated: {0}".format(out_files)
+        print "...finished!"
+    return out_files
+
+
+def filter_motion_wrapper(bold_unwarped, design, verbose=None):
+    """
+    Use FSl's GLM to regress out artifact and motion noise.
+
+    Parameters
+    ----------
+    bold_unwarped: nifti file to filter
+    design: design file from `make_motion_filter`
+    verbose:
+
+    Result
+    ------
+    """
+
+    motion_filter = GLM(out_f_name='F_mcart.nii.gz',
+                        out_pf_name='pF_mcart.nii.gz',
+                        demean=True)
+    motion_filter.inputs.in_file = bold_unwarped
+    motion_filter.inputs.design = design
+
+    if verbose:
+        print motion_filter.inputs
+        print "Start Motion Filtering ..."
+
+    motion_filter_output = motion_filter.run()
+
+    if verbose:
+        print "... end"
+        print(motion_filter_output.outputs)
+
+    return motion_filter_output.outputs.get()
+
+#
+# Main
+#
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Detects artifacts (ART) in resting-state fMRI time series.")
+    parser.add_argument("-b", "--bold", required=True, help="Full path to the 4D bold image.", action="store")
+    parser.add_argument("-m", "--mask", required=True, help="3D Brain mask of bold.", action="store")
+    parser.add_argument("-p", "--motion_file", required=True, help=".par file computed by FSL 'mcflirt -plots'.", action="store")
+    parser.add_argument("-z", "--z_thres", help="Z normed threshold for the brain mean per volume.", action="store", type=float, default=5)
+    parser.add_argument("-n", "--movement_thres", help="Threshold in mm for motion.", action="store", type=float, default=0.3)
+    parser.add_argument("-o", "--output_dir", help="Output directory.", action="store", default=os.getcwd())
+    parser.add_argument("-v", "--verbose", help="Print information.", action="store_true", default=False)
+
+    args = parser.parse_args()
+
+    # check if bold needs to be extended with gz 
+    bold = get_nii_file_name(args.bold)
+    mask = get_nii_file_name(args.mask)
+    motion = get_absolute_file_name(args.motion_file)
+
+    # Art writes everything in working directory (os.getcwd())
+    if not path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
+        if args.verbose:
+            print "Creating %s" % args.output_dir
+
+    os.chdir(args.output_dir)
+
+    # Call ART
+    art_output = art_wrapper(bold, mask, motion, args.z_thres, args.movement_thres, args.verbose)
+
+    # Call Motion Regressors
+    motion_regressors = get_motion_regressors(motion, verbose=args.verbose)
+
+    # Call Make Motion Filter
+    motion_filter = make_motion_filter(motion_regressors[0],
+                                       art_output.get('norm_files'),
+                                       art_output.get('outlier_files'),
+                                       verbose=args.verbose)
+
+    # Call Motion Filter Wrapper
+    motion_filtered = filter_motion_wrapper(bold,
+                                            motion_filter[0],
+                                            verbose=args.verbose)
+
+    # Create regression file
+    outlier_txt_file = art_output['outlier_files']
+    if not path.exists(outlier_txt_file):
+        print "ERROR: algorithm did not create an outlier file (%s)!" % outlier_txt_file
+        sys.exit(1)
+
+    (out_dir, out_file) = path.split(outlier_txt_file)
+    (out_base, _) = path.splitext(out_file)
+    (out_pre, out_post) = path.splitext(out_base)
+    outlier_regression_file = path.join(out_dir,
+                                        ''.join(['regression', out_post, '.txt']))
+    
+    make_conn_tb_compatible_cov_file(bold, outlier_txt_file, outlier_regression_file, args.verbose)
+

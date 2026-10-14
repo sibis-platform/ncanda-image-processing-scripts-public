@@ -1,0 +1,57 @@
+#!/usr/bin/env python
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+# Set up command line parser
+import argparse
+parser = argparse.ArgumentParser( description="Serialize a multi-column, multi-row CSV file into a single-column or single-row file." )
+parser.add_argument( "-v", "--verbose", help="Verbose operation", action="store_true")
+parser.add_argument( "-c", "--as-column", help="Write result as a column, rather than a row", action="store_true")
+parser.add_argument( "-l", "--lowercase-labels", help="Convert all labels in the output file to lower case. This excludes those labels provided on the command line as well as any label prefix.", action="store_true")
+parser.add_argument( "--label-prefix", default="", help="Optional prefix for all field labels (excluding those provided on the command line via the --insert-key-value option).")
+parser.add_argument( "--insert-key-value", help="Insert additional key:value pairs (e.g., to identify the contents of this file). Several key:value pairs can be provided, separated by commas.")
+parser.add_argument( "csvin", help="Input .csv file.")
+parser.add_argument( "csvout", help="Output .csv file.")
+args = parser.parse_args()
+
+# Read input file
+import pandas
+data = pandas.read_csv(args.csvin, index_col=0)
+
+# Create Series for serialized data
+serial = pandas.Series(dtype=object)
+
+# Anything to insert?
+import re
+if args.insert_key_value:
+    for key_value in args.insert_key_value.split( ',' ):
+        match = re.match( '([^:]*):(.*)', key_value )
+        if match:
+            key_val = { match.group(1) : match.group(2) }
+            serial = pandas.concat([serial, pandas.Series(key_val)])
+
+# Add serialized input data
+for i in data.iterrows():
+    row=i[0]
+    for (col,val) in i[1].items():
+        if args.lowercase_labels:
+            row = row.lower()
+            col = col.lower()
+
+        lbl_val = { "%s%s_%s" % (args.label_prefix,row,col) : val }
+        serial = pandas.concat([serial, pandas.Series(lbl_val)])
+
+# Write output file
+if args.as_column:
+    pandas.DataFrame( serial ).to_csv( args.csvout, header=False )
+else:
+    pandas.DataFrame( serial ).T.to_csv( args.csvout, index=False )
+

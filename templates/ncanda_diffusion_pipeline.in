@@ -1,0 +1,2399 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+#
+# Initialization
+#
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+NCANDA_SOURCE_DIR=@NCANDA_SOURCE_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+export SVN_VERSION=`echo "$Revision$" | cut -d ' ' -f 2`
+
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+export DIFFUSION_DIR=${WORKDIR}/diffusion
+
+export DWI6_DIR=${DIFFUSION_DIR}/native/dti6b500pepolar
+export DWI60_DIR=${DIFFUSION_DIR}/native/dti60b1000
+
+if [ ! -d ${DWI6_DIR} -o ! -d ${DWI60_DIR} ]; then
+  # echo "ERROR: ${WORKDIR}: No DTI data: ${WORKDIR}"
+  exit 1
+fi
+
+t1_mrbias=$(LWDP_get_override_file ${WORKDIR}/structural/mrbias/t1.nii.gz)
+t2_mrbias=$(LWDP_get_override_file ${WORKDIR}/structural/mrbias/t2.nii.gz)
+
+if [ ! -e ${t1_mrbias} -o ! -e ${t2_mrbias} ]; then
+  echo "ERROR: ${WORKDIR}: No structural images: ${WORKDIR}"
+  exit 1
+fi
+
+VISIT_REF=baseline
+if [ "${VISIT}" != "baseline" ]; then
+  followup_year=`echo ${VISIT} | cut -d "_" -f2 | cut -d "y" -f1`
+  if [ ! -d ${WORKDIR}/../baseline/diffusion/native/dti6b500pepolar -o ! -d ${WORKDIR}/../baseline/diffusion/native/dti60b1000 ]; then
+    for year in `seq 1 ${followup_year}`; do
+      if [ -d ${WORKDIR}/../followup_${year}y/diffusion/native/dti6b500pepolar -o ! -d ${WORKDIR}/../followup_${year}y/diffusion/native/dti60b1000 ]; then
+        VISIT_REF=followup_${year}y
+        break
+      fi
+    done
+  fi
+  if [ "${VISIT_REF}" != "baseline" ]; then
+    echo "WARNING: ${WORKDIR}: the reference visit is ${VISIT_REF}"
+  fi
+fi
+
+#
+# Main program
+#
+
+#
+# Catch cases where DTI60 was acquired at twice the DTI6 in-plane resolution and correct that
+#
+
+# make sure geomatch exists otherwise logic is broken below and causes all kinds of problems
+# Earlier versions of CMTK do not contain geomatch
+if [ ! -e `which geomatch` ]; then
+  ERRTXT="ERROR: ${WORKDIR}: Newer version of CMTK required: geomatch is missing"
+  echo "$ERRTXT"
+  #echo "$ERRTXT" | ncanda_error_email $(basename $0)
+  exit 1
+fi
+
+if ! cmtk geomatch --no-check-xforms $(LWDP_get_override_file ${DWI6_DIR}/dti6-1.nii.gz) $(LWDP_get_override_file ${DWI60_DIR}/dti60-01.nii.gz); then
+  echo "ERROR: ${WORKDIR}: cmtk geomatch failed"
+  exit 1
+  #for f in $(cd ${DWI60_DIR}; ls *.nii.gz); do
+  #  # First resample the original image to the (hopefully correct) resolution
+  #  original=$(LWDP_get_override_file ${DWI60_DIR}/$f)
+  #  resample=${DIFFUSION_DIR}/resampled/dti60b1000/$f
+  #  if LWDP_needs_update_and_lock ${resample} ${original}; then
+  #    # Select-downsampling would change the pixel locations, so to average-downsampling, which does not (and gives better SNR)
+  #    cmtk convertx --downsample-average 2,2,1 ${original} ${resample}
+  #    LWDP_lockfile_delete ${resample}
+  #  fi
+
+  #  # Second, bring along the XML sidecar files
+  #  basename_xml=$(echo $f | sed 's/\.nii.*/.nii.xml/g')
+  #  original_xml=$(LWDP_get_override_file ${DWI60_DIR}/${basename_xml})
+  #  resample_xml=${DIFFUSION_DIR}/resampled/dti60b1000/${basename_xml}
+  #  if LWDP_needs_update_and_lock ${resample_xml} ${original_xml}; then
+  #    cp ${original_xml} ${resample_xml}
+  #    LWDP_lockfile_delete ${resample_xml}
+  #  fi
+  #done
+fi
+
+#
+# Check whether the DTI6 and DTI60 truly have reversed Phase Encode w.r.t. each other
+#
+
+pe_sign_dti6=$(fgrep phaseEncodeDirectionSign ${DWI6_DIR}/dti6-1.nii.xml | sed 's/^.*<phaseEncodeDirectionSign>\(.*\)<\/phaseEncodeDirectionSign>.*$/\1/')
+pe_sign_dti60=$(fgrep phaseEncodeDirectionSign ${DWI60_DIR}/dti60-01.nii.xml | sed 's/^.*<phaseEncodeDirectionSign>\(.*\)<\/phaseEncodeDirectionSign>.*$/\1/')
+
+if [ "${pe_sign_dti6}" != "" -a "${pe_sign_dti60}" != "" ]; then
+  if [ "${pe_sign_dti6}" == "${pe_sign_dti60}" ]; then
+    echo "ERROR: ${WORKDIR}: both DWI series have the same phase encode direction, \"${pe_sign_dti6}\", in ${DIFFUSION_DIR}"
+    #echo "ERROR: both DWI series have the same phase encode direction, \"${pe_sign_dti6}\", in ${DIFFUSION_DIR}" | ncanda_error_email $(basename $0)
+    exit 1
+  fi
+fi
+
+#
+# 0 - mask bad slices with negative value (-1) to exclude from registration and tensor fitting
+#
+
+# Do this for both the 6-direction PEpolar and the 60-direction series
+for series in dti6b500pepolar dti60b1000; do
+  if [ -d ${DIFFUSION_DIR}/native/${series} ]; then
+    outdir=${DIFFUSION_DIR}/badmasked/${series}
+    outStats=${outdir}/bad_slices.csv
+    # Check if there is a "resampled/" directory for this series and use the contents of that, if there is.
+    inpdir=${DIFFUSION_DIR}/resampled/${series}
+    [ -d ${inpdir} ] || inpdir=${DIFFUSION_DIR}/native/${series}
+
+    inputs=$(ls ${inpdir}/*.nii* | fgrep -v xml)
+    inputs=$(LWDP_get_override_files_list ${inputs})
+
+    # How many b=0 images? These MUST be first in the series!
+    b0count=$(fgrep '<bValue>0</bValue>' ${inpdir}/*.nii.xml | wc -l)
+
+    # Create bad slice-masked images
+
+    if LWDP_needs_update_and_lock ${outdir} ${inputs}; then
+      if cmtk dwi_mask_bad_slices --short --padding-value -1 --b0count ${b0count} --bad-slice-statistics ${outStats} -o ${outdir} ${inputs}; then
+        # succeeded - so make sure outdir has the correct time stamp
+        touch -c ${outdir}
+      else
+        # you need to exit as otherwise the pipeline will just use the old files !
+        LWDP_lockfile_delete ${outdir}
+        exit 1
+      fi
+      LWDP_lockfile_delete ${outdir}
+    fi
+
+    # This can later be erassed - we just put it in there right now so that case that had not bad_slices.csv created do so now
+    if LWDP_needs_update_and_lock ${outStats} ${inputs}; then
+      cmtk dwi_mask_bad_slices --short --padding-value -1 --b0count ${b0count} --bad-slice-statistics ${outStats} ${inputs}
+      LWDP_lockfile_delete ${outStats}
+    fi
+
+    # Check badmasked images are actually generated
+    outCount=$(ls ${outdir}/*.nii* | wc -l)
+    if [ ${outCount} -le 0 ]; then
+      echo "ERROR: ${WORKDIR}: there's no image generated in ${outdir}."
+      # remove outdir if unsuccessful as we check outdir when running again
+      rm -rf ${outdir}
+      exit 1
+    fi
+
+    # Also copy along the XML files so the motion correction script can adjust the gradient orientations
+    for f in $(cd ${outdir}; ls *.nii* | sed 's/\.nii.*/.nii.xml/g'); do
+      in_xml=${inpdir}/${f}
+      out_xml=${outdir}/${f}
+      if LWDP_needs_update_and_lock ${out_xml} ${in_xml}; then
+        cp ${in_xml} ${out_xml}
+        LWDP_lockfile_delete ${out_xml}
+      fi
+    done
+  fi
+done
+
+#
+# Prepare structural transformations
+#
+
+t1_sri24_affine=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_0GenericAffine.mat)
+t1_sri24_warp=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_1Warp.nii.gz)
+t1_sri24_warp_inv=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_1InverseWarp.nii.gz)
+if [ ! -e  ${t1_sri24_affine} ] ; then
+  echo "ERROR: ${WORKDIR}: ${t1_sri24_affine} is missing."
+  exit 1
+fi
+if [ ! -e  ${t1_sri24_warp} ] ; then
+  echo "ERROR: ${WORKDIR}: ${t1_sri24_warp} is missing."
+  exit 1
+fi
+if [ ! -e  ${t1_sri24_warp_inv} ] ; then
+  echo "ERROR: ${WORKDIR}: ${t1_sri24_warp_inv} is missing."
+  exit 1
+fi
+if [ "${VISIT}" == "baseline" ]; then
+  t1_sri24_mtx="${t1_sri24_warp} ${t1_sri24_affine}"
+  t1_sri24_mtx_affine="${t1_sri24_affine}"
+  sri24_t1_mtx="[${t1_sri24_affine},1] ${t1_sri24_warp_inv}"
+  sri24_t1_mtx_affine="[${t1_sri24_affine},1]"
+  #
+  sri24_padded_t1_brain=${WORKDIR}/structural/reslice/sri24_padded/t1_brain.nii.gz
+  sri24_padded_to_t1_rigid=${WORKDIR}/structural/registration/sri24_padded_to_t1/ants_rigid_0GenericAffine.mat
+else
+  t1_brain_to_baseline_affine=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_0GenericAffine.mat)
+  t1_brain_to_baseline_warp=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_1Warp.nii.gz)
+  t1_brain_to_baseline_warp_inv=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_1InverseWarp.nii.gz)
+  if [ ! -e  ${t1_brain_to_baseline_affine} ] ; then
+    echo "ERROR: ${WORKDIR}: ${t1_brain_to_baseline_affine} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${t1_brain_to_baseline_warp} ] ; then
+    echo "ERROR: ${WORKDIR}: ${t1_brain_to_baseline_warp} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${t1_brain_to_baseline_warp_inv} ] ; then
+    echo "ERROR: ${WORKDIR}: ${t1_brain_to_baseline_warp_inv} is missing."
+    exit 1
+  fi
+  t1_sri24_mtx="${t1_brain_to_baseline_warp} ${t1_brain_to_baseline_affine} ${t1_sri24_warp} ${t1_sri24_affine}"
+  t1_sri24_mtx_affine="${t1_brain_to_baseline_warp} ${t1_brain_to_baseline_affine} ${t1_sri24_affine}"
+  sri24_t1_mtx="[${t1_sri24_affine},1] ${t1_sri24_warp_inv} [${t1_brain_to_baseline_affine},1] ${t1_brain_to_baseline_warp_inv}"
+  sri24_t1_mtx_affine="[${t1_sri24_affine},1] [${t1_brain_to_baseline_affine},1] ${t1_brain_to_baseline_warp_inv}"
+  #
+  sri24_padded_t1_brain=${WORKDIR}/structural/reslice/sri24_padded/corrected/t1_brain.nii.gz
+  sri24_padded_to_t1_rigid=${WORKDIR}/structural/longitudinal/registration/baseline_sri24_padded_to_t1/ants_rigid_0GenericAffine.mat
+fi
+
+convert_ants_warp_to_cmtk_nrrd()
+{
+  local warp=$1
+  local ref_image=$2
+  local inp_image=$3
+  local output_nrrd=$4
+
+  local tmpdir=$(mktemp -d)
+
+  # fix header information
+  c3d c3d ${ref_image} -o ${tmpdir}/ref_image.nii.gz
+  c3d c3d ${inp_image} -o ${tmpdir}/inp_image.nii.gz
+  ref_image=${tmpdir}/ref_image.nii.gz
+  inp_image=${tmpdir}/inp_image.nii.gz
+
+  c3d c3d -mcs ${warp} -oo ${tmpdir}/warp_x.nii ${tmpdir}/warp_y.nii ${tmpdir}/warp_z.nii
+
+  ref_orient=`c3d c3d ${ref_image} -info-full | grep -i orient | cut -d ":" -f2 | tr -d " "`
+  ref_dim_x=`fsl fslval ${ref_image} dim1 | tr -d " "`
+  ref_dim_y=`fsl fslval ${ref_image} dim2 | tr -d " "`
+  ref_dim_z=`fsl fslval ${ref_image} dim3 | tr -d " "`
+  ref_spacing_x=`fsl fslval ${ref_image} pixdim1 | tr -d " "`
+  ref_spacing_y=`fsl fslval ${ref_image} pixdim2 | tr -d " "`
+  ref_spacing_z=`fsl fslval ${ref_image} pixdim3 | tr -d " "`
+  ref_origin_x=`c3d c3d ${ref_image} -info-full | grep -i bounding | cut -d "[" -f2 | cut -d "]" -f1 | tr -s " " | cut -d " " -f1`
+  ref_origin_y=`c3d c3d ${ref_image} -info-full | grep -i bounding | cut -d "[" -f2 | cut -d "]" -f1 | tr -s " " | cut -d " " -f2`
+  ref_origin_z=`c3d c3d ${ref_image} -info-full | grep -i bounding | cut -d "[" -f2 | cut -d "]" -f1 | tr -s " " | cut -d " " -f3`
+  inp_orient=`c3d c3d ${inp_image} -info-full | grep -i orient | cut -d ":" -f2 | tr -d " "`
+  inp_origin_x=`c3d c3d ${inp_image} -info-full | grep -i bounding | cut -d "[" -f2 | cut -d "]" -f1 | tr -s " " | cut -d " " -f1`
+  inp_origin_y=`c3d c3d ${inp_image} -info-full | grep -i bounding | cut -d "[" -f2 | cut -d "]" -f1 | tr -s " " | cut -d " " -f2`
+  inp_origin_z=`c3d c3d ${inp_image} -info-full | grep -i bounding | cut -d "[" -f2 | cut -d "]" -f1 | tr -s " " | cut -d " " -f3`
+  if [[ "${ref_orient}" == *"L"*  && "${inp_orient}" == *"R"* ]]; then
+    expr_x="${ref_dim_x}*${ref_spacing_x}-(a+(${ref_origin_x})-(${inp_origin_x}))"
+  elif [[ "${ref_orient}" == *"R"*  && "${inp_orient}" == *"L"* ]]; then
+    expr_x="${ref_dim_x}*${ref_spacing_x}+(a+(${ref_origin_x})-(${inp_origin_x}))"
+  else
+    # this function is not verified for L to L or R to R cases
+    echo "WARNING: ${WORKDIR}: convert_warp_to_cmtk_nrrd is not verified for ${ref_orient} to ${inp_orient} cases."
+    expr_x="a+(${ref_origin_x})-(${inp_origin_x})"
+  fi
+  if [[ "${ref_orient}" == *"P"*  && "${inp_orient}" == *"A"* ]]; then
+    expr_y="${ref_dim_y}*${ref_spacing_y}-(a+(${ref_origin_y})-(${inp_origin_y}))"
+  elif [[ "${ref_orient}" == *"A"*  && "${inp_orient}" == *"P"* ]]; then
+    expr_y="${ref_dim_y}*${ref_spacing_y}+(a+(${ref_origin_y})-(${inp_origin_y}))"
+  else
+    # this function is not verified for P to A or A to P cases
+    echo "WARNING: ${WORKDIR}: convert_warp_to_cmtk_nrrd is not verified for ${ref_orient} to ${inp_orient} cases."
+    expr_y="a+(${ref_origin_y})-(${inp_origin_y})"
+  fi
+  if [[ "${ref_orient}" == *"S"*  && "${inp_orient}" == *"I"* ]]; then
+    # this function is not verified for S to I cases
+    echo "WARNING: ${WORKDIR}: convert_warp_to_cmtk_nrrd is not verified for ${ref_orient} to ${inp_orient} cases."
+    expr_z="${ref_dim_z}*${ref_spacing_z}-(a+(${ref_origin_z})-(${inp_origin_z}))"
+  elif [[ "${ref_orient}" == *"I"*  && "${inp_orient}" == *"S"* ]]; then
+    # this function is not verified for I to S cases
+    echo "WARNING: ${WORKDIR}: convert_warp_to_cmtk_nrrd is not verified for ${ref_orient} to ${inp_orient} cases."
+    expr_z="${ref_dim_z}*${ref_spacing_z}+(a+(${ref_origin_z})-(${inp_origin_z}))"
+  else
+    expr_z="a+(${ref_origin_z})-(${inp_origin_z})"
+  fi
+
+  afni 3dcalc -a ${tmpdir}/warp_x.nii -expr "${expr_x}" -prefix ${tmpdir}/warp_x_fixed.nii
+  afni 3dcalc -a ${tmpdir}/warp_y.nii -expr "${expr_y}" -prefix ${tmpdir}/warp_y_fixed.nii
+  afni 3dcalc -a ${tmpdir}/warp_z.nii -expr "${expr_z}" -prefix ${tmpdir}/warp_z_fixed.nii
+
+  c3d c3d ${tmpdir}/warp_x_fixed.nii -origin 0x0x0mm -o ${tmpdir}/warp_x_fixed_o.nii
+  c3d c3d ${tmpdir}/warp_y_fixed.nii -origin 0x0x0mm -o ${tmpdir}/warp_y_fixed_o.nii
+  c3d c3d ${tmpdir}/warp_z_fixed.nii -origin 0x0x0mm -o ${tmpdir}/warp_z_fixed_o.nii
+
+  c3d c3d ${tmpdir}/warp_x_fixed_o.nii ${tmpdir}/warp_y_fixed_o.nii ${tmpdir}/warp_z_fixed_o.nii -omc ${output_nrrd}
+
+  rm -rf ${tmpdir}
+}
+
+#
+# 1 - Correct DWI motion and distortion
+#
+# for pepolar branch
+# pepolar branch doen't use badmasked images for input
+# Check if there is a "resampled/" directory for this series and use the contents of that, if there is.
+branch=pepolar
+if [ -d ${DIFFUSION_DIR}/resampled/dti60b1000 ]; then
+      b0Fwd=$(LWDP_get_override_file ${DIFFUSION_DIR}/resampled/dti60b1000/dti60-01.nii.gz)
+      bXlist=$(LWDP_get_override_files_list ${DIFFUSION_DIR}/resampled/dti60b1000/dti60-*.nii.gz)
+else
+      b0Fwd=$(LWDP_get_override_file ${DIFFUSION_DIR}/native/dti60b1000/dti60-01.nii.gz)
+      bXlist=$(LWDP_get_override_files_list ${DIFFUSION_DIR}/native/dti60b1000/dti60-*.nii.gz)
+fi
+if [ -d ${DIFFUSION_DIR}/resampled/dti6b500pepolar ]; then
+      b0Rev=$(LWDP_get_override_file ${DIFFUSION_DIR}/resampled/dti6b500pepolar/dti6-1.nii.gz)
+else
+      b0Rev=$(LWDP_get_override_file ${DIFFUSION_DIR}/native/dti6b500pepolar/dti6-1.nii.gz)
+fi
+#
+topup_acqparams=${DIFFUSION_DIR}/${branch}/corrected/acqparams.txt
+if LWDP_needs_update_and_lock ${topup_acqparams} ${b0Fwd} ${b0Rev}; then
+      rotime=0.1
+      rotime_pepolar=0.1
+      echo "0 1 0 $rotime" > ${topup_acqparams}
+      echo "0 -1 0 $rotime_pepolar" >> ${topup_acqparams}
+      LWDP_lockfile_delete ${topup_acqparams}
+fi
+topup_fieldcoef=${DIFFUSION_DIR}/${branch}/corrected/topup_fieldcoef.nii.gz
+if LWDP_needs_update_and_lock ${topup_fieldcoef} ${topup_acqparams} ${b0Fwd} ${b0Rev}; then
+      tmpdir=$(mktemp -d)
+      fsl fslmerge -t ${tmpdir}/topup_input.nii.gz ${b0Fwd} ${b0Rev}
+      fsl topup --imain=${tmpdir}/topup_input.nii.gz --datain=${topup_acqparams} --config=b02b0.cnf --out=${DIFFUSION_DIR}/${branch}/corrected/topup --iout=${DIFFUSION_DIR}/${branch}/corrected/b0_fwd_rev
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${topup_fieldcoef}
+fi
+topup_aligned=${DIFFUSION_DIR}/${branch}/corrected/b0_fwd_rev.nii.gz
+
+# originally b0_mean - recompute this way so that we do not get in problems with timestamp as it is now oleder than b0_mean_orig if computed before 02/29/2024
+b0_mean_pre=${DIFFUSION_DIR}/${branch}/corrected/b0_mean
+b0_mean_flip=${b0_mean_pre}_flip.nii.gz
+b0_mean_flip_sim=${b0_mean_pre}_flip.csv
+if LWDP_needs_update_and_lock ${b0_mean_flip_sim} ${topup_aligned} ${b0Fwd}; then
+    fsl fslmaths ${topup_aligned} -Tmean ${b0_mean_flip}
+    c3d c3d ${b0_mean_flip} -flip x -type float -o ${b0_mean_flip}
+    c3d c3d ${b0Fwd} ${b0_mean_flip} -copy-transform -o ${b0_mean_flip}
+    cmtk similarity ${b0_mean_flip} ${b0Fwd} | grep SIM | tr '\t' ' ' | tr -s ' ' | tr ' ' ',' > ${b0_mean_flip_sim}
+    LWDP_lockfile_delete ${b0_mean_flip_sim}
+fi
+
+b0_mean_orig=${b0_mean_pre}_orig.nii.gz
+b0_mean_orig_sim=${b0_mean_pre}_orig.csv
+if LWDP_needs_update_and_lock ${b0_mean_orig_sim} ${topup_aligned} ${b0Fwd}; then
+    fsl fslmaths ${topup_aligned} -Tmean ${b0_mean_orig}
+    c3d c3d ${b0Fwd} ${b0_mean_orig} -copy-transform -o ${b0_mean_orig}
+    cmtk similarity ${b0_mean_orig} ${b0Fwd} | grep SIM | tr '\t' ' ' | tr -s ' ' | tr ' ' ',' > ${b0_mean_orig_sim}
+    # done so nothing would be recomputed later as we changed standard pipeline (take out after run on everybody) 
+    touch -r ${b0_mean_flip} ${b0_mean_orig}
+    touch -r ${b0_mean_flip_sim} ${b0_mean_orig_sim}
+    LWDP_lockfile_delete ${b0_mean_orig_sim}
+fi
+
+b0_mean=${b0_mean_pre}.nii.gz
+b0_mean_sim=${b0_mean_pre}.csv
+
+# above 0.85 are differences due to correction 
+NCC_THR=0.85
+if LWDP_needs_update_and_lock ${b0_mean_sim} ${b0_mean_orig_sim} ${b0_mean_flip_sim}; then
+    NCC_orig=`tail -n1 ${b0_mean_orig_sim} | cut -d, -f7`
+    NCC_flip=`tail -n1 ${b0_mean_flip_sim} | cut -d, -f7`
+    # FLIP is the default
+    if [ $(echo "${NCC_orig} < ${NCC_flip}" | bc) -eq 1 ]; then
+	cp ${b0_mean_flip} ${b0_mean} 
+	cp ${b0_mean_flip_sim} ${b0_mean_sim}
+	touch ${b0_mean_pre}.flip
+    else 
+        # If FLIP already meets threshold then check to see if it is okay to use non-flip
+	# otherwise simply use non-flip ORIG does too 
+	if [ $(echo "${NCC_flip} < ${NCC_THR}" | bc) -eq 0 ]; then
+	    # If not check if we should use original orientation (without flip)
+	    PASS=${DIFFUSION_DIR}/${branch}/corrected/b0_mean_orig.pass
+	    if [ -e $PASS -a $b0_mean_orig_sim -ot $PASS -a $b0_mean_flip_sim -ot $PASS ]; then 
+ 		echo "INFO:$WORKDIR:Using ORIG(${NCC_orig}) as it is higher than FLIP($NCC_flip), which is above threshold (0.85)!"
+	    else
+		echo "ERROR:$WORKDIR:Non-flip(${NCC_orig}) is higher than the default FLIP($NCC_flip), which is above threshold (0.85)! Manually compare ${b0_mean_pre}_{flip,orig}.nii.gz ${b0Fwd} and touch ${DIFFUSION_DIR}/${branch}/corrected/b0_mean_orig.pass if original (not the FLIP version) should be used."
+		# need to create logic if flipped should be used 
+		LWDP_lockfile_delete ${b0_mean_sim}
+		exit 1
+	    fi
+	fi
+	cp ${b0_mean_orig} ${b0_mean} 
+	cp ${b0_mean_orig_sim} ${b0_mean_sim} 
+	echo "INFO:$WORKDIR:b0_mean is based on non-flip!"
+	touch ${b0_mean_pre}.orig 
+    fi
+    LWDP_lockfile_delete ${b0_mean_sim}
+fi 
+
+NCC=`tail -n1 ${b0_mean_sim} | cut -d, -f7`
+if [ $(echo "${NCC} < ${NCC_THR}" | bc) -eq 1 ]; then
+	checkFile=${DIFFUSION_DIR}/${branch}/corrected/b0_mean_check.pass 
+	if [ -e  $checkFile -a ${b0_mean_sim} -ot $checkFile   ]; then
+		echo "Warning:${WORKDIR}:ignoring insufficient overlap between corrected and original b0 image (NCC = ${NCC} < ${NCC_THR})"
+	else 
+	    MSG="ERROR:${WORKDIR}:"
+	    if [ -e  $checkFile ]; then
+		MSG="$MSG" + "${checkFile} is older than ${b0_mean_sim} and " 
+	    fi
+	    MSG="${MSG}insufficient overlap between corrected and original b0 image (NCC = ${NCC} < ${NCC_THR})!  Check $WORKDIR/diffusion/pepolar/corrected/b0_mean.nii.gz $WORKDIR/diffusion/native/dti60b1000/dti60-01.nii.gz. If insufficient overlap should be ignored, 'touch ${checkFile}'!"
+	    if [ -e ${b0_mean_pre}.orig ]; then 
+		echo "${MSG} Note, ORIG (not the default FLIP) is used for ${b0_mean_pre}"
+	    else 
+		echo "${MSG} Note, the default FLIP is used for ${b0_mean_pre} !"
+	    fi
+	    echo "${MSG}" | ncanda_error_email $(basename $0)
+	    # delete any files afterwards via 
+	    #for CASE in `ls -d $WORKDIR/diffusion/pepolar/* | grep -v corrected`; do rm -rf $CASE; done
+	    exit 1
+	fi
+fi
+
+b0Unwarp=${DIFFUSION_DIR}/${branch}/corrected/b0_unwarp.nii.gz
+if LWDP_needs_update_and_lock ${b0Unwarp} ${b0_mean}; then
+    # make sure everything other than this directory is removed 
+    for DIR in `ls -d ${DIFFUSION_DIR}/${branch}/* | grep -v ${branch}/corrected`; do 
+	echo "INFO:$WORKDIR:Removing $DIR!"
+	rm -rf $DIR
+    done
+    mkdir ${DIFFUSION_DIR}/${branch}/corrected/keep
+    mv ${DIFFUSION_DIR}/${branch}/corrected/b0* ${DIFFUSION_DIR}/${branch}/corrected/topup*  ${DIFFUSION_DIR}/${branch}/corrected/acqparams.txt ${DIFFUSION_DIR}/${branch}/corrected/keep/.
+    
+    for DIR in `ls -d ${DIFFUSION_DIR}/${branch}/corrected/* | grep -v -e corrected/keep -e ${b0Unwarp}.lock`; do 
+	echo "INFO:$WORKDIR:Removing $DIR!"
+	rm -rf $DIR
+    done
+    mv ${DIFFUSION_DIR}/${branch}/corrected/keep/* ${DIFFUSION_DIR}/${branch}/corrected/. 
+    rm -rf ${DIFFUSION_DIR}/${branch}/corrected/keep
+    rm -rf ${DIFFUSION_DIR}/${branch}/corrected/b0_mean_mask.nii.gz
+
+    if [ ! -e ${b0_mean} ]; then 
+	echo "ERROR:$WORKDIR:something went wrong with cleaning up corrected!"
+	LWDP_lockfile_delete ${b0Unwarp}
+	exit 1 
+    fi
+
+    dim1=`fsl fslval ${b0_mean} dim1 | tr -d " "`
+    dim2=`fsl fslval ${b0_mean} dim2 | tr -d " "`
+    dim3=`fsl fslval ${b0_mean} dim3 | tr -d " "`
+    if [ ${dim1} -ne 128 ] || [ ${dim2} -ne 128 ]; then
+        # resample to 128x128 slice
+        c3d c3d ${b0_mean} -interpolation Sinc -resample 128x128x${dim3}vox -clip 0 inf -type float -o ${b0Unwarp}
+    else
+        c3d c3d ${b0_mean} -o ${b0Unwarp}
+    fi
+    touch -r ${b0Unwarp}
+
+    LWDP_lockfile_delete ${b0Unwarp}
+fi
+
+#
+# Align with structural data
+#
+
+b0_t1_pfx=${DIFFUSION_DIR}/${branch}/registration/b0_t1/ants_
+b0_t1_affine=${b0_t1_pfx}0GenericAffine.mat
+if LWDP_needs_update_and_lock ${b0_t1_affine} ${b0Unwarp} ${t2_mrbias}; then
+  log_out=${b0_t1_pfx}0GenericAffine.log
+  ants antsRegistration -d 3 -r [${b0Unwarp},${t2_mrbias},1] -t Rigid[0.1] -m MI[${b0Unwarp},${t2_mrbias},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${b0Unwarp},${t2_mrbias},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${b0_t1_pfx} > ${log_out}
+  LWDP_lockfile_delete ${b0_t1_affine}
+fi
+export b0_t1_affine=$(LWDP_get_override_file ${b0_t1_affine})
+
+b0_t1_warp=${b0_t1_pfx}1Warp.nii.gz
+if LWDP_needs_update_and_lock ${b0_t1_warp} ${b0Unwarp} ${t2_mrbias}; then
+  log_out=${b0_t1_pfx}1Warp.log
+  ants antsRegistration -d 3 --initial-moving-transform ${b0_t1_affine} -t SyN[0.5,3,0.5] -m CC[${b0Unwarp},${t2_mrbias},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${b0_t1_pfx} > ${log_out}
+  LWDP_lockfile_delete ${b0_t1_warp}
+fi
+export b0_t1_warp=$(LWDP_get_override_file ${b0_t1_warp})
+
+b0_t1_warp_inv=${b0_t1_pfx}1InverseWarp.nii.gz
+export b0_t1_warp_inv=$(LWDP_get_override_file ${b0_t1_warp_inv})
+
+b0_t1_mtx="${b0_t1_warp} ${b0_t1_affine}"
+t1_b0_mtx="[${b0_t1_affine},1] ${b0_t1_warp_inv}"
+
+#
+# Reformat brain mask
+#
+
+t1_brainmask=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain_mask.nii.gz)
+b0_brainmask=${DIFFUSION_DIR}/${branch}/reslice/b0_unwarp/brainmask.nii.gz
+#if LWDP_needs_update_and_lock ${b0_brainmask} ${t1_brainmask} ${b0_t1_mtx} ${b0Unwarp}; then
+#  ants antsApplyTransforms -n NearestNeighbor -i ${t1_brainmask} -r ${b0Unwarp} -o ${b0_brainmask} -t ${b0_t1_mtx}
+#  c3d c3d ${b0_brainmask} -type uchar -o ${b0_brainmask}
+#  LWDP_lockfile_delete ${b0_brainmask}
+#f
+# djk: using t2_brain_exp_mask to remove out non-csf regions
+t2_brain_exp_mask=$(LWDP_get_override_file ${WORKDIR}/structural/reslice/subject_t1/t2_brain_exp_mask.nii.gz)
+if LWDP_needs_update_and_lock ${b0_brainmask} ${t1_brainmask} ${t2_brain_exp_mask} ${b0_t1_mtx} ${b0Unwarp}; then
+  tmpdir=$(mktemp -d)
+  ants antsApplyTransforms -n NearestNeighbor -i ${t1_brainmask} -r ${b0Unwarp} -o ${tmpdir}/t1_mask.nii.gz -t ${b0_t1_mtx}
+  ants antsApplyTransforms -n NearestNeighbor -i ${t2_brain_exp_mask} -r ${b0Unwarp} -o ${tmpdir}/t2_mask.nii.gz -t ${b0_t1_mtx}
+  #
+  #c3d c3d ${tmpdir}/t2_mask.nii.gz -holefill 1 0 -o ${tmpdir}/t2_mask.nii.gz
+  c3d c3d ${tmpdir}/t2_mask.nii.gz -dilate 1 1x1x1vox -o ${tmpdir}/t2_mask_d.nii.gz
+  c3d c3d ${tmpdir}/t2_mask_d.nii.gz -holefill 1 0 -o ${tmpdir}/t2_mask_d_h.nii.gz
+  c3d c3d ${tmpdir}/t2_mask_d_h.nii.gz -erode 1 1x1x1vox -o ${tmpdir}/t2_mask.nii.gz
+  #
+  c3d c3d ${tmpdir}/t1_mask.nii.gz ${tmpdir}/t2_mask.nii.gz -multiply -type uchar -o ${b0_brainmask}
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${b0_brainmask}
+fi
+export b0_brainmask=$(LWDP_get_override_file ${b0_brainmask})
+
+b0_brain=${DIFFUSION_DIR}/${branch}/reslice/b0_unwarp/b0_brain.nii.gz
+if LWDP_needs_update_and_lock ${b0_brain} ${b0_Unwarp} ${b0_brainmask}; then
+  c3d c3d ${b0Unwarp} ${b0_brainmask} -multiply -o ${b0_brain}
+  LWDP_lockfile_delete ${b0_brain}
+fi
+export b0_brain=$(LWDP_get_override_file ${b0_brain})
+
+sri24_parc=${DATA_DIR}/sri24/parcellation/sri24_parc116.nii.gz
+b0_parc=${DIFFUSION_DIR}/${branch}/reslice/b0_unwarp/sri24_parc116.nii.gz
+if LWDP_needs_update_and_lock ${b0_parc} ${sri24_parc} ${b0Unwarp} ${b0_t1_mtx} ${t1_sri24_mtx}; then
+  # choose MultiLabel params which preserves boundaries close to NN, but applying some mild smoothness
+  ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${sri24_parc} -r ${b0Unwarp} -o ${b0_parc} -t ${b0_t1_mtx} ${t1_sri24_mtx}
+  c3d c3d ${b0_parc} -type short -o ${b0_parc}
+  LWDP_lockfile_delete ${b0_parc}
+fi
+export b0_parc=$(LWDP_get_override_file ${b0_parc})
+
+# transform b0 to t1 space for testing
+b0_aligned_to_t1=${DIFFUSION_DIR}/${branch}/reslice/subject_t1/b0.nii.gz
+if LWDP_needs_update_and_lock ${b0_aligned_to_t1} ${b0Unwarp} ${t2_mrbias} ${b0_t1_affine} ${b0_t1_warp_inv}; then
+  ants antsApplyTransforms -n linear -i ${b0Unwarp} -r ${t2_mrbias} -o ${b0_aligned_to_t1} -t ${t1_b0_mtx}
+  c3d c3d ${b0_aligned_to_t1} -type float -o ${b0_aligned_to_t1}
+  LWDP_lockfile_delete ${b0_aligned_to_t1}
+fi
+b0_brain_aligned_to_t1=${DIFFUSION_DIR}/${branch}/reslice/subject_t1/b0_brain.nii.gz
+if LWDP_needs_update_and_lock ${b0_brain_aligned_to_t1} ${b0_aligned_to_t1} ${t1_brainmask}; then
+  c3d c3d ${b0_aligned_to_t1} ${t1_brainmask} -multiply -o ${b0_brain_aligned_to_t1}
+  LWDP_lockfile_delete ${b0_brain_aligned_to_t1}
+fi
+
+if [ "${branch}" == "pepolar" ]; then
+  # generate mask for b0_mean
+  b0_mean_mask=${DIFFUSION_DIR}/${branch}/corrected/b0_mean_mask.nii.gz
+  if LWDP_needs_update_and_lock ${b0_mean_mask} ${t1_brainmask} ${b0_t1_mtx} ${b0_mean}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${t1_brainmask} -r ${b0_mean} -o ${b0_mean_mask} -t ${b0_t1_mtx}
+    c3d c3d ${b0_mean_mask} -type uchar -o ${b0_mean_mask}
+    LWDP_lockfile_delete ${b0_mean_mask}
+  fi
+  #
+  bval_file=${DIFFUSION_DIR}/${branch}/corrected/bval.txt
+  bvec_file=${DIFFUSION_DIR}/${branch}/corrected/bvec.txt
+  idx_file=${DIFFUSION_DIR}/${branch}/corrected/idx.txt
+  if LWDP_needs_update_and_lock ${bval_file} ${bXlist}; then
+    bval_list=
+    bvec_x_list=
+    bvec_y_list=
+    bvec_z_list=
+    idx_list=
+    for bX in ${bXlist}; do
+      xml_file="$(echo ${bX} | sed 's/\.gz//g').xml"
+      bval=`fgrep bValue ${xml_file} | sed 's/^[^<]*<[^<]*>//g; s/<[^<]*>[^<]*$//g' | tr -d " "`
+      bvec=`fgrep bVectorImage ${xml_file} | sed 's/^[^<]*<[^<]*>//g; s/<[^<]*>[^<]*$//g' | tr -s " "`
+      bvec_x=`echo ${bvec} | cut -d " " -f1`
+      bvec_y=`echo ${bvec} | cut -d " " -f2`
+      bvec_z=`echo ${bvec} | cut -d " " -f3`
+      if [ "${bval_list}" == "" ]; then
+        bval_list="${bval}"
+        bvec_x_list="${bvec_x}"
+        bvec_y_list="${bvec_y}"
+        bvec_z_list="${bvec_z}"
+        idx_list="1"
+      else
+        bval_list="${bval_list} ${bval}"
+        bvec_x_list="${bvec_x_list} ${bvec_x}"
+        bvec_y_list="${bvec_y_list} ${bvec_y}"
+        bvec_z_list="${bvec_z_list} ${bvec_z}"
+        idx_list="${idx_list} 1"
+      fi
+      echo ${bval_list} > ${bval_file}
+      echo ${bvec_x_list} > ${bvec_file}
+      echo ${bvec_y_list} >> ${bvec_file}
+      echo ${bvec_z_list} >> ${bvec_file}
+      echo ${idx_list} > ${idx_file}
+    done
+    LWDP_lockfile_delete ${bval_file}
+  fi
+  dwi_unwarp=${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp.nii.gz
+  dwi_unwarp_params=${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp.eddy_parameters
+  dwi_unwarp_bvecs=${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp.eddy_rotated_bvecs
+  dwi_unwarp_movement_rms=${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp.eddy_movement_rms
+  dwi_unwarp_outlier_map=${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp.eddy_outlier_map
+  if LWDP_needs_update_and_lock ${dwi_unwarp} ${bXlist} ${b0_mean_mask} ${topup_acqparams} ${bval_file} ${bvec_file} ${idx_file}; then
+    tmpdir=$(mktemp -d)
+    fsl fslmerge -t ${tmpdir}/dwi.nii.gz ${bXlist}
+    # eddy_openmp is from fsl 5.0.8 Centos6 version
+    #fsl eddy_openmp --imain=${tmpdir}/dwi --mask=${b0_mean_mask} --acqp=${topup_acqparams} --index=${idx_file} --bvecs=${bvec_file} --bvals=${bval_file} --topup=${DIFFUSION_DIR}/${branch}/corrected/topup --out=${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp
+    CMD="$fsl_eddy --imain=${tmpdir}/dwi --mask=${b0_mean_mask} --acqp=${topup_acqparams} --index=${idx_file} --bvecs=${bvec_file} --bvals=${bval_file} --topup=${DIFFUSION_DIR}/${branch}/corrected/topup --out=${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp"
+    if $CMD; then
+	  rm -rf ${tmpdir}
+    else
+	  echo "ERROR:$WORKDIR:The following command failed '$CMD' !"
+	  rm -rf ${tmpdir}
+	  LWDP_lockfile_delete ${dwi_unwarp}
+	  exit 1
+    fi
+    LWDP_lockfile_delete ${dwi_unwarp}
+  fi
+
+  if [ `grep p+0 ${dwi_unwarp_params}  | wc -l` -gt 0 ]; then 
+	# happens if job is run on node09 
+	echo "ERROR:$WORKDIR:${dwi_unwarp_params} seems to contain non-numeric value:"
+	cat ${dwi_unwarp_params}
+	echo "ERROR:$WORKDIR:Try running one node02 "
+	echo "  rm -f ${dwi_unwarp}"
+	echo "  $NCANDA_BINARY_DIR/ncanda_diffusion_pipeline $WORKDIR"
+	if false; then 
+	    echo "===== ${topup_acqparams}"
+	    cat ${topup_acqparams}
+	    echo "===== ${idx_file}"
+	    cat ${idx_file}
+	    echo "===== ${bvec_file}"
+	    cat ${bvec_file} 
+	    echo "===== ${bval_file}"
+	    cat ${bval_file}
+	fi
+	exit 1
+  fi
+
+  # if dti_rotate_bvec.py returns error message pops up that "dwi_unwarp.eddy_parameters contains non float values"
+  # then delete dwi_unwarp.* and execute on a different machine
+  if LWDP_needs_update_and_lock ${dwi_unwarp_bvecs} ${dwi_unwarp}; then
+    ${NCANDA_SOURCE_DIR}/utils/dti_rotate_bvec.py -b ${bvec_file} -e ${dwi_unwarp_params} -o ${dwi_unwarp_bvecs} -r ${dwi_unwarp_movement_rms}
+    LWDP_lockfile_delete ${dwi_unwarp_bvecs}
+  fi
+  bad_slices=${DIFFUSION_DIR}/badmasked/dti60b1000/bad_slices.csv
+  if LWDP_needs_update_and_lock ${dwi_unwarp_outlier_map} ${dwi_unwarp} ${bad_slices}; then
+    dim3=`fsl fslval ${dwi_unwarp} dim3 | tr -d " "`
+    dim4=`fsl fslval ${dwi_unwarp} dim4 | tr -d " "`
+    ${NCANDA_SOURCE_DIR}/utils/dti_make_outlier_map.py -b ${bad_slices} -s ${dim3} -v ${dim4} -o ${dwi_unwarp_outlier_map}
+    LWDP_lockfile_delete ${dwi_unwarp_outlier_map}
+  fi
+  unwarp=${DIFFUSION_DIR}/${branch}/corrected/unwarp/dti60-01.nii.gz
+  unwarp_average=${DIFFUSION_DIR}/${branch}/corrected/unwarp/bAverage.nii.gz
+  if LWDP_needs_update_and_lock ${unwarp} ${bXlist} ${dwi_unwarp} ${bval_file}; then
+    tmpdir=$(mktemp -d)
+    fsl fslsplit ${dwi_unwarp} ${tmpdir}/dwi_unwarp_ -t
+    bval_list=$(cat ${bval_file})
+    bdir_list=
+    idx=0
+    for bX in ${bXlist}; do
+      bXname=`basename ${bX}`
+      idxf=`printf "%04d" ${idx}`
+      let idx++
+      bval=`echo ${bval_list} | cut -d " " -f${idx}`
+      dim1=`fsl fslval ${tmpdir}/dwi_unwarp_${idxf}.nii.gz dim1 | tr -d " "`
+      dim2=`fsl fslval ${tmpdir}/dwi_unwarp_${idxf}.nii.gz dim2 | tr -d " "`
+      dim3=`fsl fslval ${tmpdir}/dwi_unwarp_${idxf}.nii.gz dim3 | tr -d " "`
+      if [ ${dim1} -ne 128 ] || [ ${dim2} -ne 128 ]; then
+        # resample to 128x128 slice
+        c3d c3d ${tmpdir}/dwi_unwarp_${idxf}.nii.gz -interpolation Sinc -resample 128x128x${dim3}vox -clip 0 inf -type float -o ${DIFFUSION_DIR}/${branch}/corrected/unwarp/${bXname}
+      else
+        c3d c3d ${tmpdir}/dwi_unwarp_${idxf}.nii.gz -type float -o ${DIFFUSION_DIR}/${branch}/corrected/unwarp/${bXname}
+      fi
+      if [ ${bval} -ne 0 ]; then
+        bdir_list="${bdir_list} ${DIFFUSION_DIR}/${branch}/corrected/unwarp/${bXname}"
+      fi
+    done
+    fsl fsladd ${unwarp_average} -m ${bdir_list}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${unwarp}
+  fi
+  final=${DIFFUSION_DIR}/${branch}/corrected/final/dti60-01.nii.gz
+  if LWDP_needs_update_and_lock ${final} ${bXlist} ${dwi_unwarp} ${dwi_unwarp_outlier_map}; then
+    bval_list=$(cat ${bval_file})
+    idx=1
+    for bX in ${bXlist}; do
+      bXname=`basename ${bX}`
+      bval=`echo ${bval_list} | cut -d " " -f${idx}`
+      let idx++
+      outlier_list=`sed "${idx}q;d" ${dwi_unwarp_outlier_map} | tr -s " "`
+      slice_idx=0
+      outlier_txt=
+      is_outlier_prev=0
+      for outlier in ${outlier_list};do
+        if [ "${outlier}" == "1" ]; then
+          if [ "${outlier_txt}" == "" ]; then
+            outlier_txt="iszero(k-${slice_idx}-1),iszero(k-${slice_idx}),iszero(k-${slice_idx}+1)"
+          else
+            if [ ${is_outlier_prev} -eq 1 ]; then
+              outlier_txt="${outlier_txt},iszero(k-${slice_idx}+1)"
+            else
+              outlier_txt="${outlier_txt},iszero(k-${slice_idx}-1),iszero(k-${slice_idx}),iszero(k-${slice_idx}+1)"
+            fi
+          fi
+          is_outlier_prev=1
+        else
+          is_outlier_prev=0
+        fi
+        let slice_idx++
+      done
+      if [ "${outlier_txt}" == "" ]; then
+        c3d c3d ${DIFFUSION_DIR}/${branch}/corrected/unwarp/${bXname} -o ${DIFFUSION_DIR}/${branch}/corrected/final/${bXname}
+      else
+        afni 3dcalc -a ${DIFFUSION_DIR}/${branch}/corrected/unwarp/${bXname} -expr "-1*or(${outlier_txt})+a*(1-or(${outlier_txt}))" -prefix ${DIFFUSION_DIR}/${branch}/corrected/final/${bXname} -overwrite
+      fi
+    done
+    LWDP_lockfile_delete ${final}
+  fi
+  gradient=${DIFFUSION_DIR}/${branch}/corrected/final/dti60-01.gradient
+  if LWDP_needs_update_and_lock ${gradient} ${bXlist} ${dwi_unwarp_bvecs}; then
+    bvec_x_list=`sed "1q;d" ${dwi_unwarp_bvecs} | tr -s " "`
+    bvec_y_list=`sed "2q;d" ${dwi_unwarp_bvecs} | tr -s " "`
+    bvec_z_list=`sed "3q;d" ${dwi_unwarp_bvecs} | tr -s " "`
+    idx=1
+    for bv in ${bvec_x_list}; do
+      bvec_x[${idx}]=${bv}
+      let idx++
+    done
+    idx=1
+    for bv in ${bvec_y_list}; do
+      bvec_y[${idx}]=${bv}
+      let idx++
+    done
+    idx=1
+    for bv in ${bvec_z_list}; do
+      bvec_z[${idx}]=${bv}
+      let idx++
+    done
+    idx=1
+    for bX in ${bXlist}; do
+      bXname=`basename ${bX}`
+      out_file="$(echo ${bXname} | sed 's/\..*//g').gradient"
+      echo "${bvec_x[${idx}]} ${bvec_y[${idx}]} ${bvec_z[${idx}]}" > ${DIFFUSION_DIR}/${branch}/corrected/final/${out_file}
+      let idx++
+    done
+    LWDP_lockfile_delete ${gradient}
+  fi
+  # make inclusion_list for camino
+  included_volumes_file=${DIFFUSION_DIR}/${branch}/camino/inclusion_list.txt
+  in_final_list=$(ls ${DIFFUSION_DIR}/${branch}/corrected/final/dti60-??.nii.gz | sort)
+  final_average=${DIFFUSION_DIR}/${branch}/corrected/final/bAverage.nii.gz
+  if LWDP_needs_update_and_lock ${included_volumes_file} ${dwi_unwarp_movement_rms} ${dwi_unwarp_outlier_map} ${in_final_list}; then
+    rm -f ${included_volumes_file}
+    bval_list=$(cat ${bval_file})
+    bdir_list=
+    excluded_num=0
+    idx=1
+    for bX in ${in_final_list}; do
+      dwi_image=$(echo ${bX} | sed 's/.*\/final\///g; s/\..*//g')
+      bval=`echo ${bval_list} | cut -d " " -f${idx}`
+      #
+      rms_list=`sed "${idx}q;d" ${dwi_unwarp_movement_rms} | tr -s " "`
+      rms_t=`echo ${rms_list} | cut -d " " -f1`
+      rms_t=`printf "%f" ${rms_t}`
+      rms_r=`echo ${rms_list} | cut -d " " -f2`
+      rms_r=`printf "%f" ${rms_r}`
+      rms_check=`bc -l <<< "${rms_t} > 1.5 || ${rms_r} > 1.5"`
+      let idx++
+      outlier_num=0
+      outlier_list=`sed "${idx}q;d" ${dwi_unwarp_outlier_map} | tr -s " "`
+      for outlier in ${outlier_list}; do
+        if [ "${outlier}" == "1" ]; then
+          let outlier_num++
+        fi
+      done
+      outlier_check_1=`bc -l <<< "${outlier_num} > 8"`
+      outlier_check_2=`bc -l <<< "${outlier_num} > 2"`
+      if [ ${outlier_check_1} -eq 1 ]; then
+        echo "INFO: ${WORKDIR}: ${dwi_image} excluded: rms_t = ${rms_t}, rms_r = ${rms_r}, outlier_num = ${outlier_num}"
+        let excluded_num++
+        continue
+      fi
+      if [ ${outlier_check_2} -eq 1 ] && [ ${rms_check} -eq 1 ]; then
+        echo "INFO: ${WORKDIR}: ${dwi_image} excluded: rms_t = ${rms_t}, rms_r = ${rms_r}, outlier_num = ${outlier_num}"
+        let excluded_num++
+        continue
+      fi
+      echo ${dwi_image} >> ${included_volumes_file}
+      if [ ${bval} -ne 0 ]; then
+        bdir_list="${bdir_list} ${bX}"
+      fi
+    done
+    cmtk imagemath --set-padding-value -1 --in ${bdir_list} --average --out ${final_average}
+    if [ ${excluded_num} -gt 6 ]; then
+      echo "WARNING: ${WORKDIR}: excluded number = ${excluded_num} is larger than 6 (10%)"
+    fi
+    LWDP_lockfile_delete ${included_volumes_file}
+  fi
+fi
+
+included_volumes_file=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/inclusion_list.txt)
+
+#
+# 2 - Make Camino voxel file
+#
+
+in_nii_list=$(cat ${included_volumes_file} | while read f; do echo ${DIFFUSION_DIR}/${branch}/corrected/final/${f}.nii.gz; done)
+number_of_images=$(echo ${in_nii_list} | wc -w)
+out_voxels=${DIFFUSION_DIR}/${branch}/camino/voxels.short
+if LWDP_needs_update_and_lock ${out_voxels} ${b0Unwarp} ${in_nii_list} ${included_volumes_file}; then
+  nvoxels=$(cmtk describe ${b0Unwarp} | awk '/voxels/ {print $1 * $3 * $5}')
+  scanner2voxel="camino scanner2voxel -voxels ${nvoxels} -components ${number_of_images} -inputdatatype short -outputdatatype short"
+  if !(cmtk stream_pixels --convert short --change-endian ${in_nii_list} | ${scanner2voxel} > ${out_voxels}); then
+    rm ${out_voxels}
+  fi
+  if [ -s ${out_voxels} ]; then
+    gzip -9f ${out_voxels}
+  else
+    rm -f ${out_voxels}
+  fi
+  LWDP_lockfile_delete ${out_voxels}
+fi
+
+#
+# 3 - Make camino scheme file
+#
+
+gradient_file_list=$(cat ${included_volumes_file} | while read f; do echo ${DIFFUSION_DIR}/${branch}/corrected/final/${f}.gradient; done)
+scheme_file=${DIFFUSION_DIR}/${branch}/camino/scheme
+if LWDP_needs_update_and_lock ${scheme_file} ${gradient_file_list} ${included_volumes_file}; then
+  cat ${gradient_file_list} | camino pointset2scheme -bvalue 1000 > ${scheme_file}
+  # File is empty 
+  if [ ! -s ${scheme_file} ]; then 
+	echo "ERROR:$WORKDIR:camino pointset2scheme failed to produce scheme file!" 
+	rm -f ${scheme_file}
+	exit 1 
+  fi 
+  LWDP_lockfile_delete ${scheme_file}
+fi
+
+#
+# 4 - Make Camino tensor file
+#
+
+voxels_file=${DIFFUSION_DIR}/${branch}/camino/voxels.short
+for number_and_model in 1/ldt; do ##  2/pospos 3/pospospos ## We MUST do "ldt" because for now it's the only one that will ignore negative (masked-out) values in the DWI
+  ntens=$(echo $number_and_model | cut -d/ -f1)
+  model=$(echo $number_and_model | cut -d/ -f2)
+  out_tensors=${DIFFUSION_DIR}/${branch}/camino/tensors_${ntens}.Bdouble
+  if LWDP_needs_update_and_lock ${out_tensors} ${scheme_file} ${voxels_file} ${b0_brainmask}; then
+    dtfit="camino modelfit -bgthresh 1 -inputdatatype short -model ${model} -schemefile ${scheme_file} -bgmask ${b0_brainmask}"
+    if ! (gzip -fcd ${voxels_file} | ${dtfit} > ${out_tensors}); then
+      rm ${out_tensors}
+    fi
+    if [ -s ${out_tensors} ]; then
+      gzip -9f ${out_tensors}
+    else
+      echo "ERROR: ${WORKDIR}: Failed to create ${out_tensors} on host ${HOSTNAME}"
+      rm ${out_tensors}
+    fi
+    LWDP_lockfile_delete ${out_tensors}
+  fi
+done
+
+#
+# 5 - Make Camino scalar maps
+#
+
+map=("fa" "md" "l1" "lt")
+# these are some conservative maximum values for each mod
+clip_max=("1" "0.003" "0.004" "0.005")
+
+tensors_file=${DIFFUSION_DIR}/${branch}/camino/tensors_1.Bdouble.gz
+for map_idx in 0 1; do
+  out_map=${DIFFUSION_DIR}/${branch}/camino/${map[${map_idx}]}.nii
+  if LWDP_needs_update_and_lock ${out_map} ${tensors_file} ${b0Unwarp}; then
+    tmpdir=$(mktemp -d)
+    gzip -cd ${tensors_file} | camino ${map[${map_idx}]} -outputdatatype float > ${tmpdir}/raw
+
+    cmtk mk_nifti_hdr --attached --import ${b0Unwarp} --float ${tmpdir}/${map[${map_idx}]}.nii
+    cat ${tmpdir}/raw | camino shredder 0 -4 0 >> ${tmpdir}/${map[${map_idx}]}.nii
+
+    cmtk convertx --set-padding 0 --replace-inf-nan 0 --thresh-below 0 --thresh-above ${clip_max[${map_idx}]} ${tmpdir}/${map[${map_idx}]}.nii ${out_map}
+    rm -rf ${tmpdir}
+
+    LWDP_lockfile_delete ${out_map}
+  fi
+done
+
+# Check for override files
+subject_md=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/md.nii)
+subject_fa=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/fa.nii)
+
+# Make eigenvalue maps, l1 and lt
+subject_l1=${DIFFUSION_DIR}/${branch}/camino/l1.nii
+if LWDP_needs_update_and_lock ${subject_l1} ${tensors_file}; then
+  tmpdir=$(mktemp -d)
+  gzip -cd ${tensors_file} | camino dteig -outputdatatype float > ${tmpdir}/dteig
+
+  cmtk mk_nifti_hdr --attached --import ${b0Unwarp} --float ${tmpdir}/l1.nii
+  cat ${tmpdir}/dteig | camino shredder 0 -4 44 >> ${tmpdir}/l1.nii
+
+  cmtk convertx --set-padding 0 --replace-inf-nan 0 --thresh-below 0 --thresh-above ${clip_max[2]} ${tmpdir}/l1.nii ${subject_l1}
+
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${subject_l1}
+fi
+subject_l1=$(LWDP_get_override_file ${subject_l1})
+
+subject_lt=${DIFFUSION_DIR}/${branch}/camino/lt.nii
+if LWDP_needs_update_and_lock ${subject_lt} ${subject_md} ${subject_l1}; then
+  cmtk imagemath --float --in ${subject_md} --scalar-mul 3 --in ${subject_l1} --scalar-mul -1 --add --thresh-below 0 --thresh-above ${clip_max[3]} --out ${subject_lt}
+  LWDP_lockfile_delete ${subject_lt}
+fi
+subject_lt=$(LWDP_get_override_file ${subject_lt})
+
+# Create upsampled FA image - this will be used for creating fiber tracking seed images
+subject_fa_upsample=${DIFFUSION_DIR}/${branch}/camino/fa_1_25mm.nii
+if LWDP_needs_update_and_lock ${subject_fa_upsample} ${subject_fa}; then
+  cmtk convertx --resample 1.24 ${subject_fa} ${subject_fa_upsample}
+  LWDP_lockfile_delete ${subject_fa_upsample}
+fi
+
+#
+# Refine alignment with SRI24 atlas based on FA map
+#
+
+fa_subject=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/fa.nii.gz)
+fa_atlas=${DATA_DIR}/sri24/sri24_fa.nii.gz
+
+if [ "${branch}" == "pepolar" ]; then
+  ## warp scheme
+  ## refine t1 to b0 registration using sri24 b0
+  #sri24_b0=${DATA_DIR}/sri24/sri24_dwi_b0.nii.gz
+  #sri24_b0_aligned_to_t1=${DIFFUSION_DIR}/${branch}/reslice/subject_t1/sri24_dwi_b0.nii.gz
+  #if LWDP_needs_update_and_lock ${sri24_b0_aligned_to_t1} ${sri24_b0} ${t2_mrbias} ${t1_sri24_mtx}; then
+  #  ants antsApplyTransforms -d 3 -n BlackmanWindowedSinc -i ${sri24_b0} -r ${t2_mrbias} -o ${sri24_b0_aligned_to_t1} -t ${t1_sri24_mtx}
+  #  c3d c3d ${sri24_b0_aligned_to_t1} -clip 0 inf -type float -o ${sri24_b0_aligned_to_t1}
+  #  LWDP_lockfile_delete ${sri24_b0_aligned_to_t1}
+  #fi
+  ##
+  #b0_t1_refine_pfx=${DIFFUSION_DIR}/${branch}/registration/b0_t1_refine/ants_
+  #b0_t1_refine_affine=${b0_t1_refine_pfx}0GenericAffine.mat
+  #if LWDP_needs_update_and_lock ${b0_t1_refine_affine} ${b0_brain} ${sri24_b0_aligned_to_t1}; then
+  #  log_out=${b0_t1_refine_pfx}0GenericAffine.log
+  #  ants antsRegistration -d 3 -r [${b0_brain},${sri24_b0_aligned_to_t1},1] -t Rigid[0.1] -m MI[${b0_brain},${sri24_b0_aligned_to_t1},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${b0_brain},${sri24_b0_aligned_to_t1},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${b0_t1_refine_pfx} > ${log_out}
+  #  LWDP_lockfile_delete ${b0_t1_refine_affine}
+  #fi
+  #export b0_t1_refine_affine=$(LWDP_get_override_file ${b0_t1_refine_affine})
+  #
+  #b0_t1_refine_warp=${b0_t1_refine_pfx}1Warp.nii.gz
+  #if LWDP_needs_update_and_lock ${b0_t1_refine_warp} ${b0_brain} ${sri24_b0_aligned_to_t1}; then
+  #  log_out=${b0_t1_refine_pfx}1Warp.log
+  #  ants antsRegistration -d 3 --initial-moving-transform ${b0_t1_refine_affine} -t SyN[0.5,3,0.5] -m CC[${b0_brain},${sri24_b0_aligned_to_t1},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${b0_t1_refine_pfx} > ${log_out}
+  #  LWDP_lockfile_delete ${b0_t1_refine_warp}
+  #fi
+  #export b0_t1_refine_warp=$(LWDP_get_override_file ${b0_t1_refine_warp})
+  #
+  #b0_t1_refine_warp_inv=${b0_t1_refine_pfx}1InverseWarp.nii.gz
+  #export b0_t1_refine_warp_inv=$(LWDP_get_override_file ${b0_t1_refine_warp_inv})
+  #
+  #b0_t1_refine_mtx="${b0_t1_refine_warp} ${b0_t1_refine_affine}"
+  #t1_b0_refine_mtx="[${b0_t1_refine_affine},1] ${b0_t1_refine_warp_inv}"
+
+  #sri24_b0_warp=${DIFFUSION_DIR}/${branch}/registration/sri24_b0/ants_0Warp.nii.gz
+  #if LWDP_needs_update_and_lock ${sri24_b0_warp} ${fa_subject} ${fa_atlas} ${b0_t1_refine_mtx} ${t1_sri24_mtx}; then
+  #  ants antsApplyTransforms -d 3 -o [${sri24_b0_warp},1] -r ${fa_atlas} -t ${sri24_t1_mtx} ${t1_b0_refine_mtx}
+  #  LWDP_lockfile_delete ${sri24_b0_warp}
+  #fi
+  #export sri24_b0_warp=$(LWDP_get_override_file ${sri24_b0_warp})
+
+  #b0_sri24_warp=${DIFFUSION_DIR}/${branch}/registration/b0_sri24/ants_0Warp.nii.gz
+  #if LWDP_needs_update_and_lock ${b0_sri24_warp} ${fa_subject} ${fa_atlas} ${b0_t1_refine_mtx} ${t1_sri24_mtx}; then
+  #  ants antsApplyTransforms -d 3 -o [${b0_sri24_warp},1] -r ${fa_subject} -t ${b0_t1_refine_mtx} ${t1_sri24_mtx}
+  #  LWDP_lockfile_delete ${b0_sri24_warp}
+  #fi
+  #export b0_sri24_warp=$(LWDP_get_override_file ${b0_sri24_warp})
+
+  # warp_refine scheme
+  if [ "${VISIT}" == "${VISIT_REF}" ]; then
+    # refine t1 to b0 registration using sri24 t2 & fa
+    sri24_t2=${DATA_DIR}/sri24/sri24_t2.nii.gz
+    sri24_t2_aligned_to_t1=${DIFFUSION_DIR}/${branch}/reslice/subject_t1/sri24_t2.nii.gz
+    if LWDP_needs_update_and_lock ${sri24_t2_aligned_to_t1} ${sri24_t2} ${t2_mrbias} ${t1_sri24_mtx}; then
+      ants antsApplyTransforms -d 3 -n BlackmanWindowedSinc -i ${sri24_t2} -r ${t2_mrbias} -o ${sri24_t2_aligned_to_t1} -t ${t1_sri24_mtx}
+      c3d c3d ${sri24_t2_aligned_to_t1} -clip 0 inf -type float -o ${sri24_t2_aligned_to_t1}
+      LWDP_lockfile_delete ${sri24_t2_aligned_to_t1}
+    fi
+    sri24_fa_aligned_to_t1=${DIFFUSION_DIR}/${branch}/reslice/subject_t1/sri24_fa.nii.gz
+    if LWDP_needs_update_and_lock ${sri24_fa_aligned_to_t1} ${fa_atlas} ${t2_mrbias} ${t1_sri24_mtx}; then
+      ants antsApplyTransforms -d 3 -n BlackmanWindowedSinc -i ${fa_atlas} -r ${t2_mrbias} -o ${sri24_fa_aligned_to_t1} -t ${t1_sri24_mtx}
+      c3d c3d ${sri24_fa_aligned_to_t1} -clip 0 inf -type float -o ${sri24_fa_aligned_to_t1}
+      LWDP_lockfile_delete ${sri24_fa_aligned_to_t1}
+    fi
+    #
+    b0fa_t1_refine_pfx=${DIFFUSION_DIR}/${branch}/registration/b0fa_t1_refine/ants_
+    b0fa_t1_refine_affine=${b0fa_t1_refine_pfx}0GenericAffine.mat
+    if LWDP_needs_update_and_lock ${b0fa_t1_refine_affine} ${b0_brain} ${sri24_t2_aligned_to_t1}; then
+      log_out=${b0fa_t1_refine_pfx}0GenericAffine.log
+      ants antsRegistration -d 3 -r [${b0_brain},${sri24_t2_aligned_to_t1},1] -t Rigid[0.1] -m MI[${b0_brain},${sri24_t2_aligned_to_t1},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${b0_brain},${sri24_t2_aligned_to_t1},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${b0fa_t1_refine_pfx} > ${log_out}
+      LWDP_lockfile_delete ${b0fa_t1_refine_affine}
+    fi
+    export b0fa_t1_refine_affine=$(LWDP_get_override_file ${b0fa_t1_refine_affine})
+
+    b0fa_t1_refine_warp=${b0fa_t1_refine_pfx}1Warp.nii.gz
+    if LWDP_needs_update_and_lock ${b0fa_t1_refine_warp} ${b0_brain} ${fa_subject} ${sri24_t2_aligned_to_t1} ${sri24_fa_aligned_to_t1}; then
+      log_out=${b0fa_t1_refine_pfx}1Warp.log
+      ants antsRegistration -d 3 --initial-moving-transform ${b0fa_t1_refine_affine} -t SyN[0.5,3,0.5] -m CC[${b0_brain},${sri24_t2_aligned_to_t1},0.5,4] -m CC[${fa_subject},${sri24_fa_aligned_to_t1},0.5,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${b0fa_t1_refine_pfx} > ${log_out}
+      LWDP_lockfile_delete ${b0fa_t1_refine_warp}
+    fi
+    export b0fa_t1_refine_warp=$(LWDP_get_override_file ${b0fa_t1_refine_warp})
+
+    b0fa_t1_refine_warp_inv=${b0fa_t1_refine_pfx}1InverseWarp.nii.gz
+    export b0fa_t1_refine_warp_inv=$(LWDP_get_override_file ${b0fa_t1_refine_warp_inv})
+
+    b0fa_t1_refine_mtx="${b0fa_t1_refine_warp} ${b0fa_t1_refine_affine}"
+    t1_b0fa_refine_mtx="[${b0fa_t1_refine_affine},1] ${b0fa_t1_refine_warp_inv}"
+
+    sri24_b0fa_warp=${DIFFUSION_DIR}/${branch}/registration/sri24_b0fa/ants_0Warp.nii.gz
+    if LWDP_needs_update_and_lock ${sri24_b0fa_warp} ${fa_subject} ${fa_atlas} ${b0fa_t1_refine_mtx} ${t1_sri24_mtx}; then
+      ants antsApplyTransforms -d 3 -o [${sri24_b0fa_warp},1] -r ${fa_atlas} -t ${sri24_t1_mtx} ${t1_b0fa_refine_mtx}
+      LWDP_lockfile_delete ${sri24_b0fa_warp}
+    fi
+    export sri24_b0fa_warp=$(LWDP_get_override_file ${sri24_b0fa_warp})
+
+    b0fa_sri24_warp=${DIFFUSION_DIR}/${branch}/registration/b0fa_sri24/ants_0Warp.nii.gz
+    if LWDP_needs_update_and_lock ${b0fa_sri24_warp} ${fa_subject} ${fa_atlas} ${b0fa_t1_refine_mtx} ${t1_sri24_mtx}; then
+      ants antsApplyTransforms -d 3 -o [${b0fa_sri24_warp},1] -r ${fa_subject} -t ${b0fa_t1_refine_mtx} ${t1_sri24_mtx}
+      LWDP_lockfile_delete ${b0fa_sri24_warp}
+    fi
+    export b0fa_sri24_warp=$(LWDP_get_override_file ${b0fa_sri24_warp})
+  else
+    # align with baseline fa
+    fa_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../${VISIT_REF}/diffusion/${branch}/camino/fa.nii.gz)
+    sri24_b0fa_warp_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../${VISIT_REF}/diffusion/${branch}/registration/sri24_b0fa/ants_0Warp.nii.gz)
+    b0fa_sri24_warp_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../${VISIT_REF}/diffusion/${branch}/registration/b0fa_sri24/ants_0Warp.nii.gz)
+
+    fa_to_baseline_pfx=${DIFFUSION_DIR}/${branch}/longitudinal/registration/fa_to_baseline/ants_
+    fa_to_baseline_affine=${fa_to_baseline_pfx}0GenericAffine.mat
+    if LWDP_needs_update_and_lock ${fa_to_baseline_affine} ${fa_subject} ${fa_at_baseline}; then
+      log_out=${fa_to_baseline_pfx}0GenericAffine.log
+      ants antsRegistration -d 3 -u -w [0.005,0.995] -r [${fa_subject},${fa_at_baseline},1] -t Rigid[0.1] -m MI[${fa_subject},${fa_at_baseline},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${fa_subject},${fa_at_baseline},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${fa_to_baseline_pfx} > ${log_out}
+      LWDP_lockfile_delete ${fa_to_baseline_affine}
+    fi
+    fa_to_baseline_affine=$(LWDP_get_override_file ${fa_to_baseline_affine})
+
+    fa_to_baseline_warp=${fa_to_baseline_pfx}1Warp.nii.gz
+    if LWDP_needs_update_and_lock ${fa_to_baseline_warp} ${fa_subject} ${fa_at_baseline}; then
+      log_out=${fa_to_baseline_pfx}1Warp.log
+      ants antsRegistration -d 3 -u -w [0.005,0.995] --initial-moving-transform ${fa_to_baseline_affine} -t SyN[0.5,3,0.5] -m CC[${fa_subject},${fa_at_baseline},0.5,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${fa_to_baseline_pfx} > ${log_out}
+      LWDP_lockfile_delete ${fa_to_baseline_warp}
+    fi
+    export fa_to_baseline_warp=$(LWDP_get_override_file ${fa_to_baseline_warp})
+
+    fa_to_baseline_warp_inv=${fa_to_baseline_pfx}1InverseWarp.nii.gz
+    export fa_to_baseline_warp_inv=$(LWDP_get_override_file ${fa_to_baseline_warp_inv})
+
+    sri24_b0fa_warp=${DIFFUSION_DIR}/${branch}/registration/sri24_b0fa/ants_0Warp.nii.gz
+    if LWDP_needs_update_and_lock ${sri24_b0fa_warp} ${fa_subject} ${fa_atlas} ${sri24_b0fa_warp_at_baseline} ${fa_to_baseline_affine} ${fa_to_baseline_warp_inv}; then
+      ants antsApplyTransforms -d 3 -o [${sri24_b0fa_warp},1] -r ${fa_atlas} -t ${sri24_b0fa_warp_at_baseline} [${fa_to_baseline_affine},1] ${fa_to_baseline_warp_inv}
+      LWDP_lockfile_delete ${sri24_b0fa_warp}
+    fi
+    export sri24_b0fa_warp=$(LWDP_get_override_file ${sri24_b0fa_warp})
+
+    b0fa_sri24_warp=${DIFFUSION_DIR}/${branch}/registration/b0fa_sri24/ants_0Warp.nii.gz
+    if LWDP_needs_update_and_lock ${b0fa_sri24_warp} ${fa_subject} ${fa_atlas} ${fa_to_baseline_warp} ${fa_to_baseline_affine} ${b0fa_sri24_warp_at_baseline}; then
+      ants antsApplyTransforms -d 3 -o [${b0fa_sri24_warp},1] -r ${fa_subject} -t ${fa_to_baseline_warp} ${fa_to_baseline_affine} ${b0fa_sri24_warp_at_baseline}
+      LWDP_lockfile_delete ${b0fa_sri24_warp}
+    fi
+    export b0fa_sri24_warp=$(LWDP_get_override_file ${b0fa_sri24_warp})
+  fi
+fi
+
+#
+# Reslice scalar maps to atlas space
+#
+
+for map_idx in 0 1 2 3; do
+  input=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/${map[${map_idx}]}.nii.gz)
+  output=${DIFFUSION_DIR}/${branch}/reslice/sri24/affine/${map[${map_idx}]}.nii.gz
+  if LWDP_needs_update_and_lock ${output} ${input} ${xfm_t1_sri24} ${xfm_bl_t1} ${fa_atlas} ${xfm_t1_dwi}; then
+    ants antsApplyTransforms -d 3 -n Linear -i ${input} -r ${fa_atlas} -o ${output} -t ${sri24_t1_mtx_affine} ${t1_b0_mtx}
+    c3d c3d ${output} -type float -o ${output}
+    LWDP_lockfile_delete ${output}
+  fi
+done
+
+if [ "${branch}" == "pepolar" ]; then
+  ## for warp
+  #for map_idx in 0 1 2 3; do
+  #  input=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/${map[${map_idx}]}.nii.gz)
+  #  output=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp/${map[${map_idx}]}.nii.gz
+  #  if LWDP_needs_update_and_lock ${output} ${input} ${sri24_b0_warp} ${fa_atlas}; then
+  #    ants antsApplyTransforms -n Linear -i ${input} -r ${fa_atlas} -o ${output} -t ${sri24_b0_warp}
+  #    c3d c3d ${output} -type float -o ${output}
+  #    LWDP_lockfile_delete ${output}
+  #  fi
+  #done
+
+  #input[1]=${DIFFUSION_DIR}/${branch}/corrected/final/dti60-01.nii.gz
+  #input[2]=${DIFFUSION_DIR}/${branch}/corrected/final/bAverage.nii.gz
+  #output[1]=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp/b0.nii.gz
+  #output[2]=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp/bAverage.nii.gz
+  #for i in 1 2; do
+  #  if LWDP_needs_update_and_lock ${output[${i}]} ${input[${i}]} ${sri24_b0_warp} ${fa_atlas}; then
+  #    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${input[${i}]} -r ${fa_atlas} -o ${output[${i}]} -t ${sri24_b0_warp}
+  #    c3d c3d ${output[${i}]} -clip 0 inf -type float -o ${output[${i}]}
+  #    LWDP_lockfile_delete ${output[${i}]}
+  #  fi
+  #done
+
+  # for warp_refine
+  for map_idx in 0 1 2 3; do
+    input=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/${map[${map_idx}]}.nii.gz)
+    output=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/${map[${map_idx}]}.nii.gz
+    if LWDP_needs_update_and_lock ${output} ${input} ${sri24_b0fa_warp} ${fa_atlas}; then
+      ants antsApplyTransforms -n Linear -i ${input} -r ${fa_atlas} -o ${output} -t ${sri24_b0fa_warp}
+      c3d c3d ${output} -type float -o ${output}
+      LWDP_lockfile_delete ${output}
+    fi
+  done
+
+  input[1]=${DIFFUSION_DIR}/${branch}/corrected/final/dti60-01.nii.gz
+  input[2]=${DIFFUSION_DIR}/${branch}/corrected/final/bAverage.nii.gz
+  output[1]=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/b0.nii.gz
+  output[2]=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/bAverage.nii.gz
+  for i in 1 2; do
+    if LWDP_needs_update_and_lock ${output[${i}]} ${input[${i}]} ${sri24_b0fa_warp} ${fa_atlas}; then
+      ants antsApplyTransforms -n BlackmanWindowedSinc -i ${input[${i}]} -r ${fa_atlas} -o ${output[${i}]} -t ${sri24_b0fa_warp}
+      c3d c3d ${output[${i}]} -clip 0 inf -type float -o ${output[${i}]}
+      LWDP_lockfile_delete ${output[${i}]}
+    fi
+  done
+
+  if [ "${VISIT}" != "${VISIT_REF}" ]; then
+    # Correct inhomogeneity for followups
+    for map_idx in 0 1 2 3; do
+      smooth_width=6
+      pbmap_wm=${DATA_DIR}/sri24/sri24_pbmap_WM.nii.gz
+      input_b=${WORKDIR}/../${VISIT_REF}/diffusion/${branch}/reslice/sri24/warp_refine/${map[${map_idx}]}.nii.gz
+      input=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/${map[${map_idx}]}.nii.gz
+      bias=${DIFFUSION_DIR}/${branch}/longitudinal/reslice/sri24/warp_refine/${map[${map_idx}]}_bias_s${smooth_width}.nii.gz
+      if LWDP_needs_update_and_lock ${bias} ${input} ${input_b} ${pbmap_wm}; then
+        tmpdir=$(mktemp -d)
+        caret7 wb_command -volume-smoothing ${input_b} ${smooth_width} ${tmpdir}/image_b.nii.gz
+        caret7 wb_command -volume-smoothing ${input} ${smooth_width} ${tmpdir}/image_a.nii.gz
+        fsl fslcpgeom ${input_b} ${tmpdir}/image_b.nii.gz
+        fsl fslcpgeom ${input_b} ${tmpdir}/image_a.nii.gz
+        afni 3dcalc -a ${tmpdir}/image_a.nii.gz -b ${tmpdir}/image_b.nii.gz -c ${pbmap_wm} -expr "c*(b-a)" -prefix ${bias}
+        c3d c3d ${bias} -type float -o ${bias}
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${bias}
+      fi
+      output=${DIFFUSION_DIR}/${branch}/longitudinal/reslice/sri24/warp_refine/${map[${map_idx}]}.nii.gz
+      if LWDP_needs_update_and_lock ${output} ${input} ${bias}; then
+        c3d c3d ${input} ${bias} -add -type float -o ${output}
+        LWDP_lockfile_delete ${output}
+      fi
+    done
+  fi
+fi
+
+#
+# Reslice scalar maps to subject T1w space (for subcortical tissue segmentation etc.)
+#
+
+for map_idx in 0 1 2 3; do
+  input=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/${map[${map_idx}]}.nii.gz)
+  output=${DIFFUSION_DIR}/${branch}/reslice/subject_t1/${map[${map_idx}]}.nii.gz
+  if LWDP_needs_update_and_lock ${output} ${input} ${t2_mrbias} ${b0_t1_mtx}; then
+    ants antsApplyTransforms -d 3 -n Linear -i ${input} -r ${t2_mrbias} -o ${output} -t ${t1_b0_mtx}
+    c3d c3d ${output} -type float -o ${output}
+    LWDP_lockfile_delete ${output}
+  fi
+done
+
+#if [ "${VISIT}" != "baseline" ]; then
+#  for map_idx in 0 1 2 3; do
+#    input=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/${map[${map_idx}]}.nii.gz)
+#    output=${DIFFUSION_DIR}/${branch}/reslice/t1_baseline/${map[${map_idx}]}.nii.gz
+#    if LWDP_needs_update_and_lock ${output} ${input} ${t2_mrbias} ${t1_brain_to_baseline_affine} ${t1_brain_to_baseline_warp_inv} ${b0_t1_mtx}; then
+#      ants antsApplyTransforms -d 3 -n Linear -i ${input} -r ${t2_mrbias} -o ${output} -t [${t1_brain_to_baseline_affine},1] ${t1_brain_to_baseline_warp_inv} ${t1_b0_mtx}
+#      c3d c3d ${output} -type float -o ${output}
+#      LWDP_lockfile_delete ${output}
+#    fi
+#  done
+#fi
+
+#
+# Reslice scalar maps to sri24_padded space
+#
+
+for map_idx in 0 1 2 3; do
+  input=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/${map[${map_idx}]}.nii.gz)
+  output=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/${map[${map_idx}]}.nii.gz
+  if LWDP_needs_update_and_lock ${output} ${input} ${sri24_padded_t1_brain} ${b0_t1_mtx}; then
+    ants antsApplyTransforms -d 3 -n Linear -i ${input} -r ${sri24_padded_t1_brain} -o ${output} -t ${sri24_padded_to_t1_rigid} ${t1_b0_mtx}
+    c3d c3d ${output} -type float -o ${output}
+    LWDP_lockfile_delete ${output}
+  fi
+done
+
+input[1]=${DIFFUSION_DIR}/${branch}/corrected/final/dti60-01.nii.gz
+input[2]=${DIFFUSION_DIR}/${branch}/corrected/final/bAverage.nii.gz
+output[1]=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/b0.nii.gz
+output[2]=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/bAverage.nii.gz
+for i in 1 2; do
+  if LWDP_needs_update_and_lock ${output[${i}]} ${input[${i}]} ${sri24_padded_t1_brain} ${sri24_padded_to_t1_rigid} ${b0_t1_mtx}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${input[${i}]} -r ${sri24_padded_t1_brain} -o ${output[${i}]} -t ${sri24_padded_to_t1_rigid} ${t1_b0_mtx}
+    c3d c3d ${output[${i}]} -clip 0 inf -type float -o ${output[${i}]}
+    LWDP_lockfile_delete ${output[${i}]}
+  fi
+done
+
+#
+# Reslice fiber tracking ROIs to subject DWI space
+#
+
+fa_subject_upsampled=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/fa_1_25mm.nii.gz)
+
+if [ "${branch}" == "pepolar" ]; then
+  for seedfile in ${DATA_DIR}/sri24/fiber_masks/*/seeds.nii*; do
+    roiname=$(echo $seedfile | sed 's/.*fiber_masks\///g; s/\/seeds.*//g')
+    output=${DIFFUSION_DIR}/${branch}/reslice/dwi/warp_refine/${roiname}/seeds.nii.gz
+    #if LWDP_needs_update_and_lock ${output} ${b0fa_sri24_warp} ${seedfile} ${fa_subject_upsampled}; then
+    if LWDP_needs_update_and_lock ${output} ${b0fa_sri24_warp} ${seedfile} ${fa_subject}; then
+      # choose MultiLabel params which preserves boundaries close to NN, but applying some mild smoothness
+      #ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${seedfile} -r ${fa_subject_upsampled} -o ${output} -t ${b0fa_sri24_warp}
+      ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${seedfile} -r ${fa_subject} -o ${output} -t ${b0fa_sri24_warp}
+      c3d c3d ${output} -type uchar -o ${output}
+      LWDP_lockfile_delete ${output}
+    fi
+
+    exclude_template=${DATA_DIR}/sri24/fiber_masks/${roiname}/exclude.nii.gz
+    if [ ! -s ${exclude_template} ]; then
+      exclude_template=""
+    fi
+
+    for waypoints in ${DATA_DIR}/sri24/fiber_masks/${roiname}/waypoints*.nii* ${exclude_template}; do
+      output=${DIFFUSION_DIR}/${branch}/reslice/dwi/warp_refine/${roiname}/$(basename $waypoints)
+      if LWDP_needs_update_and_lock ${output} ${b0fa_sri24_warp} ${waypoints} ${fa_subject}; then
+        # choose MultiLabel params which preserves boundaries close to NN, but applying some mild smoothness
+        ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${waypoints} -r ${fa_subject} -o ${output} -t  ${b0fa_sri24_warp}
+        c3d c3d ${output} -type uchar -o ${output}
+        LWDP_lockfile_delete ${output}
+      fi
+    done
+  done
+fi
+
+#
+# Run fiber tracking
+#
+
+#for ntens in 1; do ## 2 3
+#  tensors=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/tensors_${ntens}.Bdouble)
+#  for seedfile in ${DATA_DIR}/sri24/fiber_masks/*/seeds.nii*; do
+#    roiname=$(echo $seedfile | sed 's/.*fiber_masks\///g; s/\/seeds.*//g')
+#    if [ "${branch}" == "pepolar_cmtk" ]; then
+#      seedfile_subject=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/reslice/dwi/ffd_refine/${roiname}/seeds.nii)
+#    elif [ "${branch}" == "pepolar" ]; then
+#      seedfile_subject=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/reslice/dwi/warp_refine/${roiname}/seeds.nii)
+#    fi
+#    trackfile=${DIFFUSION_DIR}/${branch}/fibertrack/tensors_${ntens}/${roiname}/fibers.Bfloat
+#    if LWDP_needs_update_and_lock ${trackfile} ${seedfile_subject} ${fa_subject} ${tensors}; then
+#      tracking="track -tracker euler -stepsize 1.0 -interpolator linear -header ${fa_subject} -seedfile ${seedfile_subject} -outputfile ${trackfile} -curvethresh 60 -anisthresh 0.1"
+#      if [ "${ntens}" == "1" ]; then
+#        tracking+=" -inputmodel dt"
+#      else
+#        tracking+=" -inputmodel multitensor -maxcomponents ${ntens} -anisfile ${fa_subject}"
+#      fi
+#      zcat -fc ${tensors} | camino ${tracking}
+#      if [ -s ${trackfile} ]; then
+#        gzip -9f ${trackfile}
+#      else
+#        rm -f ${trackfile}
+#      fi
+#      LWDP_lockfile_delete ${trackfile}
+#    fi
+#
+#    exclude_template=${DATA_DIR}/sri24/fiber_masks/${roiname}/exclude.nii.gz
+#    if [ -s "${exclude_template}" ]; then
+#      if [ "${branch}" == "pepolar_cmtk" ]; then
+#        exclude_file=${DIFFUSION_DIR}/${branch}/reslice/dwi/ffd_refine/${roiname}/exclude.nii
+#      elif [ "${branch}" == "pepolar" ]; then
+#        exclude_file=${DIFFUSION_DIR}/${branch}/reslice/dwi/warp_refine/${roiname}/exclude.nii
+#      fi
+#      exclude_file=$(LWDP_get_override_file ${exclude_file})
+#      exclude=" -exclusionfile ${exclude_file}"
+#    else
+#      exclude_file=""
+#      exclude=""
+#    fi
+#
+#    for waypoints in ${DATA_DIR}/sri24/fiber_masks/${roiname}/waypoints*.nii*; do
+#      if [ "${branch}" == "pepolar_cmtk" ]; then
+#        waypoints_file=${DIFFUSION_DIR}/${branch}/reslice/dwi/ffd_refine/${roiname}/$(basename $waypoints)
+#      elif [ "${branch}" == "pepolar" ]; then
+#        waypoints_file=${DIFFUSION_DIR}/${branch}/reslice/dwi/warp_refine/${roiname}/$(basename $waypoints)
+#      fi
+#      waypoints_file=$(LWDP_get_override_file ${waypoints_file})
+#
+#      waypoints_name=$(echo $waypoints | sed 's/.*waypoints//g; s/\..*//g')
+#      trackfile_selected=${DIFFUSION_DIR}/${branch}/fibertrack/tensors_${ntens}/${roiname}/fibers_waypoints${waypoints_name}.Bfloat
+#      if LWDP_needs_update_and_lock ${trackfile_selected} ${trackfile} ${waypoints_file} ${exclude_file}; then
+#        if ! (zcat -fc ${trackfile} | camino procstreamlines -outputtracts -waypointfile ${waypoints_file} ${exclude} > ${trackfile_selected}); then
+#          # Remove output if pipeline failed
+#          rm  ${trackfile_selected}
+#        fi
+#
+#        if [ -s ${trackfile_selected} ]; then
+#          # Compress non-empty file
+#          gzip -9f ${trackfile_selected}
+#        else
+#          # Remove empty file
+#          rm -f ${trackfile_selected}
+#        fi
+#        rm -rf ${tmpdir}
+#        LWDP_lockfile_delete ${trackfile_selected}
+#      fi
+#
+#      trackfile_selected_vtk=${DIFFUSION_DIR}/${branch}/fibertrack/tensors_${ntens}/${roiname}/fibers_waypoints${waypoints_name}.vtk
+#      if LWDP_needs_update_and_lock ${trackfile_selected_vtk} ${trackfile_selected}; then
+#        if ! (zcat -fc ${trackfile_selected} | camino vtkstreamlines  -colourorient >  ${trackfile_selected_vtk}); then
+#          # delete file if processing failed
+#          rm -f ${trackfile_selected_vtk}
+#        fi
+#        if [ -s ${trackfile_selected_vtk} ]; then
+#          # Compress non-empty file
+#          gzip -9f ${trackfile_selected_vtk}
+#        else
+#          # Remove empty file
+#          rm -f ${trackfile_selected_vtk}
+#        fi
+#        LWDP_lockfile_delete ${trackfile_selected_vtk}
+#      fi
+#    done
+#  done
+# done
+
+#
+# measure mean intensity
+#
+
+for branch in pepolar; do
+  fa_atlas=${DATA_DIR}/sri24/sri24_fa.nii.gz
+  roi_image=${DATA_DIR}/sri24/parcellation/sri24_parc116.nii.gz
+  roi_label=${DATA_DIR}/sri24/parcellation/sri24_parc116.txt
+
+  if [ "${branch}" == "pepolar" ]; then
+    bAverage_aligned_to_atlas=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/bAverage.nii.gz
+    roi_measure=${DIFFUSION_DIR}/${branch}/measures/sri24/warp_refine/parc116_bAverage.csv
+  fi
+  #
+  if LWDP_needs_update_and_lock ${roi_measure} ${roi_image} ${bAverage_aligned_to_atlas}; then
+    if [ -e ${roi_measure} ]; then
+      rm -f ${roi_measure}
+    fi
+
+    echo "label,volume,mean" >> ${roi_measure}
+
+    roi_vol=`cmtk vol2csv ${roi_image} ${bAverage_aligned_to_atlas}`
+    roi_vol_num=`echo ${roi_vol} | wc -w`
+    roi_label_list=`cat ${roi_label} | tr -s "\t" " " | cut -d " " -f1,2 --output-delimiter=","`
+
+    for roi_vol_idx in `seq 3 ${roi_vol_num}`; do
+      roi_vol_i=`echo ${roi_vol} | cut -d " " -f${roi_vol_idx} | cut -d "," -f1`
+
+      found=0
+      for roi in ${roi_label_list}; do
+        roi_idx=`echo ${roi} | cut -d "," -f1`
+        roi_text=`echo ${roi} | cut -d "," -f2`
+        if [ ${roi_vol_i} -eq ${roi_idx} ]; then
+          found=1
+          break
+        fi
+      done
+      if [ ${found} -eq 0 ]; then
+        continue
+      fi
+
+      num=`echo ${roi_vol} | cut -d " " -f${roi_vol_idx} | cut -d "," -f2`
+      sum=`echo ${roi_vol} | cut -d " " -f${roi_vol_idx} | cut -d "," -f3`
+      num=`printf "%.0f" ${num}`
+      sum=`printf "%.6f" ${sum}`
+      roi_val=`printf "%.6f" $(bc -l <<< ${sum}/${num})`
+      echo "\"${roi_text}\",${num},${roi_val}" >> ${roi_measure}
+    done
+
+    LWDP_lockfile_delete ${roi_measure}
+  fi
+done
+
+#
+# Do skeletonization for TBSS
+#
+
+tbss_compute_mean_masked()
+{
+  local input_mod=$1
+  local mean_fa_mask=$2
+  local output_mod_mean_masked=$3
+
+  local tmpdir=$(mktemp -d)
+
+  X=$(fsl fslval ${input_mod} dim1); X=$(echo "$X 2 - p" | dc -)
+  Y=$(fsl fslval ${input_mod} dim2); Y=$(echo "$Y 2 - p" | dc -)
+  Z=$(fsl fslval ${input_mod} dim3); Z=$(echo "$Z 2 - p" | dc -)
+  fsl fslmaths ${input_mod} -min 1 -ero -roi 1 $X 1 $Y 1 $Z 0 1 ${tmpdir}/mod
+  fsl fslmaths ${tmpdir}/mod -mas ${mean_fa_mask} ${output_mod_mean_masked}
+
+  rm -rf ${tmpdir}
+}
+
+tbss_generate_skeleton()
+{
+  local branch=$1
+  local tbss_template=$2
+
+  if [ "${branch}" == "pepolar" ] || [ "${branch}" == "pepolar_long" ]; then
+    # factors computed by djk on 8/23/16 with new pipeline for eddy ffd_refine
+    #global_factor=("0.905606" "1.044563" "0.996833" "1.101418")
+    #global_add_factor=("-0.0524966" "0.0000354" "-0.0000045" "0.0001058")
+    # factors computed by djk on 9/08/16 with new pipeline for eddy warp
+    #global_factor=("0.928264" "1.031227" "1.002093" "1.062373")
+    #global_add_factor=("-0.0380634" "0.0000252" "0.0000025" "0.0000685")
+    # factors computed by djk on 9/16/16 with new pipeline for eddy warp_refine
+    global_factor=("0.926079" "1.041556" "1.007434" "1.079210")
+    global_add_factor=("-0.0393084" "0.0000336" "0.0000098" "0.0000866")
+    local_mul_factor[0]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/fa_GE_Siemens_local_mul.nii.gz
+    local_mul_factor[1]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/md_GE_Siemens_local_mul.nii.gz
+    local_mul_factor[2]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/l1_GE_Siemens_local_mul.nii.gz
+    local_mul_factor[3]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/lt_GE_Siemens_local_mul.nii.gz
+    local_add_factor[0]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/fa_GE_Siemens_local_add.nii.gz
+    local_add_factor[1]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/md_GE_Siemens_local_add.nii.gz
+    local_add_factor[2]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/l1_GE_Siemens_local_add.nii.gz
+    local_add_factor[3]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/lt_GE_Siemens_local_add.nii.gz
+  fi
+
+  # these are some conservative maximum values for each mod
+  clip_max=("1" "0.003" "0.004" "0.005")
+
+  if [ "${branch}" == "pepolar" ]; then
+    local tbss_template_dir=${DATA_DIR}/tbss/${branch}/${tbss_template}
+    local tbss_out_dir=${DIFFUSION_DIR}/${branch}/tbss/sri24/warp_refine/${tbss_template}
+  elif [ "${branch}" == "pepolar_long" ]; then
+    local tbss_template_dir=${DATA_DIR}/tbss/pepolar/${tbss_template}
+    local tbss_out_dir=${DIFFUSION_DIR}/pepolar/longitudinal/tbss/sri24/warp_refine/${tbss_template}
+  fi
+
+  # this is copied from stats_all with no correction factor
+  local mean_fa=${tbss_template_dir}/mean_FA.nii.gz
+  local mean_fa_mask=${tbss_template_dir}/mean_FA_mask.nii.gz
+  local mean_fa_skel_dst=${tbss_template_dir}/mean_FA_skeleton_mask_dst.nii.gz
+  local sri_cingulum=${DATA_DIR}/tbss/sri_cingulum.nii.gz
+
+  local mean_fa_corrected[1]=${tbss_template_dir}/mean_FA_corrected_global.nii.gz
+  local mean_fa_corrected[2]=${tbss_template_dir}/mean_FA_corrected_global.nii.gz
+  local mean_fa_corrected[3]=${tbss_template_dir}/mean_FA_corrected_local_mul.nii.gz
+  local mean_fa_corrected[4]=${tbss_template_dir}/mean_FA_corrected_local_mul.nii.gz
+  local mean_fa_corrected_skel_dst[1]=${tbss_template_dir}/mean_FA_corrected_global_skeleton_mask_dst.nii.gz
+  local mean_fa_corrected_skel_dst[2]=${tbss_template_dir}/mean_FA_corrected_global_skeleton_mask_dst.nii.gz
+  local mean_fa_corrected_skel_dst[3]=${tbss_template_dir}/mean_FA_corrected_local_mul_skeleton_mask_dst.nii.gz
+  local mean_fa_corrected_skel_dst[4]=${tbss_template_dir}/mean_FA_corrected_local_mul_skeleton_mask_dst.nii.gz
+
+  # Generate FA projection first
+  if [ "${branch}" == "pepolar" ]; then
+    local input_fa=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/fa.nii)
+  elif [ "${branch}" == "pepolar_long" ]; then
+    local input_fa=$(LWDP_get_override_file ${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/fa.nii)
+  fi
+  local fa_mean_masked=${tbss_out_dir}/fa_mean_masked.nii.gz
+  if LWDP_needs_update_and_lock ${fa_mean_masked} ${input_fa} ${mean_fa_mask}; then
+    tbss_compute_mean_masked ${input_fa} ${mean_fa_mask} ${fa_mean_masked}
+    LWDP_lockfile_delete ${fa_mean_masked}
+  fi
+
+  local fa_skeleton=${tbss_out_dir}/fa_skeleton.nii.gz
+  if LWDP_needs_update_and_lock ${fa_skeleton} ${mean_fa} ${mean_fa_skel_dst} ${fa_mean_masked} ${sri_cingulum}; then
+    fsl tbss_skeleton -i ${mean_fa} -p 0.2 ${mean_fa_skel_dst} ${sri_cingulum} ${fa_mean_masked} ${fa_skeleton}
+    LWDP_lockfile_delete ${fa_skeleton}
+  fi
+
+  local fa_corrected_mean_masked[1]=${tbss_out_dir}/fa_corrected_global_mean_masked.nii.gz
+  local fa_corrected_mean_masked[2]=${tbss_out_dir}/fa_corrected_global_add_mean_masked.nii.gz
+  local fa_corrected_mean_masked[3]=${tbss_out_dir}/fa_corrected_local_mul_mean_masked.nii.gz
+  local fa_corrected_mean_masked[4]=${tbss_out_dir}/fa_corrected_local_add_mean_masked.nii.gz
+  local fa_corrected_skeleton[1]=${tbss_out_dir}/fa_corrected_global_skeleton.nii.gz
+  local fa_corrected_skeleton[2]=${tbss_out_dir}/fa_corrected_global_add_skeleton.nii.gz
+  local fa_corrected_skeleton[3]=${tbss_out_dir}/fa_corrected_local_mul_skeleton.nii.gz
+  local fa_corrected_skeleton[4]=${tbss_out_dir}/fa_corrected_local_add_skeleton.nii.gz
+  for corr_idx in 1 2 3 4; do
+    if LWDP_needs_update_and_lock ${fa_corrected_mean_masked[${corr_idx}]} ${fa_mean_masked}; then
+      if [ "${SITE}" == "A" -o "${SITE}" == "D" ]; then
+        if [ ${corr_idx} -eq 1 ]; then
+          # fsl fslmaths  ${fa_mean_masked} -mul 0.911261182 ${fa_corrected_mean_masked[${corr_idx}]}
+          # Factor published in NI:
+          # fsl fslmaths  ${fa_mean_masked} -mul 0.916201 ${fa_corrected_mean_masked[${corr_idx}]}
+          fsl fslmaths  ${fa_mean_masked} -mul ${global_factor[0]} ${fa_corrected_mean_masked[${corr_idx}]}
+        elif [ ${corr_idx} -eq 2 ]; then
+          fsl fslmaths  ${fa_mean_masked} -add ${global_add_factor[0]} ${fa_corrected_mean_masked[${corr_idx}]}
+        elif [ ${corr_idx} -eq 3 ]; then
+          # multiply local factor and clip intensities
+          c3d c3d ${fa_mean_masked} ${local_mul_factor[0]} -multiply -clip 0 ${clip_max[0]} -o ${fa_corrected_mean_masked[${corr_idx}]}
+        elif [ ${corr_idx} -eq 4 ]; then
+          # add local factor and clip intensities
+          c3d c3d ${fa_mean_masked} ${local_add_factor[0]} -add -clip 0 ${clip_max[0]} -o ${fa_corrected_mean_masked[${corr_idx}]}
+        fi
+      else
+        cp ${fa_mean_masked} ${fa_corrected_mean_masked[${corr_idx}]}
+      fi
+      LWDP_lockfile_delete ${fa_corrected_mean_masked[${corr_idx}]}
+    fi
+    if LWDP_needs_update_and_lock ${fa_corrected_skeleton[${corr_idx}]} ${mean_fa_corrected[${corr_idx}]} ${mean_fa_corrected_skel_dst[${corr_idx}]} ${sri_cingulum} ${fa_corrected_mean_masked[${corr_idx}]}; then
+      fsl tbss_skeleton -i ${mean_fa_corrected[${corr_idx}]} -p 0.2 ${mean_fa_corrected_skel_dst[${corr_idx}]} ${sri_cingulum} ${fa_corrected_mean_masked[${corr_idx}]} ${fa_corrected_skeleton[${corr_idx}]}
+      LWDP_lockfile_delete ${fa_corrected_skeleton[${corr_idx}]}
+    fi
+  done
+
+  # Now project the other diffusion measures
+  for mod in md l1 lt; do
+    if [ "${branch}" == "pepolar" ]; then
+      local input_mod=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/${mod}.nii)
+    elif [ "${branch}" == "pepolar_long" ]; then
+      local input_mod=$(LWDP_get_override_file ${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/${mod}.nii)
+    fi
+    local output_mean_masked=${tbss_out_dir}/${mod}_mean_masked.nii.gz
+
+    if LWDP_needs_update_and_lock ${output_mean_masked} ${input_mod} ${mean_fa_mask}; then
+      tbss_compute_mean_masked ${input_mod} ${mean_fa_mask} ${output_mean_masked}
+      LWDP_lockfile_delete ${output_mean_masked}
+    fi
+
+    local output_mod=${tbss_out_dir}/${mod}_skeleton.nii.gz
+    if LWDP_needs_update_and_lock ${output_mod} ${mean_fa} ${mean_fa_skel_dst} ${sri_cingulum} ${fa_mean_masked} ${output_mean_masked} ; then
+      fsl tbss_skeleton -i ${mean_fa} -p 0.2 ${mean_fa_skel_dst} ${sri_cingulum} ${fa_mean_masked} ${output_mod} -a ${output_mean_masked}
+      LWDP_lockfile_delete ${output_mod}
+    fi
+
+    local output_corrected_mod[1]=${tbss_out_dir}/${mod}_corrected_global_skeleton.nii.gz
+    local output_corrected_mod[2]=${tbss_out_dir}/${mod}_corrected_global_add_skeleton.nii.gz
+    local output_corrected_mod[3]=${tbss_out_dir}/${mod}_corrected_local_mul_skeleton.nii.gz
+    local output_corrected_mod[4]=${tbss_out_dir}/${mod}_corrected_local_add_skeleton.nii.gz
+    for corr_idx in 1 2 3 4; do
+      # test code
+      if [ ${corr_idx} -eq 1 ]; then
+        local mod_corrected=${tbss_out_dir}/${mod}_corrected_global_mean_masked.nii.gz
+        if LWDP_needs_update_and_lock ${mod_corrected} ${output_mean_masked}; then
+          if [ "${SITE}" == "A" -o "${SITE}" == "D" ]; then
+            if [ "$mod" == "md" ]; then
+              fsl fslmaths ${output_mean_masked} -mul ${global_factor[1]} ${mod_corrected}
+            elif [ "$mod" == "l1" ]; then
+              fsl fslmaths ${output_mean_masked} -mul ${global_factor[2]} ${mod_corrected}
+            elif [ "$mod" == "lt" ]; then
+              fsl fslmaths ${output_mean_masked} -mul ${global_factor[3]} ${mod_corrected}
+            fi
+          else
+            cp ${output_mean_masked} ${mod_corrected}
+          fi
+          LWDP_lockfile_delete ${mod_corrected}
+        fi
+      fi
+      #
+      if LWDP_needs_update_and_lock ${output_corrected_mod[${corr_idx}]} ${output_mean_masked} ${mean_fa_corrected[${corr_idx}]} ${mean_fa_corrected_skel_dst[${corr_idx}]} ${sri_cingulum} ${fa_corrected_mean_masked[${corr_idx}]}; then
+        tmpdir=$(mktemp -d)
+
+        if [ "${SITE}" == "A" -o "${SITE}" == "D" ]; then
+          local mod_corrected=${tmpdir}/${mod}_mean_masked_corrected.nii.gz
+
+          if [ "$mod" == "md" ]; then
+            if [ ${corr_idx} -eq 1 ]; then
+              # factor=1.040387696
+              # Factor published in NI:
+              # factor=1.035314
+              fsl fslmaths ${output_mean_masked} -mul ${global_factor[1]} ${mod_corrected}
+            elif [ ${corr_idx} -eq 2 ]; then
+              fsl fslmaths ${output_mean_masked} -add ${global_add_factor[1]} ${mod_corrected}
+            elif [ ${corr_idx} -eq 3 ]; then
+              # multiply local factor and clip intensities
+              c3d c3d ${output_mean_masked} ${local_mul_factor[1]} -multiply -clip 0 ${clip_max[1]} -o ${mod_corrected}
+            elif [ ${corr_idx} -eq 4 ]; then
+              # add local factor and clip intensities
+              c3d c3d ${output_mean_masked} ${local_add_factor[1]} -add -clip 0 ${clip_max[1]} -o ${mod_corrected}
+            fi
+          fi
+          if [ "$mod" == "l1" ]; then
+            if [ ${corr_idx} -eq 1 ]; then
+              # factor=0.99854109
+              # Factor published in NI:
+              # factor=0.996488
+              fsl fslmaths ${output_mean_masked} -mul ${global_factor[2]} ${mod_corrected}
+            elif [ ${corr_idx} -eq 2 ]; then
+              fsl fslmaths ${output_mean_masked} -add ${global_add_factor[2]} ${mod_corrected}
+            elif [ ${corr_idx} -eq 3 ]; then
+              # multiply local factor and clip intensities
+              c3d c3d ${output_mean_masked} ${local_mul_factor[2]} -multiply -clip 0 ${clip_max[2]} -o ${mod_corrected}
+            elif [ ${corr_idx} -eq 4 ]; then
+              # add local factor and clip intensities
+              c3d c3d ${output_mean_masked} ${local_add_factor[2]} -add -clip 0 ${clip_max[2]} -o ${mod_corrected}
+            fi
+          fi
+          if [ "$mod" == "lt" ]; then
+            if [ ${corr_idx} -eq 1 ]; then
+              # factor=1.085982038
+              # Factor published in NI:
+              # factor= 1.077257
+              fsl fslmaths ${output_mean_masked} -mul ${global_factor[3]} ${mod_corrected}
+            elif [ ${corr_idx} -eq 2 ]; then
+              fsl fslmaths ${output_mean_masked} -add ${global_add_factor[3]} ${mod_corrected}
+            elif [ ${corr_idx} -eq 3 ]; then
+              # multiply local factor and clip intensities
+              c3d c3d ${output_mean_masked} ${local_mul_factor[3]} -multiply -clip 0 ${clip_max[3]} -o ${mod_corrected}
+            elif [ ${corr_idx} -eq 4 ]; then
+              # add local factor and clip intensities
+              c3d c3d ${output_mean_masked} ${local_add_factor[3]} -add -clip 0 ${clip_max[3]} -o ${mod_corrected}
+            fi
+          fi
+        else
+          mod_corrected=${output_mean_masked}
+        fi
+
+        fsl tbss_skeleton -i ${mean_fa_corrected[${corr_idx}]} -p 0.2 ${mean_fa_corrected_skel_dst[${corr_idx}]} ${sri_cingulum} ${fa_corrected_mean_masked[${corr_idx}]} ${output_corrected_mod[${corr_idx}]} -a ${mod_corrected}
+
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${output_corrected_mod[${corr_idx}]}
+      fi
+    done
+  done
+
+  ## phantoms use symbolic links which LWDP_needs_update_and_lock cannot deal with so check it this way
+  # local fa_skeleton_correction_factor=$3
+  # local fa_skeleton_corrected=${tbss_out_dir}/fa_skeleton_corrected.nii.gz
+  # if LWDP_needs_update_and_lock ${fa_skeleton_corrected} ${fa_skeleton}; then
+  #   if [ "${SITE}" == "A" -o "${SITE}" == "D" ]; then
+  #     CMD="fsl fslmaths ${fa_skeleton} -mul ${fa_skeleton_correction_factor} ${fa_skeleton_corrected}"
+  #   else
+  #     CMD="cp ${fa_skeleton} ${fa_skeleton_corrected}"
+  #   fi
+  #   log_and_execute "$CMD" ${fa_skeleton_corrected}
+  #   LWDP_lockfile_delete ${fa_skeleton_corrected}
+  # fi
+}
+
+TBSS_TEMPLATE_DIR=${DATA_DIR}/tbss/pepolar/ncanda_baseline_meet_criteria
+if [ -e "${TBSS_TEMPLATE_DIR}/mean_FA.nii.gz" ]; then
+  tbss_generate_skeleton pepolar ncanda_baseline_meet_criteria
+  if [ "${VISIT}" != "${VISIT_REF}" ]; then
+    tbss_generate_skeleton pepolar_long ncanda_baseline_meet_criteria
+  fi
+else
+  echo "INFO: ${TBSS_TEMPLATE_DIR} not found; skipping TBSS skeleton projection"
+fi
+
+#
+# Generate measures
+#
+
+measure_noise()
+{
+  local branch=$1
+
+  SEG=${DIFFUSION_DIR}/${branch}/reslice/b0_unwarp/sri24_parc116.nii.gz
+  B0=${DIFFUSION_DIR}/${branch}/corrected/final/dti60-01.nii.gz
+  OUT=${DIFFUSION_DIR}/${branch}/measures/final_b0_corpus_noise.csv
+
+  if LWDP_needs_update_and_lock ${OUT} ${SEG} ${B0}; then
+    tmpdir=$(mktemp -d)
+
+    cmtk convertx --set-padding 0 --thresh-below-to-padding 134 --thresh-above-to-padding 134 --map-values-only 134:1 $SEG  ${tmpdir}/bin.nii.gz
+
+    STATS=`cmtk statistics --mask  ${tmpdir}/bin.nii.gz ${B0} | sed '1d' | sed '2d' | tr $'\t' ,`
+    rm -rf $tmpdir
+
+    VALUES=`echo "$STATS" | tail -n1`
+    MEAN=`echo "$VALUES" | cut -d, -f4`
+
+    SDEV=`echo "$VALUES" | cut -d, -f5`
+    SNR=`python3 -c "print (${MEAN}/${SDEV})"`
+
+    # Rotation and tranlation component
+    traList=""
+    rotList=""
+    for bXname in `cat ${DIFFUSION_DIR}/${branch}/camino/inclusion_list.txt`; do
+      if [ "${branch}" == "pepolar" ]; then
+        idx=`echo ${bXname} | cut -d "-" -f2`
+        params=`sed "${idx}q;d" ${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp.eddy_parameters | tr -s " "`
+
+        trans_x=`echo ${params} | cut -d " " -f1`
+        trans_y=`echo ${params} | cut -d " " -f2`
+        trans_z=`echo ${params} | cut -d " " -f3`
+        rot_x=`echo ${params} | cut -d " " -f4`
+        rot_y=`echo ${params} | cut -d " " -f5`
+        rot_z=`echo ${params} | cut -d " " -f6`
+
+        # sumTrans=`python3 -c "a = [${trans_x},${trans_y},${trans_z}]; import numpy.linalg as np; print np.norm(a)"`
+        sumTrans=`python3 -c "import numpy.linalg as np; a = [${trans_x},${trans_y},${trans_z}]; print(np.norm(a))"`
+        sumRot=`python3 -c "a = [${rot_x},${rot_y},${rot_z}]; print (sum(abs(x) for x in a))"`
+      fi
+      if [ "${traList}" == "" ]; then
+        traList="${sumTrans}"
+        rotList="${sumRot}"
+      else
+        traList+=",${sumTrans}"
+        rotList+=",${sumRot}"
+      fi
+    done
+    avgTrans=`python3 -c "a = [${traList}]; print (sum(a)/len(a))"`
+    maxTrans=`python3 -c "x = [${traList}]; print (max(x))"`
+    avgRot=`python3 -c "a = [${rotList}]; print (sum(a)/len(a))"`
+    maxRot=`python3 -c "x = [${rotList}]; print (max(x))"`
+
+    echo "`echo "${STATS}" | head -n1 | sed -e "s/,/,B0_cc_/g" | cut -d, -f2-`,B0_cc_signal_to_noise_ratio,avg_sum_norm_translation,max_sum_norm_translation,avg_sum_abs_rotation,max_sum_abs_rotation" > ${OUT}
+    echo "`echo ${VALUES} | cut -d, -f2-`,${SNR},${avgTrans},${maxTrans},${avgRot},${maxRot}" >> ${OUT}
+
+    LWDP_lockfile_delete ${OUT}
+  fi
+}
+
+measure_noise pepolar
+
+measure_mori_values()
+{
+  local input_pfx=$1
+  local input_sfx=$2
+  local smask=$3
+  local output_pfx=$4
+  local output_sfx=$5
+
+  local mori_roi=${DATA_DIR}/sri24/parcellation/sri24_mori_roi_bilat_shifted.nii.gz
+  local mori_roi_bin=${DATA_DIR}/sri24/parcellation/sri24_mori_roi_bilat_shifted_bin.nii.gz
+  local mori_label=${DATA_DIR}/sri24/parcellation/sri24_mori_roi_bilat_shifted_short.txt
+  local map=("fa" "md" "l1" "lt")
+  local map_idx
+
+  if LWDP_needs_update_and_lock ${output_pfx}${map[0]}${output_sfx} ${input_pfx}${map[0]}${input_sfx} ${input_pfx}${map[1]}${input_sfx} ${input_pfx}${map[2]}${input_sfx} ${input_pfx}${map[3]}${input_sfx} ${mori_roi} ${smask}; then
+    tmpdir=$(mktemp -d)
+
+    # init header
+    header="subject,arm,visit"
+    for map_idx in 0 1 2 3; do
+      values[${map_idx}]="${SUBJECT},${ARM},${VISIT}"
+    done
+
+    # prepare masks
+    if [ "${smask}" != "" ]; then
+      c3d c3d ${mori_roi} ${smask} -multiply -o ${tmpdir}/mori_roi.nii.gz
+      c3d c3d ${mori_roi_bin} ${smask} -multiply -o ${tmpdir}/mori_roi_bin.nii.gz
+      mori_roi=${tmpdir}/mori_roi.nii.gz
+      mori_roi_bin=${tmpdir}/mori_roi_bin.nii.gz
+    fi
+
+    # global mori
+    header="${header},global_mori"
+    for map_idx in 0 1 2 3; do
+      input=${input_pfx}${map[${map_idx}]}${input_sfx}
+      roi_val=`fsl fslstats ${input} -k ${mori_roi_bin} -m | tr -d " "`
+      values[${map_idx}]="${values[${map_idx}]},${roi_val}"
+    done
+
+    # roi mori
+    for map_idx in 0 1 2 3; do
+      input=${input_pfx}${map[${map_idx}]}${input_sfx}
+      roi_vol[${map_idx}]=`cmtk vol2csv ${mori_roi} ${input}`
+    done
+
+    roi_vol_idx=1
+    for roi in `cat ${mori_label}`; do
+      roi_idx=`echo ${roi} | cut -d "," -f1`
+      roi_text=`echo ${roi} | cut -d "," -f2`
+      let roi_vol_idx++
+
+      if [ ${roi_idx} == "00" ]; then
+        continue
+      fi
+
+      header="${header},${roi_text}"
+      for map_idx in 0 1 2 3; do
+        num=`echo ${roi_vol[${map_idx}]} | cut -d " " -f${roi_vol_idx} | cut -d "," -f2`
+        sum=`echo ${roi_vol[${map_idx}]} | cut -d " " -f${roi_vol_idx} | cut -d "," -f3`
+        roi_val=`printf "%.6f" $(bc -l <<< ${sum}/${num})`
+        values[${map_idx}]="${values[${map_idx}]},${roi_val}"
+      done
+    done
+
+    for map_idx in 0 1 2 3; do
+      output=${output_pfx}${map[${map_idx}]}${output_sfx}
+      if [ -e ${output} ]; then
+        rm -f ${output}
+      fi
+      echo ${header} >> ${output}
+      echo ${values[${map_idx}]} >> ${output}
+    done
+
+    rm -rf ${tmpdir}
+
+    LWDP_lockfile_delete ${output_pfx}${map[0]}${output_sfx}
+  fi
+}
+
+for branch in pepolar pepolar_long; do
+  
+  if [ "${branch}" == "pepolar" ]; then
+    smask=${DATA_DIR}/tbss/${branch}/ncanda_baseline_meet_criteria/mean_FA_skeleton_mask.nii.gz
+    smask_corrected_global=${DATA_DIR}/tbss/${branch}/ncanda_baseline_meet_criteria/mean_FA_corrected_global_skeleton_mask.nii.gz
+    smask_corrected_local_mul=${DATA_DIR}/tbss/${branch}/ncanda_baseline_meet_criteria/mean_FA_corrected_local_mul_skeleton_mask.nii.gz
+
+    measure_mori_values "${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/" ".nii.gz" "" "${DIFFUSION_DIR}/${branch}/measures/mori_warp_refine_" ".csv"
+    if [ -e "${TBSS_TEMPLATE_DIR}/mean_FA.nii.gz" ]; then
+    measure_mori_values "${DIFFUSION_DIR}/${branch}/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_global_mean_masked.nii.gz" "" "${DIFFUSION_DIR}/${branch}/measures/mori_warp_refine_corrected_global_" ".csv"
+
+    measure_mori_values "${DIFFUSION_DIR}/${branch}/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_skeleton.nii.gz" "${smask}" "${DIFFUSION_DIR}/${branch}/measures/mori_ncanda_baseline_meet_criteria_" "_skeleton.csv"
+    measure_mori_values "${DIFFUSION_DIR}/${branch}/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_global_skeleton.nii.gz" "${smask_corrected_global}" "${DIFFUSION_DIR}/${branch}/measures/mori_ncanda_baseline_meet_criteria_" "_corrected_global_skeleton.csv"
+    measure_mori_values "${DIFFUSION_DIR}/${branch}/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_global_add_skeleton.nii.gz" "${smask_corrected_global}" "${DIFFUSION_DIR}/${branch}/measures/mori_ncanda_baseline_meet_criteria_" "_corrected_global_add_skeleton.csv"
+    measure_mori_values "${DIFFUSION_DIR}/${branch}/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_local_mul_skeleton.nii.gz" "${smask_corrected_local_mul}" "${DIFFUSION_DIR}/${branch}/measures/mori_ncanda_baseline_meet_criteria_" "_corrected_local_mul_skeleton.csv"
+    measure_mori_values "${DIFFUSION_DIR}/${branch}/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_local_add_skeleton.nii.gz" "${smask_corrected_local_mul}" "${DIFFUSION_DIR}/${branch}/measures/mori_ncanda_baseline_meet_criteria_" "_corrected_local_add_skeleton.csv"
+    fi
+  elif [ "${branch}" == "pepolar_long" ] && [ "${VISIT}" != "${VISIT_REF}" ]; then
+    smask=${DATA_DIR}/tbss/pepolar/ncanda_baseline_meet_criteria/mean_FA_skeleton_mask.nii.gz
+    smask_corrected_global=${DATA_DIR}/tbss/pepolar/ncanda_baseline_meet_criteria/mean_FA_corrected_global_skeleton_mask.nii.gz
+    smask_corrected_local_mul=${DATA_DIR}/tbss/pepolar/ncanda_baseline_meet_criteria/mean_FA_corrected_local_mul_skeleton_mask.nii.gz
+
+    measure_mori_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/" ".nii.gz" "" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/mori_warp_refine_" ".csv"
+    if [ -e "${TBSS_TEMPLATE_DIR}/mean_FA.nii.gz" ]; then
+    measure_mori_values "${DIFFUSION_DIR}/pepolar/longitudinal/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_global_mean_masked.nii.gz" "" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/mori_warp_refine_corrected_global_" ".csv"
+
+    measure_mori_values "${DIFFUSION_DIR}/pepolar/longitudinal/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_skeleton.nii.gz" "${smask}" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/mori_ncanda_baseline_meet_criteria_" "_skeleton.csv"
+    measure_mori_values "${DIFFUSION_DIR}/pepolar/longitudinal/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_global_skeleton.nii.gz" "${smask_corrected_global}" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/mori_ncanda_baseline_meet_criteria_" "_corrected_global_skeleton.csv"
+    measure_mori_values "${DIFFUSION_DIR}/pepolar/longitudinal/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_global_add_skeleton.nii.gz" "${smask_corrected_global}" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/mori_ncanda_baseline_meet_criteria_" "_corrected_global_add_skeleton.csv"
+    measure_mori_values "${DIFFUSION_DIR}/pepolar/longitudinal/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_local_mul_skeleton.nii.gz" "${smask_corrected_local_mul}" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/mori_ncanda_baseline_meet_criteria_" "_corrected_local_mul_skeleton.csv"
+    measure_mori_values "${DIFFUSION_DIR}/pepolar/longitudinal/tbss/sri24/warp_refine/ncanda_baseline_meet_criteria/" "_corrected_local_add_skeleton.nii.gz" "${smask_corrected_local_mul}" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/mori_ncanda_baseline_meet_criteria_" "_corrected_local_add_skeleton.csv"
+    fi
+  fi
+done
+
+#
+# Apply local correction factors
+#
+
+for branch in pepolar pepolar_long; do
+  if [ "${branch}" == "pepolar_long" ] && [ "${VISIT}" == "${VISIT_REF}" ]; then
+    continue
+  fi
+  if [ "${SITE}" == "A" -o "${SITE}" == "D" ]; then
+    map=("fa" "md" "l1" "lt")
+    # these are some conservative maximum values for each mod
+    clip_max=("1" "0.003" "0.004" "0.005")
+
+    for params in alpha_tv alpha_add_tv local_mul local_add local_avg_mul local_avg_add local_avg_whole_mul local_avg_whole_add; do
+      if [ "${branch}" == "pepolar" ] || [ "${branch}" == "pepolar_long" ]; then
+        # for ffd_refine
+        # for warp
+        # for warp refine
+        local_factor[0]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/fa_GE_Siemens_${params}.nii.gz
+        local_factor[1]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/md_GE_Siemens_${params}.nii.gz
+        local_factor[2]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/l1_GE_Siemens_${params}.nii.gz
+        local_factor[3]=${DATA_DIR}/dti_mfc_correction/pepolar/ncanda_human_phantoms/lt_GE_Siemens_${params}.nii.gz
+      fi
+      if [ ! -e ${local_factor[0]} ]; then
+        continue
+      fi
+
+      if [ "${branch}" == "pepolar" ]; then
+        corrected_dir=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/corrected/${params}
+      elif [ "${branch}" == "pepolar_long" ]; then
+        corrected_dir=${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/corrected/${params}
+      fi
+      [ -d ${corrected_dir} ] || mkdir -p ${corrected_dir}
+
+      for map_idx in 0 1 2 3; do
+        if [ "${branch}" == "pepolar" ]; then
+          mod_input=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/${map[${map_idx}]}.nii.gz
+        elif [ "${branch}" == "pepolar_long" ]; then
+          mod_input=${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/${map[${map_idx}]}.nii.gz
+        fi
+        mod_corrected=${corrected_dir}/${map[${map_idx}]}.nii.gz
+        if LWDP_needs_update_and_lock ${mod_corrected} ${mod_input} ${local_factor[${map_idx}]}; then
+          if [ "${params}" == "alpha_tv" ] || [ "${params}" == "local_mul" ] || [ "${params}" == "local_avg_mul" ] || [ "${params}" == "local_avg_whole_mul" ]; then
+            c3d c3d ${mod_input} ${local_factor[${map_idx}]} -multiply -clip 0 ${clip_max[${map_idx}]} -o ${mod_corrected}
+          elif [ "${params}" == "alpha_add_tv" ] || [ "${params}" == "local_add" ] || [ "${params}" == "local_avg_add" ] || [ "${params}" == "local_avg_whole_add" ]; then
+            c3d c3d ${mod_input} ${local_factor[${map_idx}]} -add -clip 0 ${clip_max[${map_idx}]} -o ${mod_corrected}
+          fi
+          LWDP_lockfile_delete ${mod_corrected}
+        fi
+      done
+
+      if [ "${branch}" == "pepolar" ]; then
+        measure_mori_values "${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/corrected/${params}/" ".nii.gz" "" "${DIFFUSION_DIR}/${branch}/measures/mori_warp_refine_corrected_${params}_" ".csv"
+      elif [ "${branch}" == "pepolar_long" ]; then
+        measure_mori_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/corrected/${params}/" ".nii.gz" "" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/mori_warp_refine_corrected_${params}_" ".csv"
+      fi
+    done
+  fi
+done
+
+#
+# measure global difference of aligned maps between baseline and followup
+#
+
+if [ "${VISIT}" != "baseline" ] && [ "${VISIT}" != "${VISIT_REF}" ]; then
+  sri24_brainmask=${DATA_DIR}/sri24/sri24_brainmask.nii.gz
+  map=("fa" "md" "l1" "lt")
+
+  for branch in pepolar; do
+    for map_idx in 0 1 2 3; do
+      mod_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../${VISIT_REF}/diffusion/${branch}/reslice/sri24/warp_refine/${map[${map_idx}]}.nii.gz)
+      mod=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/${map[${map_idx}]}.nii.gz
+      out=${DIFFUSION_DIR}/${branch}/measures/sri24/warp_refine/${map[${map_idx}]}_baseline_diff_avg.csv
+      if LWDP_needs_update_and_lock ${out} ${mod_at_baseline} ${mod}; then
+        tmpdir=$(mktemp -d)
+        afni 3dcalc -a ${mod} -b ${mod_at_baseline} -c ${sri24_brainmask} -expr 'abs(a-b)*c' -prefix ${tmpdir}/${map[${map_idx}]}_diff.nii.gz
+        diff_avg=`afni 3dmaskave -mask ${sri24_brainmask} -q ${tmpdir}/${map[${map_idx}]}_diff.nii.gz`
+        echo ${map[${map_idx}]}_baseline_diff_avg > ${out}
+        echo ${diff_avg} >> ${out}
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${out}
+      fi
+    done
+
+    fa_baseline_diff_avg_file=${DIFFUSION_DIR}/${branch}/measures/sri24/warp_refine/fa_baseline_diff_avg.csv
+    fa_baseline_diff_avg=`cat ${fa_baseline_diff_avg_file} | tail -n1`
+    # Q3 + IQS*3 = 0.05935
+    if [ $(echo "${fa_baseline_diff_avg} > 0.065" | bc) -eq 1 ]; then
+	PASS=${DIFFUSION_DIR}/${branch}/measures/sri24/warp_refine/fa_baseline_diff_avg.pass
+	if [ -e ${DIFFUSION_DIR}/${branch}/measures/sri24/warp_refine/fa_baseline_diff_avg.pass -a $fa_baseline_diff_avg_file -ot $PASS ]; then 
+ 	    echo "INFO:$WORKDIR:fa_baseline_diff_avg = ${fa_baseline_diff_avg} > 0.065 is ignored !" 
+	else
+	    echo "ERROR: ${WORKDIR}: fa_baseline_diff_avg = ${fa_baseline_diff_avg} > 0.065: compare ${WORKDIR}/../${VISIT_REF}/diffusion/${branch}/reslice/sri24/warp_refine/fa.nii.gz with ${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/fa.nii.gz fa to see if  ${VISIT} fa image looks corrupt!"
+	    exit 1 
+	fi
+    fi
+  done
+fi
+
+#
+# CONNECTOME ANALYSIS
+#
+
+if [ "$VISIT" != "baseline" ]; then 
+    if [ `echo $VISIT | cut -d_ -f2 | cut -dy -f1` -gt 6 ]; then 
+      echo "DEBUG:${WORKDIR}:Skipping connectivity analysis!"
+      exit 0
+    fi 
+fi 
+
+
+
+
+branch=pepolar
+#
+# BEDPOST  
+#
+
+
+function run_bedpost {
+   nf=3
+   bpx_dir=${DIFFUSION_DIR}/${branch}/bedpostx_nf${nf}
+   bpx_data=${bpx_dir}/data.nii.gz
+   bpx_mask=${bpx_dir}/nodif_brain_mask.nii.gz
+   bpx_bvecs=${bpx_dir}/bvecs
+   bpx_bvals=${bpx_dir}/bvals
+   if LWDP_needs_update_and_lock ${bpx_data} ${included_volumes_file} ${bval_file} ${dwi_unwarp_bvecs}; then
+     included_volumes_list=`cat ${included_volumes_file}`
+     bval_list=$(cat ${bval_file})
+     bvec_x_list=`sed "1q;d" ${dwi_unwarp_bvecs} | tr -s " "`
+     bvec_y_list=`sed "2q;d" ${dwi_unwarp_bvecs} | tr -s " "`
+     bvec_z_list=`sed "3q;d" ${dwi_unwarp_bvecs} | tr -s " "`
+     #
+     idx=1
+     bpx_data_list=
+     bpx_bval_list=
+     bpx_bvec_x_list=
+     bpx_bvec_y_list=
+     bpx_bvec_z_list=
+     for bX in ${bXlist}; do
+       volume_name=`basename ${bX} | cut -d "." -f1`
+       is_included=N
+       for f in ${included_volumes_list}; do
+         if [ "${volume_name}" == "${f}" ]; then
+           is_included=Y
+           break
+         fi
+       done
+       if [ "${is_included}" == "Y" ]; then
+         bpx_data_list="${bpx_data_list} ${DIFFUSION_DIR}/${branch}/corrected/unwarp/${f}.nii.gz"
+         bval=`echo ${bval_list} | cut -d " " -f${idx}`
+         bvec_x=`echo ${bvec_x_list} | cut -d " " -f${idx}`
+         bvec_y=`echo ${bvec_y_list} | cut -d " " -f${idx}`
+         bvec_z=`echo ${bvec_z_list} | cut -d " " -f${idx}`
+         # flip y and z directions
+         bvec_y=`python3 -c "print (-1.0 * ${bvec_y})"`
+         bvec_z=`python3 -c "print (-1.0 * ${bvec_z})"`
+         #
+         if [ "${bpx_bval_list}" == "" ]; then
+           bpx_bval_list="${bval}"
+           bpx_bvec_x_list="${bvec_x}"
+           bpx_bvec_y_list="${bvec_y}"
+           bpx_bvec_z_list="${bvec_z}"
+         else
+           bpx_bval_list="${bpx_bval_list} ${bval}"
+           bpx_bvec_x_list="${bpx_bvec_x_list} ${bvec_x}"
+           bpx_bvec_y_list="${bpx_bvec_y_list} ${bvec_y}"
+           bpx_bvec_z_list="${bpx_bvec_z_list} ${bvec_z}"
+         fi
+       fi
+       let idx++
+     done
+   
+     fsl fslmerge -t ${bpx_data} ${bpx_data_list}
+     echo ${bpx_bval_list} > ${bpx_bvals}
+     echo ${bpx_bvec_x_list} > ${bpx_bvecs}
+     echo ${bpx_bvec_y_list} >> ${bpx_bvecs}
+     echo ${bpx_bvec_z_list} >> ${bpx_bvecs}
+   
+     LWDP_lockfile_delete ${bpx_data}
+   fi
+
+   if LWDP_needs_update_and_lock ${bpx_mask} ${b0_brainmask}; then
+     c3d c3d ${b0_brainmask} -o ${bpx_mask}
+     LWDP_lockfile_delete ${bpx_mask}
+   fi
+
+   # run dtifit to check tensor directions
+   bpx_tensor_v1=${bpx_dir}/dtifit_V1.nii.gz
+   if LWDP_needs_update_and_lock ${bpx_tensor_v1} ${bpx_data} ${bpx_bvecs} ${bpx_bvals} ${bpx_mask}; then
+     fsl dtifit -k ${bpx_data} -r ${bpx_bvecs} -b ${bpx_bvals} -m ${bpx_mask} -o ${bpx_dir}/dtifit
+     LWDP_lockfile_delete ${bpx_tensor_v1}
+   fi
+
+   # Has to be run all together as we delete afterwards temp results 
+   bpx_mean_S0samples=${bpx_dir}/mean_S0samples.nii.gz
+   if LWDP_needs_update_and_lock ${bpx_mean_S0samples} ${bpx_data} ${bpx_mask}; then
+       bpx_tmp_dir=${bpx_dir}/tmp
+
+       # bedpostx_preproc     
+       [ -d ${bpx_tmp_dir}/preproc ] || mkdir -p ${bpx_tmp_dir}/preproc       
+       bpx_data_slice_pre=${bpx_tmp_dir}/preproc/data
+       bpx_data_slice=${bpx_data_slice_pre}_slice_0000.nii.gz
+       if LWDP_needs_update_and_lock ${bpx_data_slice} ${bpx_data}; then
+	   fsl fslslice ${bpx_data} ${bpx_data_slice_pre}
+	   LWDP_lockfile_delete ${bpx_data_slice}
+       fi
+
+       bpx_mask_slice_pre=${bpx_tmp_dir}/preproc/nodif_brain_mask
+       bpx_mask_slice=${bpx_mask_slice_pre}_slice_0000.nii.gz
+       if LWDP_needs_update_and_lock ${bpx_mask_slice} ${bpx_mask}; then
+	   fsl fslslice ${bpx_mask} ${bpx_mask_slice_pre}
+	   LWDP_lockfile_delete ${bpx_mask_slice}
+       fi
+       
+       # bedpostx_single_slice
+       [ -d ${bpx_tmp_dir}/diff_slices ] || mkdir -p ${bpx_tmp_dir}/diff_slices
+       nslices=`fsl fslval ${bpx_data} dim3`
+       nslices_1=`expr ${nslices} - 1`
+       idx=0
+       for slice in `seq 0 ${nslices_1}`; do
+	   slicezp=`fsl zeropad ${slice} 4`
+	   data_slice=${bpx_data_slice_pre}_slice_${slicezp}.nii.gz
+	   mask_slice=${bpx_mask_slice_pre}_slice_${slicezp}.nii.gz
+	   data_slice_dyads1=${bpx_tmp_dir}/diff_slices/data_slice_${slicezp}/dyads1.nii.gz
+	   log_out_tmp=${bpx_tmp_dir}/diff_slices/data_slice_${slicezp}.log
+	   if LWDP_needs_update ${data_slice_dyads1} ${data_slice} ${mask_slice}; then
+               #echo "processing slice ${slice}"
+               fsl xfibres --data=${data_slice} --mask=${mask_slice} -b ${bpx_dir}/bvals -r ${bpx_dir}/bvecs --forcedir --logdir=${bpx_tmp_dir}/diff_slices/data_slice_${slicezp} --nf=${nf} --fudge=1 --bi=1000 --nj=1250 --se=25 --model=1 --cnonlinear  &> ${log_out_tmp} &
+	   else
+               #echo "skipping slice ${slice}"
+               continue
+	   fi
+	   let idx++
+	   if [ `expr ${idx} % ${CMTK_NUM_THREADS}` == 0 ]; then
+               wait
+	   fi
+       done
+       wait
+
+       # checking output
+       for slice in `seq 0 ${nslices_1}`; do
+	   slicezp=`fsl zeropad ${slice} 4`
+	   data_slice_dyads1=${bpx_tmp_dir}/diff_slices/data_slice_${slicezp}/dyads1.nii.gz
+	   if [ ! -e ${data_slice_dyads1} ]; then
+               echo "ERROR:$ missing results for slice ${slice}"
+               LWDP_lockfile_delete ${data_slice_diff_multi_flag}
+               exit 1
+	   fi
+       done
+  
+       # bedpostx_postproc
+
+       numfib=`fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_0000/f*samples* | wc -w | awk '{print $1}'`
+       if [ `fsl imtest ${bpx_tmp_dir}/diff_slices/data_slice_0000/f0samples` -eq 1 ]; then
+	   numfib=$((${numfib} - 1))
+       fi
+
+       fib=1
+       while [ ${fib} -le ${numfib} ]; do
+	   fsl fslmerge -z ${bpx_dir}/merged_th${fib}samples `fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_*/th${fib}samples*`
+	   fsl fslmerge -z ${bpx_dir}/merged_ph${fib}samples `fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_*/ph${fib}samples*`
+	   fsl fslmerge -z ${bpx_dir}/merged_f${fib}samples  `fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_*/f${fib}samples*`
+	   fsl fslmaths ${bpx_dir}/merged_th${fib}samples -Tmean ${bpx_dir}/mean_th${fib}samples
+	   fsl fslmaths ${bpx_dir}/merged_ph${fib}samples -Tmean ${bpx_dir}/mean_ph${fib}samples
+	   fsl fslmaths ${bpx_dir}/merged_f${fib}samples -Tmean ${bpx_dir}/mean_f${fib}samples
+     
+	   fsl make_dyadic_vectors ${bpx_dir}/merged_th${fib}samples ${bpx_dir}/merged_ph${fib}samples ${bpx_dir}/nodif_brain_mask ${bpx_dir}/dyads${fib}
+	   if [ ${fib} -ge 2 ];then
+               fsl maskdyads ${bpx_dir}/dyads${fib} ${bpx_dir}/mean_f${fib}samples
+	   fi
+	   fib=$((${fib} + 1))
+       done
+       if [ `fsl imtest ${bpx_dir}/mean_f1samples` -eq 1 ];then
+	   fsl fslmaths ${bpx_dir}/mean_f1samples -mul 0 ${bpx_dir}/mean_fsumsamples
+	   fib=1
+	   while [ $fib -le $numfib ]; do
+               fsl fslmaths ${bpx_dir}/mean_fsumsamples -add ${bpx_dir}/mean_f${fib}samples ${bpx_dir}/mean_fsumsamples
+               fib=$((${fib} + 1))
+	   done
+       fi
+       if [ `fsl imtest ${bpx_tmp_dir}/diff_slices/data_slice_0000/mean_dsamples` -eq 1 ];then
+	   fsl fslmerge -z ${bpx_dir}/mean_dsamples `fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_*/mean_dsamples*`
+       else 
+	   echo "ERROR:$WORKDIR:fsl imtest ${bpx_tmp_dir}/diff_slices/data_slice_0000/mean_dsamples failed!"
+	   LWDP_lockfile_delete ${bpx_mean_S0samples}
+	   exit 1
+       fi 
+
+       if [ `fsl imtest ${bpx_tmp_dir}/diff_slices/data_slice_0000/mean_S0samples` -eq 1 ];then
+	   fsl fslmerge -z ${bpx_dir}/mean_S0samples `fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_*/mean_S0samples*`
+       else 
+	   echo "ERROR:$WORKDIR:fsl imtest ${bpx_tmp_dir}/diff_slices/data_slice_0000/mean_S0samples failed!"
+	   LWDP_lockfile_delete ${bpx_mean_S0samples}
+	   exit 1
+       fi 
+
+       # these are not produced by the ncanda pipeline but left them in for completness 
+       if [ `fsl imtest ${bpx_tmp_dir}/diff_slices/data_slice_0000/mean_d_stdsamples` -eq 1 ];then
+	   fsl fslmerge -z ${bpx_dir}/mean_d_stdsamples `fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_*/mean_d_stdsamples*`
+       fi
+       if [ `fsl imtest ${bpx_tmp_dir}/diff_slices/data_slice_0000/mean_f0samples` -eq 1 ];then
+	   fsl fslmerge -z ${bpx_dir}/mean_f0samples `fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_*/mean_f0samples*`
+       fi
+       if [ `fsl imtest ${bpx_tmp_dir}/diff_slices/data_slice_0000/mean_tausamples` -eq 1 ];then
+	   fsl fslmerge -z ${bpx_dir}/mean_tausamples `fsl imglob ${bpx_tmp_dir}/diff_slices/data_slice_*/mean_tausamples*`
+       fi
+   
+       # Check that it was successfull  
+       if [ `fsl imtest ${bpx_dir}/merged_th1samples` -eq 1 ];then
+	   if [ `fsl imtest ${bpx_dir}/merged_ph1samples` -eq 1 ];then
+               if [ `fsl imtest ${bpx_dir}/merged_f1samples` -eq 1 ];then
+		   # Everything ran successfull so those are not needed anymore 
+		   rm -rf ${bpx_tmp_dir}
+               fi
+	   fi
+       fi
+       
+       LWDP_lockfile_delete ${bpx_mean_S0samples}
+   fi
+
+   # not sure why this is needed    
+   xfms_eye=${bpx_dir}/xfms/eye.mat
+   if LWDP_needs_update_and_lock ${xfms_eye} ${bpx_data}; then
+     echo 1 0 0 0 > ${xfms_eye}
+     echo 0 1 0 0 >> ${xfms_eye}
+     echo 0 0 1 0 >> ${xfms_eye}
+     echo 0 0 0 1 >> ${xfms_eye}
+     LWDP_lockfile_delete ${xfms_eye}
+   fi
+}
+
+run_bedpost
+
+#
+# Separate the cortical White Matter from Gray Matter
+#
+
+function cortical_whitematter_graymatter_separation {
+
+  atropos_t1_ven_parc=${WORKDIR}/structural/segment/subject_t1/atropos/t1_ven_parc.nii.gz
+  atropos_b0_ven_parc=${DIFFUSION_DIR}/${branch}/reslice/b0_unwarp/ven_parc.nii.gz
+  if LWDP_needs_update_and_lock $atropos_b0_ven_parc ${atropos_t1_ven_parc} ${b0Unwarp} ${b0_t1_mtx}; then     
+      ants antsApplyTransforms -n MultiLabel -i ${atropos_t1_ven_parc} -r ${b0Unwarp} -o ${atropos_b0_ven_parc} -t ${b0_t1_mtx}
+      LWDP_lockfile_delete ${atropos_b0_ven_parc}
+  fi
+
+  ROI_DIR=${CONNECTOME_DIR}/roi
+  [ -d $ROI_DIR ] || mkdir -p $ROI_DIR
+
+  # Create smooth white matter mask with subcortical and ventricals filled in 
+  atropos_t1_seg_clean=${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg_clean.nii.gz
+  atropos_t1_gm_parc=${WORKDIR}/structural/segment/subject_t1/atropos/t1_gm_parc.nii.gz
+  b0_wm_filled_smooth_mask=${ROI_DIR}/wm_filled_smooth_mask.nii.gz
+  if LWDP_needs_update_and_lock ${b0_wm_filled_smooth_mask} ${b0_t1_mtx} ${b0Unwarp} $atropos_b0_ven_parc ${atropos_t1_seg_clean} ${atropos_t1_gm_parc}; then
+
+    ########
+    # -----------------------------------------------------------------
+    ## cortical regions: extract from the atlas mask (sri24_parc116 parcellation), map to b0 image, and dilate
+    tmpdir=$(mktemp -d)
+
+    # vox_resolution2=$(echo "`fsl fslinfo ${b0Unwarp} | grep pixdim1 | tr -s [:blank:] | cut -d ' ' -f 2`*2" | bc)
+    vox_resolution2=$(echo "`fsl fslval ${b0Unwarp} pixdim1 | tr -d ' '`*2" | bc)
+    
+    # ------------------
+    # white matter (WM): extract from the atlas mask, map to b0 image, and dilate
+    b0_atropos_seg=${tmpdir}/seg.nii.gz
+    ants antsApplyTransforms -n MultiLabel -i ${atropos_t1_seg_clean} -r ${b0Unwarp} -o ${b0_atropos_seg} -t ${b0_t1_mtx} &> ${tmpdir}/seg.log
+    b0_wm_mask=${tmpdir}/wm_mask.nii.gz
+    # -thr  : use following number to threshold current image (zero anything below the number)
+    fsl fslmaths ${b0_atropos_seg} -thr 3 -bin ${b0_wm_mask}
+
+    b0_atropos_ven=${tmpdir}/ven.nii.gz
+    fsl fslmaths $atropos_b0_ven_parc -bin -kernel sphere ${vox_resolution2} -dilD $b0_atropos_ven
+
+    # ------------------
+    # subcortex: extract from the atlas mask, map to b0 image, and dilate
+    b0_atropos_sub=${tmpdir}/sub.nii.gz
+    ants antsApplyTransforms -n MultiLabel -i ${atropos_t1_gm_parc} -r ${b0Unwarp} -o ${tmpdir}/gm_parc.nii.gz -t ${b0_t1_mtx} &> ${tmpdir}/gm_parc.log
+    # replace all subcortical roi intensities with value 1000
+    c3d c3d ${tmpdir}/gm_parc.nii.gz -replace 37 1000 38 1000 71 1000 72 1000 73 1000 74 1000 75 1000 76 1000 77 1000 78 1000 133 1000 134 1000 ${b0_atropos_sub}
+    fsl fslmaths ${b0_atropos_sub} -thr 999 -bin  -kernel sphere ${vox_resolution2} -dilD ${b0_atropos_sub}
+
+    # ------------------
+    # join together the above-extracted areas from WM, ventricles, and subcortex
+    b0_wm_filled_mask=${tmpdir}/wm_filled_mask.nii.gz
+    fsl fslmaths ${b0_atropos_sub} -add ${b0_atropos_ven} -add ${b0_wm_mask} -bin -kernel sphere 2.75 -ero -dilM ${tmpdir}/wm_filled_mask_temp.nii.gz
+    if [ "$SLICER_CLI" == "" ]; then
+      echo "ERROR: Load slicer"
+      exit 1
+    fi
+    ${SLICER_CLI}/IslandRemoval -m 20 ${tmpdir}/wm_filled_mask_temp.nii.gz ${b0_wm_filled_smooth_mask}
+    fsl fslcpgeom ${tmpdir}/wm_filled_mask_temp.nii.gz ${b0_wm_filled_smooth_mask}
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${b0_wm_filled_smooth_mask}
+  fi
+
+  # Extract boundary and parcellate it  
+  wm_gm_boundary=${ROI_DIR}/wm_gm_boundary_parc.nii.gz
+  if LWDP_needs_update_and_lock ${wm_gm_boundary} ${b0_parc} ${b0Unwarp} ${b0_wm_filled_smooth_mask}; then 
+    tmpdir=$(mktemp -d)  
+    # vox_resolution=$(fsl fslinfo ${b0Unwarp} | grep pixdim1 | tr -s [:blank:] | cut -d ' ' -f 2)
+    vox_resolution=$(fsl fslval ${b0Unwarp} pixdim1 | tr -d ' ')
+    vox_resolution2=$(echo "$vox_resolution*2" | bc)    
+    
+    # -replace I1 J1 I2 J2 ... Replace intensity I1 by J1, I2 by J2 and so on
+    c3d c3d ${b0_parc} -replace 37 0 38 0 71 0 72 0 73 0 74 0 75 0 76 0 77 0 78 0 ${tmpdir}/parc_dil_tmp.nii.gz
+
+    # filter out above percentile -uthr : use following number to upper-threshold current image (zero anything above the number)
+    # -kernel sphere <size>   : all voxels in a sphere of radius <size> mm centered on target voxel
+    # -dilD    : Modal Dilation of non-zero voxels
+    fsl fslmaths ${tmpdir}/parc_dil_tmp.nii.gz -uthr 90.5 -kernel sphere ${vox_resolution2} -dilD ${tmpdir}/parc_dil.nii.gz
+
+    ########
+    # -----------------------------------------------------------------
+    ## extract parcellated wm/gm boundary ##
+    fsl fslmaths  ${b0_wm_filled_smooth_mask} -edge -bin -kernel sphere ${vox_resolution} -dilM -mul  ${b0_wm_filled_smooth_mask} -mul ${tmpdir}/parc_dil.nii.gz ${wm_gm_boundary}
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${wm_gm_boundary}
+  fi
+
+  if [ ! -e $wm_gm_boundary ]; then 
+      echo "ERROR:$WORKDIR: $wm_gm_boundary is missing !"
+      exit 1
+  fi 
+
+  # Create ROI Label Maps 
+  for ROI in $ROI_LIST; do 
+      ROI_MAP=${ROI_DIR}/roi_`printf %02d $ROI`.nii.gz
+      if LWDP_needs_update_and_lock ${ROI_MAP} $wm_gm_boundary; then 
+	  c3d c3d $wm_gm_boundary -thresh $ROI $ROI 1 0 -type short ${ROI_MAP} 
+	  LWDP_lockfile_delete ${ROI_MAP}
+      fi
+  done 
+}
+
+CONNECTOME_DIR=${DIFFUSION_DIR}/pepolar/connectome
+ROI_LIST="$(seq 1 36) $(seq 39 70) $(seq 79 90)"
+
+cortical_whitematter_graymatter_separation
+
+#
+# Perform connectivity analysis 
+#
+
+# function converts hex or decimal numbers to decimal numbers 
+function convert_hex_to_dec {
+    infile=$1
+    if [ "$infile" == "" ]; then
+	echo "ERROR:$WORKDIR:check input of convert_hex_to_dec"
+	return 1 
+    fi 
+    if [ ! -e $infile ]; then 
+	echo "ERROR:$WORKDIR:convert_hex_to_dec:$infile does not exist!"
+	return 1 
+    fi
+   
+    # check if it is hex or dec 
+    firstNum=`head -n1 $infile | cut -d' ' -f1`
+    if [ "$firstNum" == `printf "%.0f" "$firstNum"` ]; then 
+	# is already dec so just return 
+	return 0 
+    fi
+
+    echo "INFO:$WORKDIR:Turning $infile from hexadecimal to decimal!"    
+    mv $infile ${infile}.orig
+
+    # Transfer number
+    while read line; do
+      for number in $line; do
+	# add free space bc that is how fsl writes it out 
+        printf "%.0f  " "$number" >> $infile
+      done
+      echo >> $infile
+    done < ${infile}.orig
+
+    return 0
+} 
+
+function probtrackx_seed_to_target {
+  SEED=$1
+  # Target has to be defined otherwise probtrackx2 does not work
+  TARGET_MAP_LIST="$2"
+  TYPE=$3
+  WAYPOINTS=$4
+
+  seed_map=${ROI_DIR}/${SEED}.nii.gz
+  prob_map_dir=${PROBTRACK_DIR}/${SEED}
+  waytotal=${prob_map_dir}/waytotal
+
+  seed_to_target_statistics=${prob_map_dir}/matrix_seeds_to_all_targets
+  if LWDP_needs_update_and_lock ${seed_to_target_statistics} ${tensor_map}_f1samples.nii.gz ${b0_wm_filled_smooth_mask} ${seed_map} $TARGET_MAP_LIST ${atropos_b0_ven_parc} $WAYPOINTS; then
+
+    num_samples=`fsl fslstats ${seed_map} -l 0 -u 2  -v | cut -d' ' -f1 | gawk '{ print int(10000 / $1) }'`
+
+    target_file=${prob_map_dir}/targets.txt
+    echo "$TARGET_MAP_LIST" | tr ' ' '\n' > ${target_file}
+    
+    CMD="fsl probtrackx2 -s ${tensor_map} -m ${b0_wm_filled_smooth_mask} --avoid=${atropos_b0_ven_parc} -x ${seed_map} --dir=${prob_map_dir} --forcedir --opd -o fdt_paths --targetmasks=${target_file} --os2t --s2tastext -l --nsamples=${num_samples}"
+
+    if [ $TYPE == "stop" ]; then
+      CMD="$CMD --stop=${target_file}"
+    fi
+
+    if  [ "$WAYPOINTS" != "" ]; then
+      waypoints_file=${prob_map_dir}/waypoints.txt
+      echo "$WAYPOINTS" | tr ' ' '\n' > ${waypoints_file}
+      CMD="$CMD --waypoints=${waypoints_file} --waycond=AND"
+    fi
+    echo "$CMD" > ${prob_map_dir}/probtrackx.cmd
+    $CMD &> ${prob_map_dir}/probtrackx.log
+    grep -i -e ERROR -e Missing ${prob_map_dir}/probtrackx.log
+    rm -f ${prob_map_dir}/seeds_to_roi_*.nii.gz
+
+    # do to bug in fsl sometimes writes out hex numbers
+    if ! convert_hex_to_dec $waytotal; then 
+	echo "ERROR:$WORKDIR:convert_hex_to_dec $waytotal failed !"
+	# so it is repeating analysis 
+	rm -f ${seed_to_target_statistics}
+	LWDP_lockfile_delete ${seed_to_target_statistics}
+	exit 1 
+    fi
+
+    if ! convert_hex_to_dec ${seed_to_target_statistics}; then 
+	echo "ERROR:$WORKDIR:convert_hex_to_dec ${seed_to_target_statistics} failed !"
+	# so it is repeating analysis 
+	rm -f ${seed_to_target_statistics}
+	LWDP_lockfile_delete ${seed_to_target_statistics}
+	exit 1 
+    fi
+
+    LWDP_lockfile_delete ${seed_to_target_statistics}
+  fi
+
+  seed_to_target_perc=${prob_map_dir}/all_targets_success_perc
+  if LWDP_needs_update_and_lock ${seed_to_target_perc}.csv ${seed_to_target_statistics} ${prob_map_dir}/targets.txt $waytotal; then
+    prob_map_dir_rel=${prob_map_dir#"${WORKDIR}/"}
+    CMD="${NCANDA_SOURCE_DIR}/utils/probtrackx_comp_perc.py $WORKDIR ${prob_map_dir_rel}"
+    $CMD &> ${seed_to_target_perc}.log
+    grep -i ERROR ${seed_to_target_perc}.log
+    LWDP_lockfile_delete ${seed_to_target_perc}.csv
+  fi
+}
+
+#
+# TEST PHASE
+#
+
+PROBTRACK_DIR=${CONNECTOME_DIR}/probtrackx
+[ -d $PROBTRACK_DIR ] || mkdir ${PROBTRACK_DIR}
+
+tensor_map=${bpx_dir}/merged
+
+for ROI in $ROI_LIST; do 
+      SEED=roi_`printf %02d $ROI`
+      TARGETS=""
+      for TAR in $ROI_LIST; do 
+	  if [ $TAR -eq $ROI ]; then 
+	      continue 
+	  fi 
+	  TARGETS="${TARGETS}${ROI_DIR}/roi_`printf %02d $TAR`.nii.gz "
+      done
+      probtrackx_seed_to_target $SEED "${TARGETS}" stop 
+      if [ ! -e ${seed_to_target_perc}.csv ]; then 
+	  echo "ERROR:$WORKDIR:failed to generate ${seed_to_target_perc}.csv!"
+	  exit 1 
+      fi 
+
+done

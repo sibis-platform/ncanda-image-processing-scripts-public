@@ -1,0 +1,8 @@
+Variable / Field Name,Form Name,Section Header,Field Type,Field Label,"Choices, Calculations, OR Slider Labels",Field Note,Text Validation Type OR Show Slider Number,Text Validation Min,Text Validation Max,Identifier?,Branching Logic (Show field only if...),Required Field?,Custom Alignment,Question Number (surveys only),Matrix Group Name,Matrix Ranking?,Field Annotation
+subject,wmsnr,,text,NCANDA Subject ID,,,,,,,,,,,,,
+arm,wmsnr,,dropdown,Study Arm,"standard, Standard Arm",,,,,,,,,,,,
+visit,wmsnr,,dropdown,Visit,"baseline, Baseline | followup_1y, Followup Year 1 | followup_2y, Followup Year 2 | followup_3y, Followup Year 3 | followup_4y, Followup Year 4",,,,,,,,,,,,
+SNR,wmsnr,,text,Signal-to-noise ratio within the white matter,,,number,,,,,,,,,,
+meanWM,wmsnr,,text,Mean intensity of white matter,,,number,,,,,,,,,,
+stdWM,wmsnr,,text,Standard deviation of white matter intensity,,,number,,,,,,,,,,
+voxWM,wmsnr,,text,Size of white matter in voxels,,,number,,,,,,,,,,

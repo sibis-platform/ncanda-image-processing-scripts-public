@@ -1,0 +1,12 @@
+Variable / Field Name,Form Name,Section Header,Field Type,Field Label,"Choices, Calculations, OR Slider Labels",Field Note,Text Validation Type OR Show Slider Number,Text Validation Min,Text Validation Max,Identifier?,Branching Logic (Show field only if...),Required Field?,Custom Alignment,Question Number (surveys only),Matrix Group Name,Matrix Ranking?
+subject,sri24_wm400,,text,NCANDA subject identification number,,,N-CANDA Subject ID,,,,,,,,,
+arm,sri24_wm400,,text,NCANDA protocol,,,,,,,,,,,,
+visit,sri24_wm400,,text,visit,,,Date (Y-M-D),,,,,,,,,
+sri24_wm400_wm_400_l_volume,sri24_wm400,,text,(total) volume of the left hemisphere of the subcortical white matter region (including the centrum semiovale),,mm^3,Number,,,,,,,,,
+sri24_wm400_wm_400_l_csf,sri24_wm400,,text,cerebral spinal fluid volume within the left hemisphere of the subcortical white matter region (including the centrum semiovale),,mm^3,Number,,,,,,,,,
+sri24_wm400_wm_400_l_gm,sri24_wm400,,text,gray matter volume within the left hemisphere of the subcortical white matter region (including the centrum semiovale),,mm^3,Number,,,,,,,,,
+sri24_wm400_wm_400_l_wm,sri24_wm400,,text,white matter volume within the left hemisphere of the subcortical white matter region (including the centrum semiovale),,mm^3,Number,,,,,,,,,
+sri24_wm400_wm_400_r_volume,sri24_wm400,,text,(total) volume of the right hemisphere of the subcortical white matter region (including the centrum semiovale),,mm^3,Number,,,,,,,,,
+sri24_wm400_wm_400_r_csf,sri24_wm400,,text,cerebral spinal fluid volume within the right hemisphere of the subcortical white matter region (including the centrum semiovale),,mm^3,Number,,,,,,,,,
+sri24_wm400_wm_400_r_gm,sri24_wm400,gray matter volume within the right hemisphere of the subcortical white matter region (including the centrum semiovale),text,,,mm^3,Number,,,,,,,,,
+sri24_wm400_wm_400_r_wm,sri24_wm400,,text,white matter volume within the right hemisphere of the subcortical white matter region (including the centrum semiovale),,mm^3,Number,,,,,,,,,

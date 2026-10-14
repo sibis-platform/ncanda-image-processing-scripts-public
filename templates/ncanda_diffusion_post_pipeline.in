@@ -1,0 +1,978 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+#
+# Initialization
+#
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+NCANDA_SOURCE_DIR=@NCANDA_SOURCE_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+#
+# setup input
+#
+ 
+DIFFUSION_DIR=${WORKDIR}/diffusion
+
+DWI6_DIR=${DIFFUSION_DIR}/native/dti6b500pepolar
+DWI60_DIR=${DIFFUSION_DIR}/native/dti60b1000
+if [ ! -d ${DWI6_DIR} -o ! -d ${DWI60_DIR} ]; then
+  echo "No DTI data: ${WORKDIR}"
+  exit 1
+fi
+
+FreeSurferFolder=${WORKDIR}/structural/freesurfer_refined/${SUBJECT}_${ARM}_${VISIT}
+if [ ! -d ${FreeSurferFolder} ]; then
+  echo "ERROR: No freesurfer_refined data: ${WORKDIR}"
+  exit 1
+fi
+
+VISIT_REF=baseline
+if [ "${VISIT}" != "baseline" ]; then
+  followup_year=`echo ${VISIT} | cut -d "_" -f2 | cut -d "y" -f1`
+  if [ ! -d ${WORKDIR}/../baseline/diffusion/native/dti6b500pepolar -o ! -d ${WORKDIR}/../baseline/diffusion/native/dti60b1000 ]; then
+    for year in `seq 1 ${followup_year}`; do
+      if [ -d ${WORKDIR}/../followup_${year}y/diffusion/native/dti6b500pepolar -o ! -d ${WORKDIR}/../followup_${year}y/diffusion/native/dti60b1000 ]; then
+        VISIT_REF=followup_${year}y
+        break
+      fi
+    done
+  fi
+  if [ "${VISIT_REF}" != "baseline" ]; then
+    echo "WARNING: the reference visit is ${VISIT_REF}"
+  fi
+fi
+
+#
+# Main program
+#
+
+branch=pepolar
+
+if [ -d ${DIFFUSION_DIR}/resampled/dti60b1000 ]; then
+  bXlist=$(LWDP_get_override_files_list ${DIFFUSION_DIR}/resampled/dti60b1000/dti60-*.nii.gz)
+else
+  bXlist=$(LWDP_get_override_files_list ${DIFFUSION_DIR}/native/dti60b1000/dti60-*.nii.gz)
+fi
+
+#inp[1]=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/reslice/b0_unwarp/b0_brain.nii.gz)
+#out[1]=${DIFFUSION_DIR}/${branch}/hcp/hcp_b0/b0_brain.nii.gz
+#for i in 1; do
+#  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]}; then
+#    # adopted from fslreorient2std procedure
+#    prefix=`echo ${out[${i}]} | rev | cut -d . -f3- | rev`
+#    scode=`fsl fslval ${inp[${i}]} sform_code | tr -d " "`
+#    qcode=`fsl fslval ${inp[${i}]} qform_code | tr -d " "`
+#    if [ "${scode}" == "0" -a "${qcode}" == "0" ]; then
+#      echo "ERROR: Orientation information not stored in ${inp[${i}]}!"
+#      exit 1
+#    fi
+#    pattern=sto_xyz
+#    if [ "${scode}" == "0" ]; then
+#      pattern=qto_xyz
+#    fi
+#    fsl fslhd ${inp[${i}]} | grep ${pattern} | awk '{ print $2 " " $3 " " $4 " " $5  }' > ${prefix}.mat
+#    det=`fsl avscale ${prefix}.mat | grep Determinant | awk '{ print $3 }'`
+#    echo "# Determinant: ${det}" > ${prefix}.log
+#    if [ X`echo "if ( $det < 0 ) { 1 }" | bc -l` = X1 ]; then
+#      # radiological case (negative determinant)
+#      echo "fsl fslswapdim ${inp[${i}]} RL PA IS ${out[${i}]}" >> ${prefix}.log
+#      fsl fslswapdim ${inp[${i}]} RL PA IS ${out[${i}]}
+#    else
+#      echo "fsl fslswapdim ${inp[${i}]} LR PA IS ${out[${i}]}" >> ${prefix}.log
+#      fsl fslswapdim ${inp[${i}]} LR PA IS ${out[${i}]}
+#    fi
+#    LWDP_lockfile_delete ${out[${i}]}
+#  fi
+#done
+#hcp_b0_brain=${out[1]}
+
+fs_ribbon=${FreeSurferFolder}/mri/ribbon.mgz
+hcp_t1_mrbias=${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias.nii.gz
+hcp_t1_brain=${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias_brain.nii.gz
+
+#hcp_t1_hcp_b0_pfx=${DIFFUSION_DIR}/${branch}/registration/hcp_t1_hcp_b0/epi_reg
+#hcp_t1_hcp_b0_affine=${hcp_t1_hcp_b0_pfx}.mat
+#if LWDP_needs_update_and_lock ${hcp_t1_hcp_b0_affine} ${fs_ribbon} ${hcp_b0_brain} ${hcp_t1_mrbias} ${hcp_t1_brain}; then
+#  tmpdir=$(mktemp -d)
+#  mri_convert -rt nearest -rl ${hcp_t1_mrbias} ${fs_ribbon} ${tmpdir}/ribbon.nii.gz
+#  # djk: create epi_reg_fast_wmseg.nii.gz file to turn around a bug of epi_reg (fsl 5.0.6)
+#  c3d c3d ${tmpdir}/ribbon.nii.gz -replace 2 1 3 0 41 1 42 0 -o ${hcp_t1_hcp_b0_pfx}_fast_wmseg.nii.gz
+#  fsl epi_reg --epi=${hcp_b0_brain} --t1=${hcp_t1_mrbias} --t1brain=${hcp_t1_brain} --wmseg=${hcp_t1_hcp_b0_pfx}_fast_wmseg.nii.gz --noclean -v --out=${hcp_t1_hcp_b0_pfx} >& ${hcp_t1_hcp_b0_pfx}.log
+#  # djk: remove dangling link
+#  rm ${hcp_t1_hcp_b0_pfx}_fast_wmseg
+#  rm -rf ${tmpdir}
+#  LWDP_lockfile_delete ${hcp_t1_hcp_b0_affine}
+#fi
+## convert fsl mtx to itk tfm
+#hcp_t1_hcp_b0_affine_tfm=${hcp_t1_hcp_b0_pfx}.tfm
+#if LWDP_needs_update_and_lock ${hcp_t1_hcp_b0_affine_tfm} ${hcp_t1_hcp_b0_affine} ${hcp_b0_brain} ${hcp_t1_mrbias}; then
+#  c3d c3d_affine_tool -ref ${hcp_t1_mrbias} -src ${hcp_b0_brain} ${hcp_t1_hcp_b0_affine} -fsl2ras -oitk ${hcp_t1_hcp_b0_affine_tfm}
+#  LWDP_lockfile_delete ${hcp_t1_hcp_b0_affine_tfm}
+#fi
+#
+#b0fa_t1_refine_affine=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/registration/b0fa_t1_refine/ants_0GenericAffine.mat)
+#b0fa_t1_refine_warp=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/registration/b0fa_t1_refine/ants_1Warp.nii.gz)
+#b0fa_t1_refine_warp_inv=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/registration/b0fa_t1_refine/ants_1InverseWarp.nii.gz)
+#b0fa_t1_refine_mtx="${b0fa_t1_refine_warp} ${b0fa_t1_refine_affine}"
+#t1_b0fa_refine_mtx="[${b0fa_t1_refine_affine},1] ${b0fa_t1_refine_warp_inv}"
+
+b0_brain=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/reslice/b0_unwarp/b0_brain.nii.gz)
+b0_brainmask=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/reslice/b0_unwarp/brainmask.nii.gz)
+
+hcp_t1_b0_pfx=${DIFFUSION_DIR}/${branch}/registration/hcp_t1_b0/epi_reg
+hcp_t1_b0_affine=${hcp_t1_b0_pfx}.mat
+if LWDP_needs_update_and_lock ${hcp_t1_b0_affine} ${fs_ribbon} ${b0_brain} ${hcp_t1_mrbias} ${hcp_t1_brain}; then
+  tmpdir=$(mktemp -d)
+  mri_convert -rt nearest -rl ${hcp_t1_mrbias} ${fs_ribbon} ${tmpdir}/ribbon.nii.gz
+  # djk: create epi_reg_fast_wmseg.nii.gz file to turn around a bug of epi_reg (fsl 5.0.6)
+  c3d c3d ${tmpdir}/ribbon.nii.gz -replace 2 1 3 0 41 1 42 0 -o ${hcp_t1_b0_pfx}_fast_wmseg.nii.gz
+  fsl epi_reg --epi=${b0_brain} --t1=${hcp_t1_mrbias} --t1brain=${hcp_t1_brain} --wmseg=${hcp_t1_b0_pfx}_fast_wmseg.nii.gz --noclean -v --out=${hcp_t1_b0_pfx} >& ${hcp_t1_b0_pfx}.log
+  # djk: remove dangling link
+  rm ${hcp_t1_b0_pfx}_fast_wmseg
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${hcp_t1_b0_affine}
+fi
+# convert fsl mtx to itk tfm
+hcp_t1_b0_affine_tfm=${hcp_t1_b0_pfx}.tfm
+if LWDP_needs_update_and_lock ${hcp_t1_b0_affine_tfm} ${hcp_t1_b0_affine} ${b0_brain} ${hcp_t1_mrbias}; then
+  c3d c3d_affine_tool -ref ${hcp_t1_mrbias} -src ${b0_brain} ${hcp_t1_b0_affine} -fsl2ras -oitk ${hcp_t1_b0_affine_tfm}
+  LWDP_lockfile_delete ${hcp_t1_b0_affine_tfm}
+fi
+
+#
+# Prepare structural transformations
+#
+
+t1_sri24_affine=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_0GenericAffine.mat)
+t1_sri24_warp=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_1Warp.nii.gz)
+t1_sri24_warp_inv=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_1InverseWarp.nii.gz)
+if [ ! -e  ${t1_sri24_affine} ] ; then
+  echo "ERROR: ${t1_sri24_affine} is missing."
+  exit 1
+    fi
+if [ ! -e  ${t1_sri24_warp} ] ; then
+  echo "ERROR: ${t1_sri24_warp} is missing."
+  exit 1
+fi
+if [ ! -e  ${t1_sri24_warp_inv} ] ; then
+  echo "ERROR: ${t1_sri24_warp_inv} is missing."
+  exit 1
+fi
+if [ "${VISIT}" == "baseline" ]; then
+  t1_sri24_mtx="${t1_sri24_warp} ${t1_sri24_affine}"
+  t1_sri24_mtx_affine="${t1_sri24_affine}"
+  sri24_t1_mtx="[${t1_sri24_affine},1] ${t1_sri24_warp_inv}"
+  sri24_t1_mtx_affine="[${t1_sri24_affine},1]"
+  #
+  sri24_padded_t1_brain=${WORKDIR}/structural/reslice/sri24_padded/t1_brain.nii.gz
+  sri24_padded_to_t1_rigid=${WORKDIR}/structural/registration/sri24_padded_to_t1/ants_rigid_0GenericAffine.mat
+else
+  t1_brain_to_baseline_affine=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_0GenericAffine.mat)
+  t1_brain_to_baseline_warp=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_1Warp.nii.gz)
+  t1_brain_to_baseline_warp_inv=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_1InverseWarp.nii.gz)
+  if [ ! -e  ${t1_brain_to_baseline_affine} ] ; then
+    echo "ERROR: ${t1_brain_to_baseline_affine} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${t1_brain_to_baseline_warp} ] ; then
+    echo "ERROR: ${t1_brain_to_baseline_warp} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${t1_brain_to_baseline_warp_inv} ] ; then
+    echo "ERROR: ${t1_brain_to_baseline_warp_inv} is missing."
+    exit 1
+  fi
+  t1_sri24_mtx="${t1_brain_to_baseline_warp} ${t1_brain_to_baseline_affine} ${t1_sri24_warp} ${t1_sri24_affine}"
+  t1_sri24_mtx_affine="${t1_brain_to_baseline_warp} ${t1_brain_to_baseline_affine} ${t1_sri24_affine}"
+  sri24_t1_mtx="[${t1_sri24_affine},1] ${t1_sri24_warp_inv} [${t1_brain_to_baseline_affine},1] ${t1_brain_to_baseline_warp_inv}"
+  sri24_t1_mtx_affine="[${t1_sri24_affine},1] [${t1_brain_to_baseline_affine},1] ${t1_brain_to_baseline_warp_inv}"
+  #
+  sri24_padded_t1_brain=${WORKDIR}/structural/reslice/sri24_padded/corrected/t1_brain.nii.gz
+  sri24_padded_to_t1_rigid=${WORKDIR}/structural/longitudinal/registration/baseline_sri24_padded_to_t1/ants_rigid_0GenericAffine.mat
+fi
+
+b0_t1_pfx=${DIFFUSION_DIR}/${branch}/registration/b0_t1/ants_
+b0_t1_affine=${b0_t1_pfx}0GenericAffine.mat
+b0_t1_warp=${b0_t1_pfx}1Warp.nii.gz
+b0_t1_warp_inv=${b0_t1_pfx}1InverseWarp.nii.gz
+b0_t1_mtx="${b0_t1_warp} ${b0_t1_affine}"
+t1_b0_mtx="[${b0_t1_affine},1] ${b0_t1_warp_inv}"
+
+#
+# perform probabilistic tractography
+#
+
+included_volumes_file=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/camino/inclusion_list.txt)
+bval_file=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/corrected/bval.txt)
+dwi_unwarp_bvecs=$(LWDP_get_override_file ${DIFFUSION_DIR}/${branch}/corrected/dwi_unwarp.eddy_rotated_bvecs)
+
+# bedpostx is now run in ncanda_diffusion_pipeline
+# #nf=2
+#nf=3
+# if [ ${nf} -eq 2 ]; then
+#  bpx_dir=${DIFFUSION_DIR}/${branch}/bedpostx
+#else
+#  bpx_dir=${DIFFUSION_DIR}/${branch}/bedpostx_nf${nf}
+#fi
+
+
+#
+# Run autoptx
+#
+
+#if [ "${VISIT}" == "${VISIT_REF}" ]; then
+
+autoptx_dir=${DIFFUSION_DIR}/${branch}/autoptx
+
+# register fa map to fmrib
+fa_subject=${bpx_dir}/dtifit_FA.nii.gz
+fa_fmrib=${FSLDIR}/data/standard/FMRIB58_FA_1mm.nii.gz
+
+fa_to_fmrib_pfx=${DIFFUSION_DIR}/${branch}/registration/fa_fmrib/ants_
+fa_to_fmrib_affine=${fa_to_fmrib_pfx}0GenericAffine.mat
+if LWDP_needs_update_and_lock ${fa_to_fmrib_affine} ${fa_subject} ${fa_fmrib}; then
+  log_out=${fa_to_fmrib_pfx}0GenericAffine.log
+  ants antsRegistration -d 3 -u -w [0.005,0.995] -r [${fa_subject},${fa_fmrib},1] -t Rigid[0.1] -m MI[${fa_subject},${fa_fmrib},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${fa_subject},${fa_fmrib},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -o ${fa_to_fmrib_pfx} > ${log_out}
+  #
+  ants antsApplyTransforms -d 3 -n Linear -i ${fa_fmrib} -r ${fa_subject} -o ${fa_to_fmrib_pfx}0GenericAffine_fmrib.nii.gz -t ${fa_to_fmrib_affine}
+  #
+  LWDP_lockfile_delete ${fa_to_fmrib_affine}
+fi
+fa_to_fmrib_affine=$(LWDP_get_override_file ${fa_to_fmrib_affine})
+
+fa_to_fmrib_warp=${fa_to_fmrib_pfx}1Warp.nii.gz
+if LWDP_needs_update_and_lock ${fa_to_fmrib_warp} ${fa_subject} ${fa_fmrib}; then
+  log_out=${fa_to_fmrib_pfx}1Warp.log
+  ants antsRegistration -d 3 -u -w [0.005,0.995] --initial-moving-transform ${fa_to_fmrib_affine} -t SyN[0.5,3,0.5] -m CC[${fa_subject},${fa_fmrib},0.5,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${fa_to_fmrib_pfx} > ${log_out}
+  #
+  ants antsApplyTransforms -d 3 -n Linear -i ${fa_fmrib} -r ${fa_subject} -o ${fa_to_fmrib_pfx}1Warp_fmrib.nii.gz -t ${fa_to_fmrib_warp} ${fa_to_fmrib_affine}
+  #
+  LWDP_lockfile_delete ${fa_to_fmrib_warp}
+fi
+export fa_to_fmrib_warp=$(LWDP_get_override_file ${fa_to_fmrib_warp})
+
+#std2nat_warp=${autoptx_dir}/std2nat_warp.nii.gz
+#if LWDP_needs_update_and_lock ${std2nat_warp} ${fa_subject} ${fa_fmrib}; then
+#  fsl fsl_reg ${fa_subject} ${fa_fmrib} ${autoptx_dir}/nat2std -e -FA
+#  fsl invwarp -r ${fa_subject} -w ${autoptx_dir}/nat2std_warp.nii.gz -o ${std2nat_warp}
+#  LWDP_lockfile_delete ${std2nat_warp}
+#fi
+
+refvol=${autoptx_dir}/refVol.nii.gz
+if LWDP_needs_update_and_lock ${refvol} ${fa_subject}; then
+  fsl flirt -in ${fa_subject} -ref ${fa_subject} -applyisoxfm 1 -out ${refvol}
+  fsl fslmaths ${refvol} -mul 0 ${refvol}
+  LWDP_lockfile_delete ${refvol}
+fi
+
+structures=${DATA_DIR}/autoptx/structureList
+snum=`cat ${structures} | wc -l`
+for sidx in `seq 1 ${snum}`; do
+  line=`sed -n "${sidx}p;d" ${structures}`
+  struct=`echo ${line} | cut -d " " -f1` 
+  tracts=${autoptx_dir}/tracts/${struct}
+  tracts_norm=${tracts}/tracts/tractsNorm.nii.gz
+  #if LWDP_needs_update_and_lock ${tracts_norm} ${std2nat_warp} ${refvol} ${bpx_mean_dsamples} ${bpx_mask}; then
+  if LWDP_needs_update_and_lock ${tracts_norm} ${fa_to_fmrib_warp} ${fa_to_fmrib_affine} ${refvol} ${bpx_mean_dsamples} ${bpx_mask}; then
+    seedm=`echo ${line} | cut -d " " -f2` 
+    nSeed=$(echo "scale=0; 1000 * ${seedm} / 1"|bc)
+    masks=${DATA_DIR}/autoptx/protocols/${struct}
+    
+    # is there a stop criterion defined in the protocol for this struct?
+    if [ -e ${masks}/stop.nii.gz ]; then
+      useStop=1
+    else
+      useStop=0
+    fi
+    # does the protocol defines a second run with inverted seed / target masks
+    if [ -e ${masks}/invert ]; then
+      symtrack=1
+      rm -f ${tracts}/tractsInv/waytotal
+    else
+      symtrack=0
+    fi
+    
+    # transform masks
+    #fsl applywarp -r ${refvol} -w ${std2nat_warp} -i ${masks}/seed.nii.gz -o ${tracts}/seed.nii.gz -d float
+    ants antsApplyTransforms -d 3 -n Linear -i ${masks}/seed.nii.gz -r ${refvol} -o ${tracts}/seed.nii.gz -t ${fa_to_fmrib_warp} ${fa_to_fmrib_affine}
+    fsl fslmaths ${tracts}/seed.nii.gz -thr 0.1 -bin ${tracts}/seed.nii.gz -odt char
+    #fsl applywarp -r ${refvol} -w ${std2nat_warp} -i ${masks}/target.nii.gz -o ${tracts}/target.nii.gz -d float
+    ants antsApplyTransforms -d 3 -n Linear -i ${masks}/target.nii.gz -r ${refvol} -o ${tracts}/target.nii.gz -t ${fa_to_fmrib_warp} ${fa_to_fmrib_affine}
+    fsl fslmaths ${tracts}/target.nii.gz -thr 0.1 -bin ${tracts}/target.nii.gz -odt char
+    #fsl applywarp -r ${refvol} -w ${std2nat_warp} -i ${masks}/exclude.nii.gz -o ${tracts}/exclude.nii.gz -d float
+    ants antsApplyTransforms -d 3 -n Linear -i ${masks}/exclude.nii.gz -r ${refvol} -o ${tracts}/exclude.nii.gz -t ${fa_to_fmrib_warp} ${fa_to_fmrib_affine}
+    fsl fslmaths ${tracts}/exclude.nii.gz -thr 0.1 -bin ${tracts}/exclude.nii.gz -odt char
+    if [ "${useStop}" -eq "1" ]; then
+      #fsl applywarp -r ${refvol} -w ${std2nat_warp} -i ${masks}/stop.nii.gz -o ${tracts}/stop.nii.gz -d float
+      ants antsApplyTransforms -d 3 -n Linear -i ${masks}/stop.nii.gz -r ${refvol} -o ${tracts}/stop.nii.gz -t ${fa_to_fmrib_warp} ${fa_to_fmrib_affine}
+      fsl fslmaths ${tracts}/stop.nii.gz -thr 0.1 -bin ${tracts}/stop.nii.gz -odt char
+    fi
+    
+    # process structure
+    if [ "${useStop}" -eq "1" ]; then
+      fsl probtrackx -s ${bpx_dir}/merged -m ${bpx_dir}/nodif_brain_mask.nii.gz -x ${tracts}/seed.nii.gz -o density --waypoints=${tracts}/target.nii.gz --stop=${tracts}/stop.nii.gz --nsamples=${nSeed} --opd --dir=${tracts}/tracts --avoid=${tracts}/exclude.nii.gz -l --forcedir
+      if [ "${symtrack}" -eq "1" ]; then
+        fsl probtrackx -s ${bpx_dir}/merged -m ${bpx_dir}/nodif_brain_mask.nii.gz -x ${tracts}/target.nii.gz -o density --waypoints=${tracts}/seed.nii.gz --stop=${tracts}/stop.nii.gz --nsamples=${nSeed} --opd --dir=${tracts}/tractsInv --avoid=${tracts}/exclude.nii.gz -l --forcedir
+      fi
+    else
+      fsl probtrackx -s ${bpx_dir}/merged -m ${bpx_dir}/nodif_brain_mask.nii.gz -x ${tracts}/seed.nii.gz -o density --waypoints=${tracts}/target.nii.gz --nsamples=${nSeed} --opd --dir=${tracts}/tracts --avoid=${tracts}/exclude.nii.gz -l --forcedir
+      if [ "${symtrack}" -eq "1" ]; then
+        fsl probtrackx -s ${bpx_dir}/merged -m ${bpx_dir}/nodif_brain_mask.nii.gz -x ${tracts}/target.nii.gz -o density --waypoints=${tracts}/seed.nii.gz --nsamples=${nSeed} --opd --dir=${tracts}/tractsInv --avoid=${tracts}/exclude.nii.gz -l --forcedir
+      fi
+    fi
+    
+    # merge runs for forward and inverted tractography runs
+    if [ "${symtrack}" = "1" ]; then
+      fsl immv ${tracts}/tracts/density.nii.gz ${tracts}/tractsInv/fwDensity.nii.gz
+      fsl fslmaths ${tracts}/tractsInv/fwDensity.nii.gz -add ${tracts}/tractsInv/density.nii.gz ${tracts}/tracts/density.nii.gz
+      way1=`cat ${tracts}/tracts/waytotal | sed 's/e/\\*10^/' | tr -d '+' `
+      mv ${tracts}/tracts/waytotal ${tracts}/tractsInv/fwWaytotal
+      way2=`cat ${tracts}/tractsInv/waytotal | sed 's/e/\\*10^/' | tr -d '+' `
+      way=$(echo "scale=5; ${way1} + ${way2} "|bc)
+      echo ${way} > ${tracts}/tracts/waytotal
+    fi
+    
+    # perform normalisation for waytotal
+    waytotal=`cat ${tracts}/tracts/waytotal`
+    fsl fslmaths ${tracts}/tracts/density.nii.gz -div ${waytotal} -range ${tracts_norm} -odt float
+
+    LWDP_lockfile_delete ${tracts_norm}
+  fi
+
+  fa_atlas=${DATA_DIR}/sri24/sri24_fa.nii.gz
+  sri24_b0fa_warp=${DIFFUSION_DIR}/${branch}/registration/sri24_b0fa/ants_0Warp.nii.gz
+  input=${tracts}/tracts/tractsNorm.nii.gz
+  output=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/autoptx/tractsNorm/${struct}.nii.gz
+  if LWDP_needs_update_and_lock ${output} ${input} ${sri24_b0fa_warp} ${fa_atlas}; then
+    ants antsApplyTransforms -d 3 -n Linear -i ${input} -r ${fa_atlas} -o ${output} -t ${sri24_b0fa_warp}
+    c3d c3d ${output} -type float -o ${output}
+    LWDP_lockfile_delete ${output}
+  fi
+
+  input=${tracts}/tracts/tractsNorm.nii.gz
+  output=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/tractsNorm/${struct}.nii.gz
+  if LWDP_needs_update_and_lock ${output} ${input} ${sri24_padded_t1_brain} ${b0_t1_mtx}; then
+    ants antsApplyTransforms -d 3 -n Linear -i ${input} -r ${sri24_padded_t1_brain} -o ${output} -t ${sri24_padded_to_t1_rigid} ${t1_b0_mtx}
+    c3d c3d ${output} -type float -o ${output}
+    LWDP_lockfile_delete ${output}
+  fi
+done
+# merge left right
+structures=${DATA_DIR}/autoptx/structureListLR
+snum=`cat ${structures} | wc -l`
+for sidx in `seq 1 ${snum}`; do
+  line=`sed -n "${sidx}p;d" ${structures}`
+  struct=`echo ${line} | cut -d " " -f1`
+
+  inputL=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/autoptx/tractsNorm/${struct}_l.nii.gz
+  inputR=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/autoptx/tractsNorm/${struct}_r.nii.gz
+  output=${DIFFUSION_DIR}/${branch}/reslice/sri24/warp_refine/autoptx/tractsNorm/${struct}.nii.gz
+  if [ -e ${inputL} ] && [ -e ${inputR} ]; then
+    if LWDP_needs_update_and_lock ${output} ${inputL} ${inputR}; then
+      c3d c3d ${inputL} ${inputR} -add -o ${output}
+      LWDP_lockfile_delete ${output}
+    fi
+  fi
+
+  inputL=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/tractsNorm/${struct}_l.nii.gz
+  inputR=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/tractsNorm/${struct}_r.nii.gz
+  output=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/tractsNorm/${struct}.nii.gz
+  if [ -e ${inputL} ] && [ -e ${inputR} ]; then
+    if LWDP_needs_update_and_lock ${output} ${inputL} ${inputR}; then
+      c3d c3d ${inputL} ${inputR} -add -o ${output}
+      LWDP_lockfile_delete ${output}
+    fi
+  fi
+done
+
+#fi
+
+for map_id in FA L1 L2 L3 MD; do
+  input=${DIFFUSION_DIR}/${branch}/bedpostx_nf3/dtifit_${map_id}.nii.gz
+  output=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/dtifit_${map_id}.nii.gz
+  if LWDP_needs_update_and_lock ${output} ${input} ${sri24_padded_t1_brain} ${b0_t1_mtx}; then
+    ants antsApplyTransforms -d 3 -n Linear -i ${input} -r ${sri24_padded_t1_brain} -o ${output} -t ${sri24_padded_to_t1_rigid} ${t1_b0_mtx}
+    c3d c3d ${output} -type float -o ${output}
+    LWDP_lockfile_delete ${output}
+  fi
+done
+
+input=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/dtifit_FA.nii.gz
+output=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/fa.nii.gz
+if LWDP_needs_update_and_lock ${output} ${input} ${sri24_padded_t1_brain} ${b0_t1_mtx}; then
+  c3d c3d ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/dtifit_FA.nii.gz -o ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/fa.nii.gz
+  c3d c3d ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/dtifit_MD.nii.gz -o ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/md.nii.gz
+  c3d c3d ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/dtifit_L1.nii.gz -o ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/l1.nii.gz
+  c3d c3d ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/dtifit_L2.nii.gz ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/dtifit_L3.nii.gz -add -o ${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/lt.nii.gz
+  LWDP_lockfile_delete ${output}
+
+fi
+
+if [ "${VISIT}" != "${VISIT_REF}" ]; then
+  # correct inhomogeneity for followups
+  map=("fa" "md" "l1" "lt")
+  for map_idx in 0 1 2 3; do
+    smooth_width=6
+    input_b=${WORKDIR}/../${VISIT_REF}/diffusion/${branch}/reslice/sri24_padded/autoptx/${map[${map_idx}]}.nii.gz
+    input=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/${map[${map_idx}]}.nii.gz
+    bias=${DIFFUSION_DIR}/${branch}/longitudinal/reslice/sri24_padded/autoptx/${map[${map_idx}]}_bias_s${smooth_width}.nii.gz
+    if LWDP_needs_update_and_lock ${bias} ${input} ${input_b}; then
+      tmpdir=$(mktemp -d)
+      caret7 wb_command -volume-smoothing ${input_b} ${smooth_width} ${tmpdir}/image_b.nii.gz
+      caret7 wb_command -volume-smoothing ${input} ${smooth_width} ${tmpdir}/image_a.nii.gz
+      fsl fslcpgeom ${input_b} ${tmpdir}/image_b.nii.gz
+      fsl fslcpgeom ${input_b} ${tmpdir}/image_a.nii.gz
+      afni 3dcalc -a ${tmpdir}/image_a.nii.gz -b ${tmpdir}/image_b.nii.gz -expr "(b-a)" -prefix ${bias}
+      c3d c3d ${bias} -type float -o ${bias}
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${bias}
+    fi
+    output=${DIFFUSION_DIR}/${branch}/longitudinal/reslice/sri24_padded/autoptx/${map[${map_idx}]}.nii.gz
+    if LWDP_needs_update_and_lock ${output} ${input} ${bias}; then
+      c3d c3d ${input} ${bias} -add -type float -o ${output}
+      LWDP_lockfile_delete ${output}
+    fi
+  done
+
+  for structures in ${DATA_DIR}/autoptx/structureList ${DATA_DIR}/autoptx/structureListLR; do
+    snum=`cat ${structures} | wc -l`
+    for sidx in `seq 1 ${snum}`; do
+      line=`sed -n "${sidx}p;d" ${structures}`
+      struct=`echo ${line} | cut -d " " -f1`
+      smooth_width=6
+      input_b=${WORKDIR}/../${VISIT_REF}/diffusion/${branch}/reslice/sri24_padded/autoptx/tractsNorm/${struct}.nii.gz
+      input=${DIFFUSION_DIR}/${branch}/reslice/sri24_padded/autoptx/tractsNorm/${struct}.nii.gz
+      bias=${DIFFUSION_DIR}/${branch}/longitudinal/reslice/sri24_padded/autoptx/tractsNorm/${struct}_bias_s${smooth_width}.nii.gz
+      if LWDP_needs_update_and_lock ${bias} ${input} ${input_b}; then
+        tmpdir=$(mktemp -d)
+        caret7 wb_command -volume-smoothing ${input_b} ${smooth_width} ${tmpdir}/image_b.nii.gz
+        caret7 wb_command -volume-smoothing ${input} ${smooth_width} ${tmpdir}/image_a.nii.gz
+        fsl fslcpgeom ${input_b} ${tmpdir}/image_b.nii.gz
+        fsl fslcpgeom ${input_b} ${tmpdir}/image_a.nii.gz
+        afni 3dcalc -a ${tmpdir}/image_a.nii.gz -b ${tmpdir}/image_b.nii.gz -expr "(b-a)" -prefix ${bias}
+        c3d c3d ${bias} -type float -o ${bias}
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${bias}
+      fi
+      output=${DIFFUSION_DIR}/${branch}/longitudinal/reslice/sri24_padded/autoptx/tractsNorm/${struct}.nii.gz
+      if LWDP_needs_update_and_lock ${output} ${input} ${bias}; then
+        c3d c3d ${input} ${bias} -add -type float -o ${output}
+        LWDP_lockfile_delete ${output}
+      fi
+    done
+  done
+fi
+
+measure_autoptx_values()
+{
+  local input_pfx=$1
+  local input_sfx=$2
+  local weight_path=$3
+  local output_pfx=$4
+  local output_sfx=$5
+  local structures=$6
+
+  local map=("fa" "md" "l1" "lt")
+  local map_idx
+
+  if LWDP_needs_update_and_lock ${output_pfx}${map[0]}${output_sfx} ${input_pfx}${map[0]}${input_sfx} ${input_pfx}${map[1]}${input_sfx} ${input_pfx}${map[2]}${input_sfx} ${input_pfx}${map[3]}${input_sfx} ${weight_path}/unc_r.nii.gz; then
+    # init header
+    header="subject,arm,visit"
+    for map_idx in 0 1 2 3; do
+      values[${map_idx}]="${SUBJECT},${ARM},${VISIT}"
+    done
+
+    snum=`cat ${structures} | wc -l`
+    for sidx in `seq 1 ${snum}`; do
+      line=`sed -n "${sidx}p;d" ${structures}`
+      struct=`echo ${line} | cut -d " " -f1`
+
+      header="${header},${struct}"
+
+      weight=${weight_path}/${struct}.nii.gz
+      for map_idx in 0 1 2 3; do
+        input=${input_pfx}${map[${map_idx}]}${input_sfx}
+        roi_val=`caret7 wb_command -volume-weighted-stats ${input} -weight-volume ${weight} -mean`
+        values[${map_idx}]="${values[${map_idx}]},${roi_val}"
+      done
+
+      for map_idx in 0 1 2 3; do
+        output=${output_pfx}${map[${map_idx}]}${output_sfx}
+        if [ -e ${output} ]; then
+          rm -f ${output}
+        fi
+        echo ${header} >> ${output}
+        echo ${values[${map_idx}]} >> ${output}
+      done
+    done
+
+    LWDP_lockfile_delete ${output_pfx}${map[0]}${output_sfx}
+  fi
+}
+
+for branch in pepolar pepolar_long; do
+  if [ "${branch}" == "pepolar" ]; then
+    #if [ "${VISIT}" == "${VISIT_REF}" ]; then
+      measure_autoptx_values "${DIFFUSION_DIR}/pepolar/reslice/sri24/warp_refine/" ".nii.gz" "${DIFFUSION_DIR}/pepolar/reslice/sri24/warp_refine/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/measures/autoptx_warp_refine_" ".csv" "${DATA_DIR}/autoptx/structureList"
+      measure_autoptx_values "${DIFFUSION_DIR}/pepolar/reslice/sri24/warp_refine/" ".nii.gz" "${DIFFUSION_DIR}/pepolar/reslice/sri24/warp_refine/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/measures/autoptx_warp_refine_" "_LR.csv" "${DATA_DIR}/autoptx/structureListLR"
+      #
+      measure_autoptx_values "${DIFFUSION_DIR}/pepolar/reslice/sri24_padded/autoptx/" ".nii.gz" "${DIFFUSION_DIR}/pepolar/reslice/sri24_padded/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/measures/autoptx_sri24_padded_" ".csv" "${DATA_DIR}/autoptx/structureList"
+      measure_autoptx_values "${DIFFUSION_DIR}/pepolar/reslice/sri24_padded/autoptx/" ".nii.gz" "${DIFFUSION_DIR}/pepolar/reslice/sri24_padded/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/measures/autoptx_sri24_padded_" "_LR.csv" "${DATA_DIR}/autoptx/structureListLR"
+    #fi
+    if [ "${VISIT}" != "${VISIT_REF}" ]; then
+      measure_autoptx_values "${DIFFUSION_DIR}/pepolar/reslice/sri24/warp_refine/" ".nii.gz" "${WORKDIR}/../${VISIT_REF}/diffusion/pepolar/reslice/sri24/warp_refine/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/measures/autoptx_warp_refine_" "_ref_tracts.csv" "${DATA_DIR}/autoptx/structureList"
+      measure_autoptx_values "${DIFFUSION_DIR}/pepolar/reslice/sri24/warp_refine/" ".nii.gz" "${WORKDIR}/../${VISIT_REF}/diffusion/pepolar/reslice/sri24/warp_refine/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/measures/autoptx_warp_refine_" "_ref_tracts_LR.csv" "${DATA_DIR}/autoptx/structureListLR"
+      #
+      measure_autoptx_values "${DIFFUSION_DIR}/pepolar/reslice/sri24_padded/autoptx/" ".nii.gz" "${WORKDIR}/../${VISIT_REF}/diffusion/pepolar/reslice/sri24_padded/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/measures/autoptx_sri24_padded_" "_ref_tracts.csv" "${DATA_DIR}/autoptx/structureList"
+      measure_autoptx_values "${DIFFUSION_DIR}/pepolar/reslice/sri24_padded/autoptx/" ".nii.gz" "${WORKDIR}/../${VISIT_REF}/diffusion/pepolar/reslice/sri24_padded/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/measures/autoptx_sri24_padded_" "_ref_tracts_LR.csv" "${DATA_DIR}/autoptx/structureListLR"
+    fi
+  elif [ "${branch}" == "pepolar_long" ] && [ "${VISIT}" != "${VISIT_REF}" ]; then
+    measure_autoptx_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/" ".nii.gz" "${DIFFUSION_DIR}/pepolar/reslice/sri24/warp_refine/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/autoptx_warp_refine_" ".csv" "${DATA_DIR}/autoptx/structureList"
+    measure_autoptx_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/" ".nii.gz" "${DIFFUSION_DIR}/pepolar/reslice/sri24/warp_refine/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/autoptx_warp_refine_" "_LR.csv" "${DATA_DIR}/autoptx/structureListLR"
+    measure_autoptx_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/" ".nii.gz" "${WORKDIR}/../${VISIT_REF}/diffusion/pepolar/reslice/sri24/warp_refine/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/autoptx_warp_refine_" "_ref_tracts.csv" "${DATA_DIR}/autoptx/structureList"
+    measure_autoptx_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24/warp_refine/" ".nii.gz" "${WORKDIR}/../${VISIT_REF}/diffusion/pepolar/reslice/sri24/warp_refine/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/autoptx_warp_refine_" "_ref_tracts_LR.csv" "${DATA_DIR}/autoptx/structureListLR"
+    #
+    measure_autoptx_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24_padded/autoptx/" ".nii.gz" "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24_padded/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/autoptx_sri24_padded_" ".csv" "${DATA_DIR}/autoptx/structureList"
+    measure_autoptx_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24_padded/autoptx/" ".nii.gz" "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24_padded/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/autoptx_sri24_padded_" "_LR.csv" "${DATA_DIR}/autoptx/structureListLR"
+    measure_autoptx_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24_padded/autoptx/" ".nii.gz" "${WORKDIR}/../${VISIT_REF}/diffusion/pepolar/reslice/sri24_padded/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/autoptx_sri24_padded_" "_ref_tracts.csv" "${DATA_DIR}/autoptx/structureList"
+    measure_autoptx_values "${DIFFUSION_DIR}/pepolar/longitudinal/reslice/sri24_padded/autoptx/" ".nii.gz" "${WORKDIR}/../${VISIT_REF}/diffusion/pepolar/reslice/sri24_padded/autoptx/tractsNorm" "${DIFFUSION_DIR}/pepolar/longitudinal/measures/autoptx_sri24_padded_" "_ref_tracts_LR.csv" "${DATA_DIR}/autoptx/structureListLR"
+  fi
+done
+
+exit 0
+
+#
+# transform mesh
+#
+
+T1wFolder=${WORKDIR}/structural/hcp/hcp_t1
+LowResMesh=32
+
+for Hemisphere in L R; do
+  for Surface in white pial; do
+    inp=${T1wFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Surface}.${LowResMesh}k_fs_LR.surf.gii
+    out=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${Hemisphere}.${Surface}.${LowResMesh}k_fs_LR.surf.gii
+    if LWDP_needs_update_and_lock ${out} ${inp} ${hcp_t1_b0_affine_tfm}; then
+      tmpdir=$(mktemp -d)
+
+      cp ${inp} ${tmpdir}/${hemisphere}h.${Surface}.surf.gii
+      mris_convert ${tmpdir}/${hemisphere}h.${Surface}.surf.gii ${tmpdir}/${hemisphere}h.${Surface}.surf.asc
+      v_num=`sed -n 2p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | cut -d " " -f1`
+      e_num=`sed -n 2p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | cut -d " " -f2`
+      v_a=3
+      v_b=`expr ${v_num} + 2`
+      echo "x,y,z,t" > ${tmpdir}/${hemisphere}h_lps.csv
+      sed -n ${v_a},${v_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | tr -s " " | cut -d " " -f1 > ${tmpdir}/${hemisphere}h_ras_x.csv
+      sed -n ${v_a},${v_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | tr -s " " | cut -d " " -f2 > ${tmpdir}/${hemisphere}h_ras_y.csv
+      sed -n ${v_a},${v_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | tr -s " " | cut -d " " -f3 > ${tmpdir}/${hemisphere}h_ras_z.csv
+      sed -n ${v_a},${v_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | tr -s " " | cut -d " " -f4 > ${tmpdir}/${hemisphere}h_ras_t.csv
+      cat ${tmpdir}/${hemisphere}h_ras_x.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${hemisphere}h_lps_x.csv
+      cat ${tmpdir}/${hemisphere}h_ras_y.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${hemisphere}h_lps_y.csv
+      cat ${tmpdir}/${hemisphere}h_ras_z.csv > ${tmpdir}/${hemisphere}h_lps_z.csv
+      cat ${tmpdir}/${hemisphere}h_ras_t.csv > ${tmpdir}/${hemisphere}h_lps_t.csv
+      paste -d "," ${tmpdir}/${hemisphere}h_lps_x.csv ${tmpdir}/${hemisphere}h_lps_y.csv ${tmpdir}/${hemisphere}h_lps_z.csv ${tmpdir}/${hemisphere}h_lps_t.csv >> ${tmpdir}/${hemisphere}h_lps.csv
+
+      ants antsApplyTransformsToPoints -d 3 -p 1 -i ${tmpdir}/${hemisphere}h_lps.csv -o ${tmpdir}/${hemisphere}h_warp_lps.csv -t ${hcp_t1_b0_affine_tfm}
+
+      sed -n 1,2p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc > ${tmpdir}/${hemisphere}h.${Surface}.native.surf.asc
+      c_a=2
+      c_b=`expr ${v_num} + 1`
+      sed -n ${c_a},${c_b}p ${tmpdir}/${hemisphere}h_warp_lps.csv | cut -d "," -f1 > ${tmpdir}/${hemisphere}h_warp_lps_x.csv
+      sed -n ${c_a},${c_b}p ${tmpdir}/${hemisphere}h_warp_lps.csv | cut -d "," -f2 > ${tmpdir}/${hemisphere}h_warp_lps_y.csv
+      sed -n ${c_a},${c_b}p ${tmpdir}/${hemisphere}h_warp_lps.csv | cut -d "," -f3 > ${tmpdir}/${hemisphere}h_warp_lps_z.csv
+      sed -n ${c_a},${c_b}p ${tmpdir}/${hemisphere}h_warp_lps.csv | cut -d "," -f4 > ${tmpdir}/${hemisphere}h_warp_lps_t.csv
+      cat ${tmpdir}/${hemisphere}h_warp_lps_x.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${hemisphere}h_warp_ras_x.csv
+      cat ${tmpdir}/${hemisphere}h_warp_lps_y.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${hemisphere}h_warp_ras_y.csv
+      cat ${tmpdir}/${hemisphere}h_warp_lps_z.csv > ${tmpdir}/${hemisphere}h_warp_ras_z.csv
+      cat ${tmpdir}/${hemisphere}h_warp_lps_t.csv > ${tmpdir}/${hemisphere}h_warp_ras_t.csv
+      paste -d " " ${tmpdir}/${hemisphere}h_warp_ras_x.csv ${tmpdir}/${hemisphere}h_warp_ras_y.csv ${tmpdir}/${hemisphere}h_warp_ras_z.csv ${tmpdir}/${hemisphere}h_warp_ras_t.csv >> ${tmpdir}/${hemisphere}h.${Surface}.native.surf.asc
+
+      e_a=`expr ${v_b} + 1`
+      e_b=`expr ${v_b} + ${e_num}`
+      sed -n ${e_a},${e_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc >> ${tmpdir}/${hemisphere}h.${Surface}.native.surf.asc
+
+      mris_convert ${tmpdir}/${hemisphere}h.${Surface}.native.surf.asc ${out}
+
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${out}
+    fi
+  done
+done
+
+# make trajectory space
+GrayordinatesSpace=91282_Greyordinates
+GrayordinatesSpaceDIR=${DATA_DIR}/hcp/templates/${GrayordinatesSpace}
+GrayordinatesResolutions=2
+
+# transform ROI
+inp[1]=${T1wFolder}/wmparc.nii.gz
+inp[2]=${T1wFolder}/aparc+aseg.nii.gz
+out[1]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/wmparc.nii.gz
+out[2]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/aparc+aseg.nii.gz
+for idx in 1 2; do
+  if LWDP_needs_update_and_lock ${out[${idx}]} ${inp[${idx}]} ${b0_brain} ${hcp_t1_b0_affine_tfm}; then
+    ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${idx}]} -r ${b0_brain} -o ${out[${idx}]} -t [${hcp_t1_b0_affine_tfm},1]
+    c3d c3d ${out[${idx}]} -type short -o ${out[${idx}]}
+    LWDP_lockfile_delete ${out[${idx}]}
+  fi
+done
+
+if [ ${nf} -eq 2 ]; then
+  ROIFolder=ROIs
+else
+  ROIFolder=ROIs_nf${nf}
+fi
+
+ROIStructuresToSeed="26 58 18 54 16 11 50 8 47 28 60 17 53 13 52 12 51 10 49"
+ROINames=("ACCUMBENS_LEFT" "ACCUMBENS_RIGHT" "AMYGDALA_LEFT" "AMYGDALA_RIGHT" "BRAIN_STEM" "CAUDATE_LEFT" "CAUDATE_RIGHT" "CEREBELLUM_LEFT" "CEREBELLUM_RIGHT" "DIENCEPHALON_VENTRAL_LEFT" "DIENCEPHALON_VENTRAL_RIGHT" "HIPPOCAMPUS_LEFT" "HIPPOCAMPUS_RIGHT" "PALLIDUM_LEFT" "PALLIDUM_RIGHT" "PUTAMEN_LEFT" "PUTAMEN_RIGHT" "THALAMUS_LEFT" "THALAMUS_RIGHT")
+count=0
+for Structure in ${ROIStructuresToSeed}; do
+  inp=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/aparc+aseg.nii.gz
+  out=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/${ROINames[${count}]}.nii.gz
+  if LWDP_needs_update_and_lock ${out} ${inp}; then
+    fsl fslmaths ${inp} -thr ${Structure} -uthr ${Structure} -bin ${out}
+    LWDP_lockfile_delete ${out}
+  fi
+  let count++
+done
+
+label[1]=${DATA_DIR}/freesurfer/FreeSurferColorLUT_WM.txt
+label[2]=${DATA_DIR}/freesurfer/FreeSurferColorLUT_Ventricles.txt
+label[3]=""
+label_add[1]="${ROIStructuresToSeed}"
+label_add[2]="24" # CSF
+label_add[3]="${ROIStructuresToSeed}"
+label_del[1]="8 47" # CEREBELLUM_LEFT CEREBELLUM_RIGHT
+label_del[2]=""
+label_del[3]=""
+input[1]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/aparc+aseg.nii.gz
+input[2]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/aparc+aseg.nii.gz
+input[3]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/aparc+aseg.nii.gz
+output[1]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/aparc+aseg_waypoints.nii.gz
+output[2]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/aparc+aseg_avoid.nii.gz
+output[3]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/aparc+aseg_volseeds.nii.gz
+output2[1]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/aparc+aseg_waypoints_bin.nii.gz
+output2[2]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/aparc+aseg_avoid_bin.nii.gz
+output2[3]=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/aparc+aseg_volseeds_bin.nii.gz
+for idx in 1 2 3; do
+  if LWDP_needs_update_and_lock ${output[${idx}]} ${intput[${idx}]} ${label[${idx}]}; then
+    tmpdir=$(mktemp -d)
+    if [ "${label[${idx}]}" != "" ]; then
+      label_set=`cat ${label[${idx}]} | cut -d " " -f1`
+    else
+      label_set=""
+    fi
+    label_set="${label_set} ${label_add[${idx}]}"
+    replace_txt=
+    for l in ${label_set}; do
+      found=0
+      if [ "${label_del[${idx}]}" != "" ]; then
+        for ld in ${label_del[${idx}]}; do
+          if [ "${l}" == "${ld}" ]; then
+            found=1
+          fi
+        done
+      fi
+      if [ ${found} -eq 0 ]; then
+        replace_txt="${replace_txt} ${l} 100000"
+      fi
+    done
+    c3d c3d ${input[${idx}]} -replace ${replace_txt} -thresh 100000 inf 1 0 -type short -o ${tmpdir}/tmp_bin.nii.gz
+    c3d c3d ${input[${idx}]} ${tmpdir}/tmp_bin.nii.gz -multiply -o ${output[${idx}]}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${output[${idx}]}
+  fi
+  if LWDP_needs_update_and_lock ${output2[${idx}]} ${output[${idx}]}; then
+    c3d c3d ${output[${idx}]} -thresh 1 inf 1 0 -o ${output2[${idx}]}
+    LWDP_lockfile_delete ${output2[${idx}]}
+  fi
+done
+label_waypoints=${output2[1]}
+label_avoid=${output2[2]}
+label_volseeds=${output2[3]}
+
+inp=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/aparc+aseg.nii.gz
+label_stop=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/aparc+aseg_stop_bin.nii.gz
+if LWDP_needs_update_and_lock ${label_stop} ${label_volseeds} ${inp}; then
+  #c3d c3d ${inp} -thresh 1 inf 0 1 ${label_volseeds} -add -thresh 1 inf 1 0 -o ${label_stop}
+  c3d c3d ${inp} -thresh 1 inf 0 1 -o ${label_stop}
+  LWDP_lockfile_delete ${label_stop}
+fi
+
+for Hemisphere in L R; do
+  for Surface in white pial; do
+    inp=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${Hemisphere}.${Surface}.${LowResMesh}k_fs_LR.surf.gii
+    out=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/${Surface}.${Hemisphere}.asc
+    atlasroi=${GrayordinatesSpaceDIR}/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+    if LWDP_needs_update_and_lock ${out} ${inp} ${b0_brain} ${atlasroi}; then
+      fsl surf2surf -i ${inp} -o ${out} --volin=${b0_brain} --outputtype=ASCII --values=${atlasroi} --convin=caret --convout=vox
+      LWDP_lockfile_delete ${out}
+    fi
+
+    out_gii=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/${Surface}.${Hemisphere}.gii
+    if LWDP_needs_update_and_lock ${out_gii} ${out} ${b0_brain}; then
+      fsl surf2surf -i ${out} -o ${out_gii} --volin=${b0_brain} --convin=vox --convout=caret
+      LWDP_lockfile_delete ${out_gii}
+    fi
+  done
+done
+
+# transform volume grayordinate
+hcp_mni_hcp_t1_concat=$(LWDP_get_override_file ${WORKDIR}/structural/registration/hcp_mni_hcp_t1/concat/ants_0Warp.nii.gz)
+#
+count=0
+for Structure in ${ROIStructuresToSeed}; do
+  atlas_coord=${GrayordinatesSpaceDIR}/${GrayordinatesSpace}.dscalar.nii
+  atlas_img=${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolutions}.nii.gz
+  roi_img=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/${ROINames[${count}]}.nii.gz
+  out=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/${ROINames[${count}]}.asc
+  if LWDP_needs_update_and_lock ${out} ${inp} ${atlas_coord} ${atlas_img} ${roi_img} ${hcp_mni_hcp_t1_concat} ${hcp_t1_b0_affine_tfm}; then
+    tmpdir=$(mktemp -d)
+    #tmpdir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/tmp
+    #mkdir -p ${tmpdir}
+
+    caret7 wb_command -cifti-export-dense-mapping ${atlas_coord} COLUMN -volume ${ROINames[${count}]} ${tmpdir}/${ROINames[${count}]}.asc -no-cifti-index
+
+    v_num=`cat ${tmpdir}/${ROINames[${count}]}.asc | wc -l`
+
+    # vox to physical coord
+    fsl img2stdcoord -img ${atlas_img} -std ${atlas_img} ${tmpdir}/${ROINames[${count}]}.asc | tr -s " " | tr " " "," > ${tmpdir}/${ROINames[${count}]}_ras.csv
+
+    echo "x,y,z" > ${tmpdir}/${ROINames[${count}]}_lps.csv
+    cat ${tmpdir}/${ROINames[${count}]}_ras.csv | cut -d "," -f1 > ${tmpdir}/${ROINames[${count}]}_ras_x.csv
+    cat ${tmpdir}/${ROINames[${count}]}_ras.csv | cut -d "," -f2 > ${tmpdir}/${ROINames[${count}]}_ras_y.csv
+    cat ${tmpdir}/${ROINames[${count}]}_ras.csv | cut -d "," -f3 > ${tmpdir}/${ROINames[${count}]}_ras_z.csv
+    cat ${tmpdir}/${ROINames[${count}]}_ras_x.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${ROINames[${count}]}_lps_x.csv
+    cat ${tmpdir}/${ROINames[${count}]}_ras_y.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${ROINames[${count}]}_lps_y.csv
+    cat ${tmpdir}/${ROINames[${count}]}_ras_z.csv > ${tmpdir}/${ROINames[${count}]}_lps_z.csv
+    paste -d "," ${tmpdir}/${ROINames[${count}]}_lps_x.csv ${tmpdir}/${ROINames[${count}]}_lps_y.csv ${tmpdir}/${ROINames[${count}]}_lps_z.csv >> ${tmpdir}/${ROINames[${count}]}_lps.csv
+
+    # warp lps coord
+    ants antsApplyTransformsToPoints -d 3 -p 1 -i ${tmpdir}/${ROINames[${count}]}_lps.csv -o ${tmpdir}/${ROINames[${count}]}_warp_lps.csv -t ${hcp_mni_hcp_t1_concat} ${hcp_t1_b0_affine_tfm}
+
+    c_a=2
+    c_b=`expr ${v_num} + 1`
+    sed -n ${c_a},${c_b}p ${tmpdir}/${ROINames[${count}]}_warp_lps.csv | cut -d "," -f1 > ${tmpdir}/${ROINames[${count}]}_warp_lps_x.csv
+    sed -n ${c_a},${c_b}p ${tmpdir}/${ROINames[${count}]}_warp_lps.csv | cut -d "," -f2 > ${tmpdir}/${ROINames[${count}]}_warp_lps_y.csv
+    sed -n ${c_a},${c_b}p ${tmpdir}/${ROINames[${count}]}_warp_lps.csv | cut -d "," -f3 > ${tmpdir}/${ROINames[${count}]}_warp_lps_z.csv
+    cat ${tmpdir}/${ROINames[${count}]}_warp_lps_x.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${ROINames[${count}]}_warp_ras_x.csv
+    cat ${tmpdir}/${ROINames[${count}]}_warp_lps_y.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${ROINames[${count}]}_warp_ras_y.csv
+    cat ${tmpdir}/${ROINames[${count}]}_warp_lps_z.csv > ${tmpdir}/${ROINames[${count}]}_warp_ras_z.csv
+    paste -d " " ${tmpdir}/${ROINames[${count}]}_warp_ras_x.csv ${tmpdir}/${ROINames[${count}]}_warp_ras_y.csv ${tmpdir}/${ROINames[${count}]}_warp_ras_z.csv > ${tmpdir}/${ROINames[${count}]}_warp_ras.asc
+
+    # physical coord to vox
+    fsl std2imgcoord -img ${roi_img} -std ${roi_img} -vox ${tmpdir}/${ROINames[${count}]}_warp_ras.asc | tr -s " " > ${tmpdir}/${ROINames[${count}]}_warp.asc
+
+    rm -f ${tmpdir}/${ROINames[${count}]}_warp_t.csv
+    for i in `seq 1 ${v_num}`; do
+      echo "1" >> ${tmpdir}/${ROINames[${count}]}_warp_t.csv
+    done
+
+    echo "#!ascii from CsvMesh" > ${out}
+    echo "${v_num} ${v_num}" >> ${out}
+    #
+    # flip x
+    cat ${tmpdir}/${ROINames[${count}]}_warp.asc | cut -d " " -f1 > ${tmpdir}/${ROINames[${count}]}_warp_x.csv
+    cat ${tmpdir}/${ROINames[${count}]}_warp.asc | cut -d " " -f2 > ${tmpdir}/${ROINames[${count}]}_warp_y.csv
+    cat ${tmpdir}/${ROINames[${count}]}_warp.asc | cut -d " " -f3 > ${tmpdir}/${ROINames[${count}]}_warp_z.csv
+    roi_img_x=`fsl fslval ${roi_img} dim1 | tr -d " "`
+    roi_img_x_1=`expr ${roi_img_x} - 1`
+    cat ${tmpdir}/${ROINames[${count}]}_warp_x.csv | awk -v dim=${roi_img_x_1} '{print (dim - $0)}' > ${tmpdir}/${ROINames[${count}]}_warp_x_flip.csv
+    paste -d " " ${tmpdir}/${ROINames[${count}]}_warp_x_flip.csv ${tmpdir}/${ROINames[${count}]}_warp_y.csv ${tmpdir}/${ROINames[${count}]}_warp_z.csv ${tmpdir}/${ROINames[${count}]}_warp_t.csv >> ${out}
+    #
+    v_idx=0
+    for i in `seq 1 ${v_num}`; do
+      echo "${v_idx} ${v_idx} ${v_idx} 0" >> ${out}
+      let v_idx++
+    done
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${out}
+  fi
+
+  out_gii=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/${ROINames[${count}]}.gii
+  if LWDP_needs_update_and_lock ${out_gii} ${out} ${b0_brain}; then
+    fsl surf2surf -i ${out} -o ${out_gii} --volin=${b0_brain} --convin=vox --convout=caret
+    LWDP_lockfile_delete ${out_gii}
+  fi
+
+  let count++
+done
+
+# run probtrackx2 for fdt_matrix1.dot
+inp="${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.L.gii ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.R.gii"
+stop=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/stop
+volseeds=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/volseeds
+seeds=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/seeds
+if LWDP_needs_update_and_lock ${stop} ${inp}; then
+  rm -f ${stop}
+  rm -f ${volseeds}
+  rm -f ${seeds}
+
+  echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/pial.L.gii >> ${stop}
+  echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/pial.R.gii >> ${stop}
+  #
+  echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.L.gii >> ${seeds}
+  echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.R.gii >> ${seeds}
+  #
+  count=0
+  for Structure in ${ROIStructuresToSeed}; do
+    echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/${ROINames[${count}]}.gii >> ${volseeds}
+    let count++
+  done
+  #
+  cat ${volseeds} >> ${seeds}
+
+  LWDP_lockfile_delete ${stop}
+fi
+#
+#surf_fdt_matrix1=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/surf/fdt_matrix1.dot.gz
+#if LWDP_needs_update_and_lock ${surf_fdt_matrix1} ${inp} ${stop} ${b0_brain} ${bpx_mask} ${bpx_mean_dsamples}; then
+#  surfseeds=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/surf/surfseeds
+#  rm -f ${surfseeds}
+#  echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.L.gii >> ${surfseeds}
+#  echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.R.gii >> ${surfseeds}
+#
+#  for name in coords_for_fdt_matrix1 fdt_matrix1.dot probtrackx.txt; do
+#    rm -f ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/surf/${name}
+#    rm -f ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/surf/${name}.gz
+#  done
+#
+#  options="--seedref=${b0_brain} -s ${bpx_dir}/merged -m ${bpx_mask} --stop=${stop} --loopcheck --forcedir --fibthresh=0.01 -c 0.2 --sampvox=2 --randfib=1 -P 5000 -S 2000 --steplength=0.5 --omatrix1 -V 1 --opd"
+#  #if [ ! -d /usr/local/cuda/lib64 ]; then
+#  if [ 1 ]; then
+#    # cpu version
+#    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/surf/
+#    fsl probtrackx2 -x ${surfseeds} --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+#  else
+#    # gpu version
+#    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+#    export CUDA_VISIBLE_DEVICES=0
+#    probtrackx2_gpu=/fs/tools/fsl/packages/probtrackx_gpu/cuda-8.0/bin/probtrackx2_gpu
+#
+#    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/surf/
+#    ${probtrackx2_gpu} -x ${surfseeds} --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+#  fi
+#
+#  # compress files
+#  for name in coords_for_fdt_matrix1 fdt_matrix1.dot probtrackx.txt; do
+#    file=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/surf/${name}
+#    if [ -e ${file} ]; then
+#      gzip -9f ${file}
+#    fi
+#  done
+#
+#  LWDP_lockfile_delete ${surf_fdt_matrix1}
+#fi
+#
+whole_fdt_matrix1=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/whole/fdt_matrix1.dot.gz
+if LWDP_needs_update_and_lock ${whole_fdt_matrix1} ${inp} ${stop} ${b0_brain} ${bpx_mask} ${bpx_mean_dsamples}; then
+  wholeseeds=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/whole/wholeseeds
+  rm -f ${wholeseeds}
+  echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.L.gii >> ${wholeseeds}
+  echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.R.gii >> ${wholeseeds}
+  count=0
+  for Structure in ${ROIStructuresToSeed}; do
+    echo ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/${ROINames[${count}]}.nii.gz >> ${wholeseeds}
+    let count++
+  done
+
+  for name in coords_for_fdt_matrix1 fdt_matrix1.dot probtrackx.txt; do
+    rm -f ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/whole/${name}
+    rm -f ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/whole/${name}.gz
+  done
+
+  options="--seedref=${b0_brain} -s ${bpx_dir}/merged -m ${bpx_mask} --stop=${stop} --loopcheck --forcedir --fibthresh=0.01 -c 0.2 --sampvox=2 --randfib=1 -P 5000 -S 2000 --steplength=0.5 --omatrix1 -V 1 --opd"
+  #if [ ! -d /usr/local/cuda/lib64 ]; then
+  if true; then
+    # cpu version
+    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/whole/
+    fsl probtrackx2 -x ${wholeseeds} --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+  else
+    # gpu version
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+    export CUDA_VISIBLE_DEVICES=0
+    probtrackx2_gpu=/fs/tools/fsl/packages/probtrackx_gpu/cuda-8.0/bin/probtrackx2_gpu
+
+    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/whole/
+    ${probtrackx2_gpu} -x ${wholeseeds} --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+  fi
+
+  # compress files
+  for name in coords_for_fdt_matrix1 fdt_matrix1.dot probtrackx.txt; do
+    file=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/whole/${name}
+    if [ -e ${file} ]; then
+      gzip -9f ${file}
+    fi
+  done
+
+  LWDP_lockfile_delete ${whole_fdt_matrix1}
+fi
+#
+# run probtrackx2 for fdt_matrix2.dot
+#sc_fdt_matrix2=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/sc/fdt_matrix2.dot.gz
+#if LWDP_needs_update_and_lock ${sc_fdt_matrix2} ${inp} ${stop} ${volseeds} ${b0_brain} ${bpx_mask} ${bpx_mean_dsamples}; then
+#  for region in lh rh sc; do
+#    if [ ! -d ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/${region} ]; then
+#      mkdir -p ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/${region}
+#    fi
+#    for name in coords_for_fdt_matrix2 tract_space_coords_for_fdt_matrix2 fdt_matrix2.dot probtrackx.txt; do
+#      rm -f ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/${region}/${name}
+#      rm -f ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/${region}/${name}.gz
+#    done
+#  done
+#
+#  options="--seedref=${b0_brain} -s ${bpx_dir}/merged -m ${bpx_mask} --stop=${stop} --loopcheck --forcedir --fibthresh=0.01 -c 0.2 --sampvox=2 --randfib=1 -P 5000 -S 2000 --steplength=0.5 -V 1 --opd --omatrix2 --target2=${bpx_mask}"
+#  #if [ ! -d /usr/local/cuda/lib64 ]; then
+#  if true; then
+#    # cpu version
+#    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/lh/
+#    fsl probtrackx2 -x ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.L.gii --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+#    #
+#    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/rh/
+#    fsl probtrackx2 -x ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.R.gii --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+#    #
+#    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/sc/
+#    fsl probtrackx2 -x ${volseeds} --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+#  else
+#    # gpu version
+#    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+#    export CUDA_VISIBLE_DEVICES=0
+#    probtrackx2_gpu=/fs/tools/fsl/packages/probtrackx_gpu/cuda-8.0/bin/probtrackx2_gpu
+#
+#    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/lh/
+#    ${probtrackx2_gpu} -x ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.L.gii --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+#    #
+#    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/rh/
+#    ${probtrackx2_gpu} -x ${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/${ROIFolder}/white.R.gii --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+#    #
+#    dir=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/sc/
+#    ${probtrackx2_gpu} -x ${volseeds} --meshspace=caret --dir=${dir} ${options} &> ${dir}probtrackx.txt
+#  fi
+#
+#  # compress files
+#  for region in lh rh sc; do
+#    for name in coords_for_fdt_matrix2 tract_space_coords_for_fdt_matrix2 fdt_matrix2.dot probtrackx.txt; do
+#      file=${DIFFUSION_DIR}/${branch}/hcp/b0_unwarp/probtrackx2_nf${nf}/${region}/${name}
+#      if [ -e ${file} ]; then
+#        gzip -9f ${file}
+#      fi
+#    done
+#  done
+#
+#  LWDP_lockfile_delete ${sc_fdt_matrix2}
+#fi
+

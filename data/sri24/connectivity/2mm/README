@@ -1,0 +1,2 @@
+c3d ../../sri24_brainmask.nii.gz -flip x -orient RPI -pad 0x1x1vox 0x-1x0vox 0 -o sri24_brainmask.nii.gz
+c3d sri24_brainmask.nii.gz -interpolation nearestneighbor -resample 120x120x78vox -origin 0x0x0mm -o sri24_brainmask.nii.gz

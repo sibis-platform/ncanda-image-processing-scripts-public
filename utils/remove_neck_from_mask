@@ -1,0 +1,56 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+SCRIPTDIR=$(dirname $0)
+source ${SCRIPTDIR}/../bin/ncanda_setup.sh $*
+
+# Currently only designed for baseline 
+WORKDIR=$1/baseline/structural
+if [ ! -e $WORKDIR ]; then 
+  echo "Error: $WORKDIR does not exists - please define proper path to arm, e.g. /path/to/cases/<subject>/standard"
+  exit 1
+fi
+
+VERSION="" 
+STRIPDIR=$WORKDIR/stripped
+
+# created inverse of mask by executing 
+# /fs/p00/torsten/x86_64/bin/convertx --map-values 1:0+0:1 /share1/dolf/PROGRAMS/programs_NCANDA/dir_structural/neckmask_<VER>_13Aug13.nii.gz sri24_neckmask<VER>_inv.nii.gz 
+
+sri24_neckmask=${SCRIPTDIR}/../data/sri24/sri24_neckmask_inv.nii
+t1_sri24_affine=$(LWDP_get_override_file ${WORKDIR}/registration/sri24/affine/t1_atlas.xform)
+mask_manual=${STRIPDIR}/manual/t1_brain_mask.nii.gz
+mask_strip=${STRIPDIR}/t1_brain_mask.nii.gz 
+if [ -e ${STRIPDIR}/manual/t1_brain_mask.nii.gz -a -e ${STRIPDIR}/manual/t2_brain_mask.nii.gz ]; then 
+  mv ${STRIPDIR}/manual/t1_brain_mask.nii.gz ${STRIPDIR}/manual/t1_brain_mask_orig.nii.gz
+  mv ${STRIPDIR}/manual/t2_brain_mask.nii.gz ${STRIPDIR}/manual/t2_brain_mask_orig.nii.gz
+fi  
+
+if [ -e ${STRIPDIR}/manual/t1_brain_mask_orig.nii.gz ]; then 
+    mask_strip=${STRIPDIR}/manual/t1_brain_mask_orig.nii.gz
+fi 
+
+if LWDP_needs_update_and_lock ${mask_manual} ${mask_strip} ${t1_sri24_affine} ${sri24_neckmask}; then
+  # The following lines are from ncanda_structural_reformat_to_template 
+  # cmtk reformatx --cubic -o ${brain_out} --floating ${t1_brain} ${sri24_t1} --inverse ${t1_sri24} ${baseline_to_t1}
+  cmtk reformatx  ${CMTK_GLOBAL_ARGS} --nn -o ${mask_manual} --floating ${sri24_neckmask} ${mask_strip} ${t1_sri24_affine}
+  (cmtk imagemath --in ${mask_manual} ${mask_strip} --mul --out ${mask_manual}  && cmtk convertx --byte ${mask_manual} ${mask_manual})  || rm ${mask_manual}.gz
+   echo "${mask_manual}: Removed neck from ${mask_strip} via \n$0 $@" >> ${STRIPDIR}/manual${VERSION}/README
+  LWDP_lockfile_delete ${mask_manual}
+
+  if [ -x "$(dirname $0)/upload_pipeline_manual" ]; then
+    "$(dirname $0)/upload_pipeline_manual" ${STRIPDIR}
+  fi
+ 
+  
+fi
+

@@ -1,0 +1,614 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+
+LONGITUDINAL_FLAG=$2 
+if [ "$LONGITUDINAL_FLAG" == "" ]; then 
+   LONGITUDINAL_FLAG=true
+fi 
+
+# run epi_rag without white matter 
+EPI_REG_FLAG=$3 
+
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+pushd () {
+  command pushd "$@" > /dev/null
+}
+popd () {
+  command popd "$@" > /dev/null
+}
+
+#
+# Setup input and output
+#
+
+export subject=${SUBJECT}_${ARM}_${VISIT}
+if [ "${VISIT}" == "baseline" ]; then
+  export t1_brain=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain.nii.gz)
+else
+  # for followups, apply intensity matched images
+  export t1_brain=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/corrected/t1_brain.nii.gz)
+fi
+
+# Error if no stripped T1w image
+if [ ! -e ${t1_brain} ]; then
+  echo "ERROR: missing ${t1_brain}"
+  exit 1
+fi
+
+# Set up the directories for a freesurfer auto_recon_all job, where the brain mask is already made and 
+# is substituted into the processing stream.
+
+freesurfer_run_stage_1() {
+    FS_DIR=$1 
+    subject=$2 
+    FS_LOG_FILE=${FS_DIR}/autorecon1.log
+    FS_SUBJECT_DIR=${FS_DIR}/${subject}
+
+    T1_STRIPPED=${FS_SUBJECT_DIR}/mri/orig/001.mgz
+    # This is what we believe to be the last file created by freesurfer when running autorecon 1
+    lastfile_stage_1=${FS_SUBJECT_DIR}/mri/brainmask.mgz
+
+    if LWDP_needs_update_and_lock ${lastfile_stage_1} ${T1_STRIPPED}; then
+	freesurfer_reset ${FS_SUBJECT_DIR} 1
+
+	echo "INFO:${FS_SUBJECT_DIR}: Started freesurfer stage 1 at `date` ..."
+	manual_overwrite=${FS_DIR}/manual/${subject}
+	if [ -e ${manual_overwrite} ]; then       
+	    echo "INFO:${FS_SUBJECT_DIR}: Copying files from ${manual_overwrite}!" 
+	    rsync -rtaL ${manual_overwrite}/ ${FS_SUBJECT_DIR}
+	fi 
+
+	if ! recon-all  -norandomness -openmp ${OMP_NUM_THREADS} -sd ${FS_DIR} -autorecon1 -noskullstrip -no-isrunning -s ${subject} -rng-seed 1234 &> ${FS_LOG_FILE}; then
+	    echo "freesurfer recon-all autorecon1 (refined) failed for ${WORKDIR}, running again with -notalairach option"
+	    if ! recon-all -norandomness -openmp ${OMP_NUM_THREADS} -sd ${FS_DIR} -autorecon1 -noskullstrip -clean-tal -notalairach -no-isrunning -s ${subject} -rng-seed 1234 &>  ${FS_LOG_FILE}; then
+		freesurfer_err_msg ${FS_SUBJECT_DIR} "ERROR:${FS_SUBJECT_DIR}: freesurfer recon-all autorecon1 failed" ${FS_LOG_FILE}
+	    fi
+
+	fi
+
+	if [ "`tail -1 ${FS_LOG_FILE}`" != "done" ]; then 
+	    freesurfer_err_msg ${FS_SUBJECT_DIR} "ERROR:${FS_SUBJECT_DIR}: freesurfer recon-all autorecon1 did not complete correctly - possible solution provided in this script!" ${FS_LOG_FILE}
+	    # if it fails bc of Talairach Transform
+	    # then install missing lib to make  mni_autoreg work or manually create the the transform by following the instructions outlined in  https://surfer.nmr.mgh.harvard.edu/fswiki/FsTutorial/Talairach_freeview
+	    # 1) Open up the talairach registration results with tkregister2
+            #    export SUBJECTS_DIR=<case>/<arm>/<visit>/structural/longitudinal/freesurfer_refined
+            #    cd $SUBJECT_DIR
+            #    ./tkregister2 --mgz --s template_baseline_1y_2y_3y_4y --fstal
+	    # 2) visuall confirm failure
+	    # 3) translate, rotate, scale to correct the registration.
+	    # 4) Save the xfm file 
+            # 5) Create a README file how the xfm file was created 
+            # 6) Put the README and talairach.xfm under structural/longitudinal/freesurfer_refined/manual/<template>/mri/transforms/ (path must include manual/)
+            # 7) rm -rf structural/longitudinal/freesurfer_refined/template_baseline_1y_2y_3y_4y/mri/transforms    
+	    # 8) Run script again comenting out freesurfer_reset
+	fi   
+
+	# Create links for masked brain image to the original image (which we made sure is already masked)
+	# brainmask from T1.mgz has holes, so replaced T1.mgz to orig.mgz
+	for file in brainmask.auto.mgz brainmask.mgz; do
+	    if [ ! -f ${FS_SUBJECT_DIR}/mri/${file} ]; then
+		pushd ${FS_SUBJECT_DIR}/mri > /dev/null
+		ln -s orig.mgz ${file}
+		popd > /dev/null
+	    else 
+		echo "WARNING:${FS_SUBJECT_DIR}: skipped pushd ${FS_DIR}/${FS_SUBJECT_DIR}/mri; ln -s orig.mgz ${file}; popd"
+	    fi
+	done
+
+	echo "INFO:${FS_SUBJECT_DIR}: freesurfer stage 1 completed"
+	LWDP_lockfile_delete ${lastfile_stage_1}
+    fi
+}
+
+# 05/18/2026: updated function for making sure preceding files exist
+# freesurfer_run_stage_2_3() {
+#     FS_DIR=$1 
+#     subject=$2 
+#     FS_LOG_FILE=${FS_DIR}/autorecon23.log
+#     FS_SUBJECT_DIR=${FS_DIR}/${subject}
+
+#     lastfile_stage_1=${FS_SUBJECT_DIR}/mri/brainmask.mgz
+#     lastfile_stage_3=${FS_SUBJECT_DIR}/label/rh.entorhinal_exvivo.label
+
+#     # check if first file is newer from pipelne mri/transform/talairach.lta
+#     # then only thing I know how to do is erase everything and do step 1 again - check before running stage 1 so you do not have to redo it again 
+#     # if [ -t ] 
+    
+#     if LWDP_needs_update_and_lock ${lastfile_stage_3} ${lastfile_stage_1}; then
+# 	freesurfer_already_running ${FS_SUBJECT_DIR}
+
+# 	echo "INFO:${FS_SUBJECT_DIR}: Started freesurfer stage 2 + 3 at `date`"
+# 	CMD="recon-all -openmp ${OMP_NUM_THREADS} -sd ${FS_DIR} -autorecon2 -autorecon3 -no-isrunning -s ${subject}"
+# 	if ! $CMD &> ${FS_LOG_FILE}; then
+# 	    echo "WARNING:${FS_SUBJECT_DIR}: freesurfer recon-all autorecon2/3 failed, running again with -use-new-fixer and a different random seed options (default: 1234)"
+# 	    CMD="${CMD} -use-new-fixer -rng-seed 1000"
+# 	    if ! ${CMD}  &> ${FS_LOG_FILE}; then
+# 		freesurfer_err_msg ${FS_SUBJECT_DIR} "ERROR:${FS_SUBJECT_DIR}: freesurfer recon-all autorecon2/3 failed even after trying different random seed" ${FS_LOG_FILE}
+# 	    fi
+# 	fi 
+
+# 	if [ "`tail -1 ${FS_LOG_FILE}`" != "done" ]; then 
+# 	    freesurfer_err_msg ${FS_SUBJECT_DIR} "ERROR:${FS_SUBJECT_DIR}: freesurfer recon-all autorecon2/3 did not complete correctly!" ${FS_LOG_FILE}
+# 	fi
+       
+# 	echo "INFO:${FS_SUBJECT_DIR}: freesurfer stage 2 + 3 completed"
+# 	LWDP_lockfile_delete ${lastfile_stage_3}
+#     fi
+# } 
+freesurfer_run_stage_2_3() {
+  FS_DIR=$1 
+  subject=$2 
+  FS_LOG_FILE=${FS_DIR}/autorecon23.log
+  FS_SUBJECT_DIR=${FS_DIR}/${subject}
+
+  lastfile_stage_1=${FS_SUBJECT_DIR}/mri/brainmask.mgz
+  lastfile_stage_3=${FS_SUBJECT_DIR}/label/rh.entorhinal_exvivo.label
+
+  if LWDP_needs_update_and_lock ${lastfile_stage_3} ${lastfile_stage_1}; then
+      freesurfer_already_running ${FS_SUBJECT_DIR}
+
+      echo "INFO:${FS_SUBJECT_DIR}: Started freesurfer stage 2 + 3 at `date`"
+
+      # Needs to run with -careg starting version 7.2
+      
+      CMD="recon-all -norandomness -openmp ${OMP_NUM_THREADS} -sd ${FS_DIR} -careg -autorecon2 -autorecon3 -no-isrunning -s ${subject}"  
+      CMD_SEED="$CMD -rng-seed 1234"
+      # from mp pipeline
+      # if ! recon-all -norandomness -openmp ${OMP_NUM_THREADS} -sd ${FSDIR_T1R} -autorecon2 -autorecon3 -no-isrunning -s ${subject} -no-fix-with-ga -use-new-fixer -rng-seed 1000 &> ${FSDIR_T1R}/autorecon23-try2.log; then
+	 
+      if ! $CMD_SEED &> ${FS_LOG_FILE}; then
+          echo "WARNING:${FS_SUBJECT_DIR}: freesurfer recon-all autorecon2/3 failed, running again with -use-new-fixer and a different random seed options (default: 1234)"
+          CMD="${CMD} -use-new-fixer -rng-seed 1000"
+
+          if ! ${CMD} &> ${FS_LOG_FILE}; then
+              freesurfer_err_msg ${FS_SUBJECT_DIR} "ERROR:${FS_SUBJECT_DIR}: freesurfer recon-all autorecon2/3 failed even after trying different random seed" ${FS_LOG_FILE}
+          fi
+      fi 
+
+      if [ "`tail -1 ${FS_LOG_FILE}`" != "done" ]; then 
+          freesurfer_err_msg ${FS_SUBJECT_DIR} "ERROR:${FS_SUBJECT_DIR}: freesurfer recon-all autorecon2/3 did not complete correctly!" ${FS_LOG_FILE}
+      fi
+      
+      echo "INFO:${FS_SUBJECT_DIR}: freesurfer stage 2 + 3 completed"
+      LWDP_lockfile_delete ${lastfile_stage_3}
+  fi
+}
+
+freesurfer_run_all() {
+    FS_DIR=$1 
+    subject=$2 
+    csv_measures=$3
+
+    [ -e ${FS_DIR}/fsaverage ] || ln -s ${FREESURFER_HOME}/subjects/fsaverage ${FS_DIR}/fsaverage 
+
+    # if first result of stage 2 is older than the last result of stage 1 then regnerated everything 
+    # currently do not know how to preserve the results of stage 1 (and it does not take a long time to generate so we should be good  
+    # If one does not do it then freesurfer might only update the last part of stage 3 leaving everything else the same 
+    # even though it should have been updated as previous results were changed 
+    FS_SUBJECT=${FS_DIR}/${subject}
+    lastFileCreatedByStage1=${FS_SUBJECT}//mri/brainmask.mgz
+    firstFileCreatedByStage2=${FS_SUBJECT}/mri/transforms/talairach.lta  
+    if [ -e ${lastFileCreatedByStage1} -a -e ${firstFileCreatedByStage2} -a ${lastFileCreatedByStage1} -nt ${firstFileCreatedByStage2} ]; then 
+	echo "INFO:${FS_SUBJECT}: Resetting directory as ${lastFileCreatedByStage1} (`stats -c %y ${lastFileCreatedByStage1}`) is newer than $firstFileCreatedByStage2 (`stats -c %y $firstFileCreatedByStage2`)" 
+	freesurfer_reset ${FS_SUBJECT} 1
+    fi 
+
+    freesurfer_run_stage_1 ${FS_DIR} ${subject} 
+    freesurfer_run_stage_2_3 ${FS_DIR} ${subject}
+    if $csv_measures; then 
+	freesurfer_create_csv ${FS_DIR} ${subject} cross 
+    fi 
+}
+
+
+export FSDIR=${WORKDIR}/structural/freesurfer
+
+# Set up directories and links
+[ -d ${FSDIR}/${subject}/mri/orig ] || mkdir -p ${FSDIR}/${subject}/mri/orig
+
+# Make input image for freesurfer
+t1_brain_mgz=${FSDIR}/${subject}/mri/orig/001.mgz
+if LWDP_needs_update_and_lock ${t1_brain_mgz} ${t1_brain}; then
+  mri_convert -i ${t1_brain} -o ${t1_brain_mgz}
+  LWDP_lockfile_delete ${t1_brain_mgz}
+fi
+
+freesurfer_run_all ${FSDIR} ${subject} false
+
+#
+# Refine t1 t2 alignment using epi_reg and freesurfer wmparc outlines
+#
+
+fs_wmparc=${FSDIR}/${subject}/mri/wmparc.mgz
+t1_mrbias=$(LWDP_get_override_file ${WORKDIR}/structural/mrbias/t1.nii.gz)
+t1_brain=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain.nii.gz)
+t1_brainmask=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain_mask.nii.gz)
+t2_input=$(LWDP_get_override_file ${WORKDIR}/structural/native/t2.nii.gz)
+
+t1_t2_refine_dir=${WORKDIR}/structural/registration/t1_t2_refine
+t1_t2_refine_pfx=${t1_t2_refine_dir}/epi_reg
+t1_t2_refine_affine=${t1_t2_refine_pfx}.mat
+
+if [ "$EPI_REG_FLAG" == "1" ]; then
+    manual_dir=${t1_t2_refine_dir}/manual
+    [ -e $manual_dir ] || mkdir $manual_dir 
+    manual_pfx=${manual_dir}/epi_reg
+    manual_affine=${manual_pfx}.mat
+    if LWDP_needs_update_and_lock ${manual_affine} ${t2_input} ${t1_mrbias} ${t1_brain}; then
+	CMD="fsl epi_reg --epi=${t2_input} --t1=${t1_mrbias} --t1brain=${t1_brain} --noclean -v --out=${manual_pfx}"
+	echo "$CMD" >  ${manual_dir}/README
+	$CMD >& ${manual_pfx}.log
+	LWDP_lockfile_delete ${manual_affine}
+    fi
+else  
+    if LWDP_needs_update_and_lock ${t1_t2_refine_affine} ${fs_wmparc} ${t2_input} ${t1_mrbias} ${t1_brain}; then
+       tmpdir=$(mktemp -d)
+       mri_convert -rt nearest -rl ${t1_mrbias} ${fs_wmparc} ${tmpdir}/wmparc.nii.gz
+       # djk: create epi_reg_fast_wmseg.nii.gz file to turn around a bug of epi_reg (fsl 5.0.6)
+       # KP: If fsl epi_reg --epi=${t2_input} --t1=${t1_mrbias} --t1brain=${t1_brain} ... fails than run without --wmseg option
+       # i.e., with EPI_RAG_FLAG=1
+       c3d c3d ${tmpdir}/wmparc.nii.gz -thresh 1 inf 1 0 -o ${t1_t2_refine_pfx}_fast_wmseg.nii.gz
+   
+       fsl epi_reg --epi=${t2_input} --t1=${t1_mrbias} --t1brain=${t1_brain} --wmseg=${t1_t2_refine_pfx}_fast_wmseg.nii.gz --noclean -v --out=${t1_t2_refine_pfx} >& ${t1_t2_refine_pfx}.log
+       # djk: remove dangling link
+       rm ${t1_t2_refine_pfx}_fast_wmseg
+       rm -rf ${tmpdir}
+       LWDP_lockfile_delete ${t1_t2_refine_affine}
+    fi
+fi 
+t1_t2_refine_affine=$(LWDP_get_override_file ${t1_t2_refine_affine})
+
+# convert fsl mtx to itk tfm
+t1_t2_refine_affine_tfm=${t1_t2_refine_pfx}.tfm
+if LWDP_needs_update_and_lock ${t1_t2_refine_affine_tfm} ${t1_t2_refine_affine} ${t1_mrbias} ${t2_input}; then
+  CMD="c3d c3d_affine_tool -ref ${t1_mrbias} -src ${t2_input} ${t1_t2_refine_affine} -fsl2ras -oitk ${t1_t2_refine_affine_tfm}"
+  $CMD
+  LWDP_lockfile_delete ${t1_t2_refine_affine_tfm}
+
+  if [ ! -e ${t1_t2_refine_affine_tfm} ]; then 
+    echo -e "ERROR:$WORKDIR:${t1_t2_refine_affine_tfm} was not created! Most likely ${t1_t2_refine_affine} is not well formed causing the following command to fail:\n$CMD\nSimply delete  ${t1_t2_refine_affine}, set fsl to version 5.10 or higher, and try again!!"
+    exit 1
+  fi 
+
+fi
+
+# generate affinely registratered t2
+t2_affine=${WORKDIR}/structural/reslice/subject_t1/t2_affine_refined.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine} ${t2_input} ${t1_mrbias} ${t1_t2_refine_affine_tfm}; then
+  ants antsApplyTransforms -n BlackmanWindowedSinc -i ${t2_input} -r ${t1_mrbias} -o ${t2_affine} -t ${t1_t2_refine_affine_tfm}
+  c3d c3d ${t2_affine} -clip 0 inf -type float -o ${t2_affine}
+  LWDP_lockfile_delete ${t2_affine}
+fi
+t2_affine=$(LWDP_get_override_file ${t2_affine})
+
+t2_affine_denoised=${WORKDIR}/structural/denoised/t2_affine_refined.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_denoised} ${t2_affine}; then
+  naonlm naonlm3d -i ${t2_affine} -o ${t2_affine_denoised}
+  LWDP_lockfile_delete ${t2_affine_denoised}
+fi
+t2_affine_denoised=$(LWDP_get_override_file ${t2_affine_denoised})
+#t2_affine_denoised_brain=${WORKDIR}/structural/denoised/t2_affine_refined_brain.nii.gz
+#if LWDP_needs_update_and_lock ${t2_affine_denoised_brain} ${t2_affine_denoised} ${t1_brainmask}; then
+#  c3d c3d ${t2_affine_denoised} ${t1_brainmask} -multiply -o ${t2_affine_denoised_brain}
+#  LWDP_lockfile_delete ${t2_affine_denoised_brain}
+#fi
+t2_affine_mrbias=${WORKDIR}/structural/mrbias/t2_affine_refined.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_mrbias} ${t2_affine_denoised} ${t1_mrbias} ${t1_brainmask}; then
+  ants N4BiasFieldCorrection -i ${t2_affine_denoised} -x ${t1_brainmask} -o [${t2_affine_mrbias},${WORKDIR}/structural/mrbias/t2_affine_refined_bias.nii.gz]
+  LWDP_lockfile_delete ${t2_affine_mrbias}
+fi
+
+t2_affine_brain=${WORKDIR}/structural/stripped/t2_affine_refined_brain.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_brain} ${t2_affine_mrbias} ${t1_brainmask}; then
+  c3d c3d ${t2_affine_mrbias} ${t1_brainmask} -multiply -o ${t2_affine_brain}
+  LWDP_lockfile_delete ${t2_affine_brain}
+fi
+
+#
+# Check that it worked 
+#
+t2_affine_brain_orig=${WORKDIR}/structural/stripped/t2_affine_brain.nii.gz
+t2_affine_brain_sim=${t1_t2_refine_pfx}_check.csv
+if LWDP_needs_update_and_lock ${t2_affine_brain_sim} ${t1_brainmask} ${t2_affine_brain} ${t2_affine_brain_orig}; then
+    cmtk similarity -m ${t1_brainmask} ${t2_affine_brain} ${t2_affine_brain_orig} | grep SIM | tr '\t' ' ' | tr -s ' ' | tr ' ' ',' > ${t2_affine_brain_sim}
+    LWDP_lockfile_delete ${t2_affine_brain_sim}
+fi
+
+if [ ! -e $t2_affine_brain_sim ]; then
+    echo "ERROR: $t2_affine_brain_sim is missing"  
+    exit 1 
+fi 
+
+NCC=`tail -n1 ${t2_affine_brain_sim} | cut -d, -f7`
+# above 0.8 are differences in scaling 
+# should also check final mask with that of t1 image 
+NCC_THR=0.8
+if [ $(echo "${NCC} < ${NCC_THR}" | bc) -eq 1 ]; then
+   checkFile=${t1_t2_refine_pfx}_check.pass 
+   if [ -e  $checkFile ]; then 
+       if [ $checkFile -ot $t2_affine_brain_sim ]; then 
+	   MSG="Error:${WORKDIR}:${checkFile} is older than ${t2_affine_brain_sim} and insufficient overlap between refined and original T2 alignment (NCC = ${NCC} < ${NCC_THR})"
+           echo "${MSG}"
+           echo "${MSG}" | ncanda_error_email $(basename $0)
+           exit 1
+       fi
+       echo "Warning:${WORKDIR}:ignoring insufficient overlap between refined and original T2 alignment (NCC = ${NCC} < ${NCC_THR})"
+   else 
+       # If fails run fsl epi_reg --epi=${t2_input} --t1=${t1_mrbias} --t1brain=${t1_brain} ... without --wmseg option 
+       MSG="ERROR:${WORKDIR}:insufficient overlap between refined ${t2_affine_brain} and original T2 alignment ${t2_affine_brain_orig} (NCC = ${NCC} < ${NCC_THR})! Check ${t1_t2_refine_pfx}.mat" 
+       if [ -e ${t1_t2_refine_dir}/manual ]; then 
+	  MSG="${MSG}\nERROR:${WORKDIR}:Still failing even after running with EPI_REG_FLAG !"
+	  MSG="${MSG}\nERROR:${WORKDIR}:Step 1: If better than original (${t2_affine_brain_sim}_orig) and  ${t2_affine_brain_orig} is well aligned with ${t1_brain} then 'touch $checkFile' and run again."
+	  MSG="${MSG}\nERROR:${WORKDIR}:Step 2: If worse than original (${t2_affine_brain_sim}_orig) then first read step 3 (will not show up after completing these instructions), 'rm -rf ${t1_t2_refine_dir}/manual ${t1_t2_refine_affine_tfm} ${t2_affine} ${t2_affine_denoised} ${t2_affine_mrbias} ${t2_affine_brain} ${t2_affine_brain_sim}', run ncanda_freesurfer_pipeline $WORKDIR . if ${t2_affine_brain_orig} is well aligned with ${t1_brain} then 'touch $checkFile' and run again."
+	  MSG="${MSG}\nERROR:${WORKDIR}:Step 3:If not well aligned, simply ignore step by creating ${WORKDIR}/structural/reslice/subject_t1/manual and copy ${WORKDIR}/structural/reslice/subject_t1/t2.nii.gz to manual/t2_affine_refined.nii.gz" 
+       else
+	   MSG="${MSG}\nERROR:${WORKDIR}:Copy ${t2_affine_brain_sim} to ${t2_affine_brain_sim}_orig (for your record) and run script with EPI_REG_FLAG i.e., ncanda_freesurfer_pipeline $WORKDIR 0 1 !"
+       fi
+       echo -e "${MSG}"
+       echo "${MSG}" | ncanda_error_email $(basename $0)
+       exit 1
+   fi 
+fi
+
+if [ "$EPI_REG_FLAG" == "1" ]; then
+   echo "INFO:${WORKDIR}:overlap between refined ${t2_affine_brain} and original T2 alignment ${t2_affine_brain_orig} (NCC = ${NCC} < ${NCC_THR}) is now sufficient! Now rerun without EPI_REG_FLAG option !"
+   exit 0
+fi 
+
+# start parcellations
+
+fs_aparc_aseg_mgz=${FSDIR}/${subject}/mri/aparc+aseg.mgz
+fs_rawavg_mgz=${FSDIR}/${subject}/mri/rawavg.mgz
+fs_wm_label=${DATA_DIR}/freesurfer/FreeSurferColorLUT_WM.txt
+t2_affine_brain_exp_mask=${WORKDIR}/structural/reslice/subject_t1/t2_affine_refined_brain_exp_mask.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_brain_exp_mask} ${t2_affine_brain} ${t1_brainmask} ${fs_aparc_aseg_mgz} ${fs_rawavg_mgz} ${fs_wm_label}; then
+  tmpdir=$(mktemp -d)
+  mean=`fsl fslstats ${t2_affine_brain} -k ${t1_brainmask} -m | tr -d " "`
+  mean_1=`bc -l <<< 1/${mean}`
+  echo t2_affine_brain: mean=${mean}, 1/mean=${mean_1}
+  # thresh 0.8 cuts 20% of the mean
+  c3d c3d ${t2_affine_brain} -scale -${mean_1} -exp -thresh 0.8 inf 0 1 -o ${tmpdir}/t2_mask.nii.gz
+  #
+  # thresh 0.6 (0.65, 0.7) cuts 50% (40%, 35%) of the mean
+  #c3d c3d ${tmpdir}/t2_mask.nii.gz -erode 1 1x1x1vox -o ${tmpdir}/t2_mask_e.nii.gz
+  #c3d c3d ${t2_affine_brain} -scale -${mean_1} -exp -thresh 0.7 inf 0 1 -o ${tmpdir}/t2_mask2.nii.gz
+  #c3d c3d ${tmpdir}/t2_mask_e.nii.gz ${tmpdir}/t2_mask2.nii.gz -add -thresh 1 inf 1 0 -o ${tmpdir}/t2_mask.nii.gz
+  #
+  mri_label2vol --seg ${fs_aparc_aseg_mgz} --temp ${fs_rawavg_mgz} --o ${tmpdir}/aparc+aseg.nii.gz --regheader
+  label_set=`cat ${fs_wm_label} | cut -d " " -f1`
+  # add some subcortical structures
+  label_set="${label_set} 10 11 12 13 17 18 26 49 50 51 52 53 54"
+  replace_txt=
+  for l in ${label_set}; do
+    replace_txt="${replace_txt} ${l} 100000"
+  done
+  c3d c3d ${tmpdir}/aparc+aseg.nii.gz -replace ${replace_txt} -thresh 100000 inf 1 0 -o ${tmpdir}/seg_bin.nii.gz
+  c3d c3d ${tmpdir}/t2_mask.nii.gz ${tmpdir}/seg_bin.nii.gz -copy-transform -o ${tmpdir}/seg_bin.nii.gz
+  c3d c3d ${tmpdir}/t2_mask.nii.gz ${tmpdir}/seg_bin.nii.gz -add -thresh 1 inf 1 0 -type byte -o ${t2_affine_brain_exp_mask}
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${t2_affine_brain_exp_mask}
+fi
+
+#
+# Register t2 image with sri24 and propagate mask
+#
+
+sri24_t2=${DATA_DIR}/sri24/sri24_t2.nii.gz
+sri24_brainmask=${DATA_DIR}/sri24/sri24_brainmask.nii.gz
+
+if [ "${VISIT}" == "baseline" ]; then
+  # initialize the registration with t1_sri24_affine
+  t1_sri24_affine=${WORKDIR}/structural/registration/t1_sri24/ants_0GenericAffine.mat
+
+  t2_sri24_pfx=${WORKDIR}/structural/registration/t2_sri24/ants_
+  t2_sri24_affine=${t2_sri24_pfx}0GenericAffine.mat
+  if LWDP_needs_update_and_lock ${t2_sri24_affine} ${t1_sri24_affine} ${t2_affine_brain} ${sri24_t2} ${sri24_brainmask} ${t2_affine_brain_exp_mask}; then
+    tmpdir=$(mktemp -d)
+    log_out=${t2_sri24_pfx}0GenericAffine.log
+
+    for i in 1 2; do
+      if [ "${i}" == "1" ]; then
+        ants antsRegistration -d 3 --initial-moving-transform ${t1_sri24_affine} -t Affine[0.1] -m MI[${t2_affine_brain},${sri24_t2},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -o ${t2_sri24_pfx} > ${log_out}
+      elif [ "${i}" == "2" ]; then
+        rm -f ${t2_sri24_affine}
+        rm -f ${log_out}
+        echo "INFO: attempt affine registration again by changing parameters"
+
+        # apply histogram matching, clip intensity ranges, finer updates for inter-subject registrations
+        ants antsRegistration -d 3 -u -w [0.005,0.995] --initial-moving-transform ${t1_sri24_affine} -t Affine[0.001] -m MI[${t2_affine_brain},${sri24_t2},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -o ${t2_sri24_pfx} > ${log_out}
+      fi
+
+      # check registration result
+      ants antsApplyTransforms -n NearestNeighbor -i ${sri24_brainmask} -r ${t2_affine_brain} -o ${tmpdir}/sri24_brainmask_affine_${i}.nii.gz -t ${t2_sri24_affine}
+      dice=`c3d c3d ${t1_brainmask} ${tmpdir}/sri24_brainmask_affine_${i}.nii.gz -overlap 1 | cut -d "," -f 5 | tr -d " "`
+      echo "INFO: overlap between warped sri24 baseline mask and t1_brainmask: (dice = ${dice})"
+      if [ $(echo "${dice} < 0.9" | bc) -eq 1 ]; then
+        echo "WARNING:${WORKDIR}:insufficient overlap between warped sri24 baseline mask and t1_brainmask (dice = ${dice} < 0.9)"
+      else
+        # stop here if we get a sufficient overlap
+        echo "INFO: overlap is sufficient"
+        break
+      fi
+    done
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${t2_sri24_affine}
+  fi
+
+  t2_sri24_warp=${t2_sri24_pfx}1Warp.nii.gz
+  if LWDP_needs_update_and_lock ${t2_sri24_warp} ${t2_affine_brain} ${sri24_t2} ${t2_affine_brain_exp_mask}; then
+    log_out=${t2_sri24_pfx}1Warp.log
+    ants antsRegistration -d 3 --initial-moving-transform ${t2_sri24_affine} -t SyN[0.5,3,0.5] -m CC[${t2_affine_brain},${sri24_t2},1,4] -x ${t2_affine_brain_exp_mask} -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${t2_sri24_pfx} > ${log_out}
+    LWDP_lockfile_delete ${t2_sri24_warp}
+  fi
+
+  t2_sri24_mtx=$(LWDP_get_override_files_list ${t2_sri24_warp} ${t2_sri24_affine})
+else
+  t1_brain_to_baseline_affine=${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_0GenericAffine.mat
+  t1_brain_to_baseline_warp=${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_1Warp.nii.gz
+  t2_sri24_mtx=$(LWDP_get_override_files_list ${t1_brain_to_baseline_warp} ${t1_brain_to_baseline_affine} ${WORKDIR}/../baseline/structural/registration/t2_sri24/ants_1Warp.nii.gz ${WORKDIR}/../baseline/structural/registration/t2_sri24/ants_0GenericAffine.mat)
+fi
+
+sri24_t2_aligned_mask=${WORKDIR}/structural/reslice/subject_t1/t2_sri24/brainmask.nii.gz
+if LWDP_needs_update_and_lock ${sri24_t2_aligned_mask} ${sri24_brainmask} ${t2_affine_brain} ${t2_sri24_mtx}; then
+  # used MultiLabel (default value equals MultiLabel[1,1]) interpolation to make smooth boundaries
+  ants antsApplyTransforms -n MultiLabel -i ${sri24_brainmask} -r ${t2_affine_brain} -o ${sri24_t2_aligned_mask} -t ${t2_sri24_mtx}
+  c3d c3d ${sri24_t2_aligned_mask} -type byte -o ${sri24_t2_aligned_mask}
+  LWDP_lockfile_delete ${sri24_t2_aligned_mask}
+fi
+
+t1_denoised=${WORKDIR}/structural/denoised/t1.nii.gz
+t2_affine_brain_mask=${WORKDIR}/structural/reslice/subject_t1/t2_affine_refined_brain_mask.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_brain_mask} ${t1_brainmask} ${sri24_t2_aligned_mask} ${fs_aparc_aseg_mgz} ${fs_rawavg_mgz} ${t1_denoised} ${t2_affine_denoised}; then
+  tmpdir=$(mktemp -d)
+  mri_label2vol --seg ${fs_aparc_aseg_mgz} --temp ${fs_rawavg_mgz} --o ${tmpdir}/aparc+aseg.nii.gz --regheader
+  # include some subcortical structures, cerebellum and brain stem
+  label_set="10 11 12 13 17 18 26 49 50 51 52 53 54 7 8 46 47 16"
+  # add gray matter
+  label_set="${label_set} `seq 1001 1035` `seq 2001 2035`"
+  replace_txt=
+  for l in ${label_set}; do
+    replace_txt="${replace_txt} ${l} 100000"
+  done
+  c3d c3d ${tmpdir}/aparc+aseg.nii.gz -replace ${replace_txt} -thresh 100000 inf 1 0 -o ${tmpdir}/seg_bin.nii.gz
+  c3d c3d ${sri24_t2_aligned_mask} ${tmpdir}/seg_bin.nii.gz -copy-transform -o ${tmpdir}/seg_bin.nii.gz
+  c3d c3d ${sri24_t2_aligned_mask} ${tmpdir}/seg_bin.nii.gz -add -thresh 1 inf 1 0 -o ${tmpdir}/mask.nii.gz
+  #
+  c3d c3d ${t1_denoised} -log10 -o ${tmpdir}/t1_log.nii.gz
+  c3d c3d ${t2_affine_denoised} -log10 -o ${tmpdir}/t2_log.nii.gz
+  c3d c3d ${tmpdir}/t1_log.nii.gz ${tmpdir}/t2_log.nii.gz -scale -1 -add -o ${tmpdir}/t1_div_t2_log.nii.gz
+  # set threshold to the 95 percentile value
+  t1_div_t2_log_th=`fsl fslstats ${tmpdir}/t1_div_t2_log.nii.gz -k ${t1_brainmask} -P 95 | tr -d " "`
+  echo t1_div_t2_log_th=${t1_div_t2_log_th}
+  #
+  mean=`fsl fslstats ${t2_affine_denoised} -k ${t1_brainmask} -m | tr -d " "`
+  mean_1=`bc -l <<< 1/${mean}`
+  echo t2_affine_brain: mean=${mean}, 1/mean=${mean_1}
+  c3d c3d ${t2_affine_denoised} -scale -${mean_1} -exp -o ${tmpdir}/t2_exp.nii.gz
+  # thresh 0.8 cuts 20% of the mean
+  t2_exp_th=0.8
+  echo t2_exp_th=${t2_exp_th}
+  #
+  for i in 1 2 3; do
+    c3d c3d ${tmpdir}/mask.nii.gz -erode 1 1x1x1vox -o ${tmpdir}/mask_e1.nii.gz
+    c3d c3d ${tmpdir}/mask.nii.gz ${tmpdir}/mask_e1.nii.gz -scale -1 -add -o ${tmpdir}/mask_d1.nii.gz
+    c3d c3d ${tmpdir}/t1_div_t2_log.nii.gz ${tmpdir}/mask_d1.nii.gz -multiply -thresh ${t1_div_t2_log_th} inf 1 0 -o ${tmpdir}/t1_div_t2_mask.nii.gz
+    c3d c3d ${tmpdir}/mask.nii.gz ${tmpdir}/t1_div_t2_mask.nii.gz -scale -1 -add -thresh 1 inf 1 0 -o ${tmpdir}/mask.nii.gz
+    c3d c3d ${tmpdir}/t2_exp.nii.gz ${tmpdir}/mask_d1.nii.gz -multiply -thresh ${t2_exp_th} inf 1 0 -o ${tmpdir}/t2_exp_mask.nii.gz
+    c3d c3d ${tmpdir}/mask.nii.gz ${tmpdir}/t2_exp_mask.nii.gz -scale -1 -add -thresh 1 inf 1 0 -o ${tmpdir}/mask.nii.gz
+  done
+  #
+  c3d c3d ${tmpdir}/mask.nii.gz -holefill 1 0 -type byte -o ${t2_affine_brain_mask}
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${t2_affine_brain_mask}
+fi
+
+for ex in refined refined2 refined3; do
+  if [ "${ex}" == "refined" ]; then
+    t2_affine_brain_exp_mask=${WORKDIR}/structural/reslice/subject_t1/t2_affine_refined_brain_exp_mask.nii.gz
+  elif [ "${ex}" == "refined2" ] || [ "${ex}" == "refined3" ]; then
+    if [ -d ${WORKDIR}/structural/reslice/subject_t1/${ex} ]; then
+      fs_aparc_aseg_mgz=${WORKDIR}/structural/freesurfer_refined/${subject}/mri/aparc+aseg.mgz
+      fs_rawavg_mgz=${WORKDIR}/structural/freesurfer_refined/${subject}/mri/rawavg.mgz
+      fs_wm_label=${DATA_DIR}/freesurfer/FreeSurferColorLUT_WM.txt
+      t2_affine_brain_exp_mask=${WORKDIR}/structural/reslice/subject_t1/t2_affine_${ex}_brain_exp_mask.nii.gz
+      if LWDP_needs_update_and_lock ${t2_affine_brain_exp_mask} ${t2_affine_brain} ${t1_brainmask} ${fs_aparc_aseg_mgz} ${fs_rawavg_mgz} ${fs_wm_label}; then
+        tmpdir=$(mktemp -d)
+        mean=`fsl fslstats ${t2_affine_brain} -k ${t1_brainmask} -m | tr -d " "`
+        mean_1=`bc -l <<< 1/${mean}`
+        echo t2_affine_brain: mean=${mean}, 1/mean=${mean_1}
+        if [ "${ex}" == "refined2" ]; then
+          # thresh 0.45 cuts >50% of the mean
+          c3d c3d ${t2_affine_brain} -scale -${mean_1} -exp -thresh 0.45 inf 0 1 -o ${tmpdir}/t2_mask.nii.gz
+        elif [ "${ex}" == "refined3" ]; then
+          c3d c3d ${t2_affine_brain} -scale -${mean_1} -exp -thresh 0.40 inf 0 1 -o ${tmpdir}/t2_mask.nii.gz
+        fi
+        #
+        mri_label2vol --seg ${fs_aparc_aseg_mgz} --temp ${fs_rawavg_mgz} --o ${tmpdir}/aparc+aseg.nii.gz --regheader
+        label_set=`cat ${fs_wm_label} | cut -d " " -f1`
+        # add some subcortical structures
+        label_set="${label_set} 10 11 12 13 17 18 26 49 50 51 52 53 54"
+        replace_txt=
+        for l in ${label_set}; do
+          replace_txt="${replace_txt} ${l} 100000"
+        done
+        c3d c3d ${tmpdir}/aparc+aseg.nii.gz -replace ${replace_txt} -thresh 100000 inf 1 0 -o ${tmpdir}/seg_bin.nii.gz
+        c3d c3d ${tmpdir}/t2_mask.nii.gz ${tmpdir}/seg_bin.nii.gz -copy-transform -o ${tmpdir}/seg_bin.nii.gz
+        c3d c3d ${tmpdir}/t2_mask.nii.gz ${tmpdir}/seg_bin.nii.gz -add -thresh 1 inf 1 0 -type byte -o ${t2_affine_brain_exp_mask}
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${t2_affine_brain_exp_mask}
+      fi
+    else
+      continue
+    fi
+  fi
+  t2_affine_brain_exp_mask=$(LWDP_get_override_file ${t2_affine_brain_exp_mask})
+
+  #
+  # Running freesurfer for refined brain mask
+  #
+  export FSDIR_T1R=${WORKDIR}/structural/freesurfer_${ex}
+  
+  # Set up directories and links
+  [ -d ${FSDIR_T1R}/${subject}/mri/orig ] || mkdir -p ${FSDIR_T1R}/${subject}/mri/orig
+  
+  # Make input image for freesurfer
+  t1_brain_mgz=${FSDIR_T1R}/${subject}/mri/orig/001.mgz
+  if LWDP_needs_update_and_lock ${t1_brain_mgz} ${t1_brain} ${t2_affine_brain_mask} ${t2_affine_brain_exp_mask}; then
+    tmpdir=$(mktemp -d)
+    c3d c3d ${t2_affine_brain_mask} ${t2_affine_brain_exp_mask} -multiply -o ${tmpdir}/mask.nii.gz
+    c3d c3d ${tmpdir}/mask.nii.gz ${t2_affine_brain_mask} -scale -1 -add -thresh -inf -1 1 0 -o ${tmpdir}/mask_diff.nii.gz
+    c3d c3d ${t1_brain} ${tmpdir}/mask.nii.gz -multiply -o ${tmpdir}/t1_brain.nii.gz
+    # assign intensity 1 if t2 value is low: so this region will be excluded in freesurfer seg, but included in brain mask
+    c3d c3d ${tmpdir}/t1_brain.nii.gz ${tmpdir}/mask_diff.nii.gz -add -o ${tmpdir}/t1_brain.nii.gz
+    mri_convert -i ${tmpdir}/t1_brain.nii.gz -o ${t1_brain_mgz}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${t1_brain_mgz}
+  fi
+
+  freesurfer_run_all ${FSDIR_T1R} ${subject} true
+
+done
+
+#
+# Perform longitudinal freesurfer
+#
+if [ "${VISIT}" != "baseline" ]; then
+  if ! $LONGITUDINAL_FLAG; then 
+      echo "INFO:${WORKDIR}: skipping longitudinal freesurfer pipeline!" 
+      exit 0 
+  fi 
+
+  followup_year=`echo ${VISIT} | cut -d "_" -f2 | cut -d "y" -f1`
+  followup_char=`echo ${VISIT} | cut -d "_" -f2 | sed 's/^[0-9]\+//'`
+
+  visit_list=${CASESDIR}/${SUBJECT}/${ARM}/baseline
+  for year in `seq 1 ${followup_year}`; do
+    if [ -d ${CASESDIR}/${SUBJECT}/${ARM}/followup_${year}${followup_char}/structural/freesurfer ]; then
+      visit_list="${visit_list} ${CASESDIR}/${SUBJECT}/${ARM}/followup_${year}${followup_char}"
+    else
+	if [ ! -d ${CASESDIR}/${SUBJECT}/${ARM}/followup_${year}${followup_char}/structural ]; then 
+	    echo "WARNING:${WORKDIR}: missing ${CASESDIR}/${SUBJECT}/${ARM}/followup_${year}${followup_char}/structural; longitudinal freesurfer will omit this visit"
+	else 
+ 	    echo "ERROR:${WORKDIR}: directory 'freesurfer' is missing in ${CASESDIR}/${SUBJECT}/${ARM}/followup_${year}${followup_char}/structural; longitudinal freesurfer will omit this visit"
+	fi 
+    fi
+  done
+
+  bash ${NCANDA_BINARY_DIR}/ncanda_freesurfer_longitudinal_pipeline ${visit_list}
+fi
+

@@ -1,0 +1,2573 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+#
+# Script copmutes myelin scores and algins to HCP atlas 
+#
+
+#--------------------------------------
+#
+# Myelin computation in SRI24 space 
+# (moved from ncanda_structural_reformat_to_template.in as it has to be executed after freesurfer !)
+#
+#--------------------------------------
+inp[11]=${WORKDIR}/structural/denoised/t1.nii.gz
+out[11]=${WORKDIR}/structural/reslice/sri24/warp/t1_denoised_brain.nii.gz
+
+# Because of this input it has to be executed after freesurfer
+inp[12]=${WORKDIR}/structural/denoised/t2_affine_refined.nii.gz
+out[12]=${WORKDIR}/structural/reslice/sri24/warp/t2_affine_refined_denoised_brain.nii.gz
+
+atlas_mr=${DATA_DIR}/sri24/sri24_t1.nii.gz
+
+t1_sri24_affine=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_0GenericAffine.mat)
+t1_sri24_warp=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_1Warp.nii.gz)
+t1_sri24_mtx="${t1_sri24_warp} ${t1_sri24_affine}"
+
+for i in 11 12; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${atlas_mr} ${t1_sri24_mtx} ${out[1]}; then
+        ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${atlas_mr} -o ${out[${i}]} -t ${sri24_t1_mtx}
+        c3d c3d ${out[${i}]} ${out[1]} -multiply -clip 0 inf -type float -o ${out[${i}]}
+        LWDP_lockfile_delete ${out[${i}]}
+    fi
+done
+
+
+inp[13]=${WORKDIR}/structural/reslice/subject_t1/t2_affine_refined_brain_exp_mask.nii.gz
+out[13]=${WORKDIR}/structural/reslice/sri24/warp/t2_affine_refined_brain_exp_mask.nii.gz
+for i in 13; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${atlas_mr} ${t1_sri24_mtx}; then
+        ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${atlas_mr} -o ${out[${i}]} -t ${sri24_t1_mtx}
+        c3d c3d ${out[${i}]} -type uchar -o ${out[${i}]}
+        LWDP_lockfile_delete ${out[${i}]}
+    fi
+done 
+
+t1_aligned_to_sri24=${out[11]}
+t2_aligned_to_sri24=${out[12]}
+t1_div_t2=${WORKDIR}/structural/reslice/sri24/warp/t1_div_t2.nii.gz
+if LWDP_needs_update_and_lock ${t1_div_t2} ${t1_aligned_to_sri24} ${t2_aligned_to_sri24}; then
+    tmpdir=$(mktemp -d)
+    # sometimes wb_command -volume-math failed due to header mismatch, so match headers first
+    cp ${t1_aligned_to_sri24} ${tmpdir}/t1.nii.gz
+    cp ${t2_aligned_to_sri24} ${tmpdir}/t2.nii.gz
+    fsl fslcpgeom ${t1_aligned_to_sri24} ${tmpdir}/t2.nii.gz
+    #
+    caret7 wb_command -volume-math "clamp((T1w/T2w),0,100)" ${t1_div_t2} -var T1w ${tmpdir}/t1.nii.gz -var T2w ${tmpdir}/t2.nii.gz -fixnan 0
+    caret7 wb_command -volume-palette ${t1_div_t2} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    #
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${t1_div_t2}
+fi
+if [ ! -e ${t1_div_t2} ]; then
+    echo "ERROR: failed generating ${t1_div_t2}"
+else 
+    t2_mask_aligned_to_sri24=${out[13]}
+    t1_div_t2_masked=${WORKDIR}/structural/reslice/sri24/warp/t1_div_t2_masked.nii.gz
+    if LWDP_needs_update_and_lock ${t1_div_t2_masked} ${t1_div_t2} ${t2_mask_aligned_to_sri24}; then
+      caret7 wb_command -volume-math "clamp((VAL*MASK),0,20)" ${t1_div_t2_masked} -var VAL ${t1_div_t2} -var MASK ${t2_mask_aligned_to_sri24} -fixnan 0
+      caret7 wb_command -volume-palette ${t1_div_t2_masked} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      LWDP_lockfile_delete ${t1_div_t2_masked}
+    fi
+
+    # for testing
+    t1_div_t2_ref=${DATA_DIR}/sri24/sri24_t1_div_t2_HCP1200.nii.gz
+    t1_div_t2_bc=${WORKDIR}/structural/reslice/sri24/warp/t1_div_t2_bc.nii.gz
+    t1_div_t2_bias=${WORKDIR}/structural/reslice/sri24/warp/t1_div_t2_bias.nii.gz
+    if [ -e "${t1_div_t2_ref}" ] && LWDP_needs_update_and_lock ${t1_div_t2_bc} ${t1_div_t2_masked} ${t1_div_t2_ref} ${t2_mask_aligned_to_sri24}; then
+      tmpdir=$(mktemp -d)
+      #tmpdir=${WORKDIR}/structural/reslice/${atlas_type[${index}]}/warp/tmp
+      #mkdir -p ${tmpdir}
+      CorrectionSigma=`echo "sqrt ( 200 )" | bc -l`
+      caret7 wb_command -volume-smoothing ${t1_div_t2_masked} ${CorrectionSigma} ${tmpdir}/t1_div_t2_masked.nii.gz -roi ${t2_mask_aligned_to_sri24}
+      caret7 wb_command -volume-smoothing ${t1_div_t2_ref} ${CorrectionSigma} ${tmpdir}/t1_div_t2_ref.nii.gz -roi ${t2_mask_aligned_to_sri24}
+      caret7 wb_command -volume-math "((Individual-Reference)*Mask)" ${t1_div_t2_bias} -var Individual ${tmpdir}/t1_div_t2_masked.nii.gz -var Reference ${tmpdir}/t1_div_t2_ref.nii.gz -var Mask ${t2_mask_aligned_to_sri24}
+      caret7 wb_command -volume-math "((Individual-Bias)*Mask)" ${t1_div_t2_bc} -var Individual ${t1_div_t2_masked} -var Bias ${t1_div_t2_bias} -var Mask ${t2_mask_aligned_to_sri24}
+      caret7 wb_command -volume-palette ${t1_div_t2_bc} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${t1_div_t2_bc}
+    fi
+fi
+exit 0 
+#--------------------------------------
+#
+# Alignment of freesurfer results to HCP 
+#
+#--------------------------------------
+
+#
+# prepare reorient images
+#
+
+inp[1]=$(LWDP_get_override_file ${WORKDIR}/structural/mrbias/t1.nii.gz)
+inp[2]=$(LWDP_get_override_file ${WORKDIR}/structural/mrbias/t2_affine_refined.nii.gz)
+
+if [ ! -f ${inp[1]} -o ! -f ${inp[2]} ]; then
+  MSG="ERROR: missing or incomplete structural data: ${WORKDIR}"
+  echo "${MSG}"
+  #echo "${MSG}" | ncanda_error_email $(basename $0)
+  exit 1
+fi
+
+if [ "${VISIT}" == "baseline" ]; then
+  inp[3]=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain.nii.gz)
+else
+  inp[3]=$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/corrected/t1_brain.nii.gz)
+fi
+inp[4]=$(LWDP_get_override_file ${WORKDIR}/structural/denoised/t1.nii.gz)
+inp[5]=$(LWDP_get_override_file ${WORKDIR}/structural/denoised/t2_affine_refined.nii.gz)
+inp[6]=$(LWDP_get_override_file ${WORKDIR}/structural/stripped/t1_brain_mask.nii.gz)
+inp[7]=$(LWDP_get_override_file ${WORKDIR}/structural/reslice/subject_t1/t2_affine_refined_brain_mask.nii.gz)
+inp[8]=$(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg.nii.gz)
+out[1]=${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias.nii.gz
+out[2]=${WORKDIR}/structural/hcp/hcp_t1/t2_mrbias.nii.gz
+out[3]=${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias_brain.nii.gz
+out[4]=${WORKDIR}/structural/hcp/hcp_t1/t1_denoised.nii.gz
+out[5]=${WORKDIR}/structural/hcp/hcp_t1/t2_denoised.nii.gz
+out[6]=${WORKDIR}/structural/hcp/hcp_t1/t1_brain_mask.nii.gz
+out[7]=${WORKDIR}/structural/hcp/hcp_t1/t2_refined_brain_mask.nii.gz
+out[8]=${WORKDIR}/structural/hcp/hcp_t1/t1_seg.nii.gz
+for i in 1 2 3 4 5 6 7 8; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]}; then
+    # adopted from fslreorient2std procedure
+    prefix=`echo ${out[${i}]} | rev | cut -d . -f3- | rev`
+    scode=`fsl fslval ${inp[${i}]} sform_code | tr -d " "`
+    qcode=`fsl fslval ${inp[${i}]} qform_code | tr -d " "`
+    if [ "${scode}" == "0" -a "${qcode}" == "0" ]; then
+      echo "ERROR: Orientation information not stored in ${inp[${i}]}!"
+      exit 1
+    fi
+    pattern=sto_xyz
+    if [ "${scode}" == "0" ]; then
+      pattern=qto_xyz
+    fi
+    fsl fslhd ${inp[${i}]} | grep ${pattern} | awk '{ print $2 " " $3 " " $4 " " $5  }' > ${prefix}.mat
+    det=`fsl avscale ${prefix}.mat | grep Determinant | awk '{ print $3 }'`
+    echo "# Determinant: ${det}" > ${prefix}.log
+    if [ X`echo "if ( $det < 0 ) { 1 }" | bc -l` = X1 ]; then
+      # radiological case (negative determinant)
+      echo "fsl fslswapdim ${inp[${i}]} RL PA IS ${out[${i}]}" >> ${prefix}.log
+      fsl fslswapdim ${inp[${i}]} RL PA IS ${out[${i}]}
+    else
+      echo "fsl fslswapdim ${inp[${i}]} LR PA IS ${out[${i}]}" >> ${prefix}.log
+      fsl fslswapdim ${inp[${i}]} LR PA IS ${out[${i}]}
+    fi
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+hcp_t1_mrbias=${out[1]}
+hcp_t2_mrbias=${out[2]}
+hcp_t1_brain=${out[3]}
+hcp_t1_denoised=${out[4]}
+hcp_t2_denoised=${out[5]}
+hcp_t1_brainmask=${out[6]}
+hcp_t2_brain_mask=${out[7]}
+hcp_t1_seg=${out[8]}
+
+#
+# for baseline, align hcp t1 with hcp mni atlas
+#
+
+hcp_mni_atlas_t1=${DATA_DIR}/hcp/templates/MNI152_T1_1mm.nii.gz
+#hcp_mni_atlas_t1_brain=${DATA_DIR}/hcp/templates/MNI152_T1_1mm_brain.nii.gz
+hcp_mni_atlas_t1_brain=${DATA_DIR}/hcp/templates/MNI152_T1_1mm_brain_compact.nii.gz
+hcp_mni_atlas_t1_brain_mask=${DATA_DIR}/hcp/templates/MNI152_T1_1mm_brain_compact_mask.nii.gz
+
+if [ "${VISIT}" == "baseline" ]; then
+  # Only align baseline with atlas directly
+  hcp_t1_hcp_mni_pfx=${WORKDIR}/structural/registration/hcp_t1_hcp_mni/ants_
+  hcp_t1_hcp_mni_affine=${hcp_t1_hcp_mni_pfx}0GenericAffine.mat
+  if LWDP_needs_update_and_lock ${hcp_t1_hcp_mni_affine} ${hcp_t1_brain} ${hcp_mni_atlas_t1_brain}; then
+    tmpdir=$(mktemp -d)
+    log_out=${hcp_t1_hcp_mni_pfx}0GenericAffine.log
+
+    for i in 1 2; do
+      if [ "${i}" == "1" ]; then
+        ants antsRegistration -d 3 -u -w [0.005,0.995] -r [${hcp_t1_brain},${hcp_mni_atlas_t1_brain},0] -t Affine[0.001] -m MI[${hcp_t1_brain},${hcp_mni_atlas_t1_brain},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -o ${hcp_t1_hcp_mni_pfx} > ${log_out}
+      elif [ "${i}" == "2" ]; then
+        rm -f ${hcp_t1_hcp_mni_affine}
+        rm -f ${log_out}
+        echo "INFO: attempt affine registration again by changing parameters"
+
+        ants antsRegistration -d 3 -u -w [0.005,0.995] -r [${hcp_t1_brain},${hcp_mni_atlas_t1_brain},0] -t Rigid[0.001] -m MI[${hcp_t1_brain},${hcp_mni_atlas_t1_brain},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.001] -m MI[${hcp_t1_brain},${hcp_mni_atlas_t1_brain},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -o ${hcp_t1_hcp_mni_pfx} > ${log_out}
+      fi
+
+      # check registration result
+      ants antsApplyTransforms -n NearestNeighbor -i ${hcp_mni_atlas_t1_brain_mask} -r ${hcp_t1_brain} -o ${tmpdir}/hcp_mni_atlas_brainmask_affine_${i}.nii.gz -t ${hcp_t1_hcp_mni_affine}
+      dice=`c3d c3d ${hcp_t1_brainmask} ${tmpdir}/hcp_mni_atlas_brainmask_affine_${i}.nii.gz -overlap 1 | cut -d "," -f 5 | tr -d " "`
+      echo "INFO: overlap between warped hcp_mni_atlas mask and t1_brainmask: (dice = ${dice})"
+      if [ $(echo "${dice} < 0.9" | bc) -eq 1 ]; then
+        echo "WARNING: insufficient overlap between warped hcp_mni_atlas mask and t1_brainmask (dice = ${dice} < 0.9)"
+      else
+        # stop here if we get a sufficient overlap
+        echo "INFO: overlap is sufficient"
+        break
+      fi
+    done
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${hcp_t1_hcp_mni_affine}
+  fi
+  hcp_t1_hcp_mni_affine=$(LWDP_get_override_file ${hcp_t1_hcp_mni_affine})
+
+  hcp_t1_hcp_mni_warp=${hcp_t1_hcp_mni_pfx}1Warp.nii.gz
+  if LWDP_needs_update_and_lock ${hcp_t1_hcp_mni_warp} ${hcp_t1_brain} ${hcp_mni_atlas_t1_brain}; then
+    log_out=${hcp_t1_hcp_mni_pfx}1Warp.log
+    #ants antsRegistration -d 3 --initial-moving-transform ${hcp_t1_hcp_mni_affine} -t SyN[0.5,3,0.5] -m CC[${hcp_t1_mrbias},${hcp_mni_atlas_t1},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${hcp_t1_hcp_mni_pfx} > ${log_out}
+    #ants antsRegistration -d 3 --initial-moving-transform ${hcp_t1_hcp_mni_affine} -t SyN[0.5,3,0.5] -m CC[${hcp_t1_mrbias},${hcp_mni_atlas_t1},1,4] -c 50x30x10 -f 4x2x1 -s 2x1x0vox -o ${hcp_t1_hcp_mni_pfx} > ${log_out}
+    ants antsRegistration -d 3 --initial-moving-transform ${hcp_t1_hcp_mni_affine} -t SyN[0.1,3,0] -m CC[${hcp_t1_brain},${hcp_mni_atlas_t1_brain},1,4] -c 100x50x30x0 -f 8x4x2x1 -s 4x2x1x0vox -o ${hcp_t1_hcp_mni_pfx} > ${log_out}
+    LWDP_lockfile_delete ${hcp_t1_hcp_mni_warp}
+  fi
+  hcp_t1_hcp_mni_warp=$(LWDP_get_override_file ${hcp_t1_hcp_mni_warp})
+
+  hcp_t1_hcp_mni_warp_inv=$(LWDP_get_override_file ${hcp_t1_hcp_mni_pfx}1InverseWarp.nii.gz)
+
+  hcp_t1_hcp_mni_mtx="${hcp_t1_hcp_mni_warp} ${hcp_t1_hcp_mni_affine}"
+  hcp_mni_hcp_t1_mtx="[${hcp_t1_hcp_mni_affine},1] ${hcp_t1_hcp_mni_warp_inv}"
+else
+  # align with baseline t1
+  hcp_t1_brain_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/hcp/hcp_t1/t1_mrbias_brain.nii.gz)
+
+  # align to t1_baseline
+  hcp_t1_brain_to_baseline_pfx=${WORKDIR}/structural/longitudinal/registration/hcp_t1_brain_to_baseline/ants_
+  hcp_t1_brain_to_baseline_affine=${hcp_t1_brain_to_baseline_pfx}0GenericAffine.mat
+  if LWDP_needs_update_and_lock ${hcp_t1_brain_to_baseline_affine} ${hcp_t1_brain} ${hcp_t1_brain_at_baseline}; then
+    log_out=${hcp_t1_brain_to_baseline_pfx}0GenericAffine.log
+    ants antsRegistration -d 3 -r [${hcp_t1_brain},${hcp_t1_brain_at_baseline},1] -t Rigid[0.1] -m MI[${hcp_t1_brain},${hcp_t1_brain_at_baseline},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${hcp_t1_brain},${hcp_t1_brain_at_baseline},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -o ${hcp_t1_brain_to_baseline_pfx} > ${log_out}
+    LWDP_lockfile_delete ${hcp_t1_brain_to_baseline_affine}
+  fi
+  hcp_t1_brain_to_baseline_affine=$(LWDP_get_override_file ${hcp_t1_brain_to_baseline_affine})
+
+  hcp_t1_brain_to_baseline_warp=${hcp_t1_brain_to_baseline_pfx}1Warp.nii.gz
+  if LWDP_needs_update_and_lock ${hcp_t1_brain_to_baseline_warp} ${hcp_t1_brain} ${hcp_t1_brain_at_baseline}; then
+    log_out=${hcp_t1_brain_to_baseline_pfx}1Warp.log
+    ants antsRegistration -d 3 --initial-moving-transform ${hcp_t1_brain_to_baseline_affine} -t SyN[0.5,3,0.5] -m CC[${hcp_t1_brain},${hcp_t1_brain_at_baseline},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${hcp_t1_brain_to_baseline_pfx} > ${log_out}
+    LWDP_lockfile_delete ${hcp_t1_brain_to_baseline_warp}
+  fi
+  hcp_t1_brain_to_baseline_warp=$(LWDP_get_override_file ${hcp_t1_brain_to_baseline_warp})
+
+  hcp_t1_brain_to_baseline_warp_inv=$(LWDP_get_override_file ${hcp_t1_brain_to_baseline_pfx}1InverseWarp.nii.gz)
+
+  hcp_t1_hcp_mni_affine=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/hcp_t1_hcp_mni/ants_0GenericAffine.mat)
+  hcp_t1_hcp_mni_warp=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/hcp_t1_hcp_mni/ants_1Warp.nii.gz)
+  hcp_t1_hcp_mni_warp_inv=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/registration/hcp_t1_hcp_mni/ants_1InverseWarp.nii.gz)
+  if [ ! -e  ${hcp_t1_hcp_mni_affine} ] ; then
+    echo "ERROR: ${hcp_t1_hcp_mni_affine} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${hcp_t1_hcp_mni_warp} ] ; then
+    echo "ERROR: ${hcp_t1_hcp_mni_warp} is missing."
+    exit 1
+  fi
+  if [ ! -e  ${hcp_t1_hcp_mni_warp_inv} ] ; then
+    echo "ERROR: ${hcp_t1_hcp_mni_warp_inv} is missing."
+    exit 1
+  fi
+
+  hcp_t1_hcp_mni_mtx="${hcp_t1_brain_to_baseline_warp} ${hcp_t1_brain_to_baseline_affine} ${hcp_t1_hcp_mni_warp} ${hcp_t1_hcp_mni_affine}"
+  hcp_mni_hcp_t1_mtx="[${hcp_t1_hcp_mni_affine},1] ${hcp_t1_hcp_mni_warp_inv} [${hcp_t1_brain_to_baseline_affine},1] ${hcp_t1_brain_to_baseline_warp_inv}"
+fi
+
+hcp_t1_hcp_mni_concat=${WORKDIR}/structural/registration/hcp_t1_hcp_mni/concat/ants_0Warp.nii.gz
+if LWDP_needs_update_and_lock ${hcp_t1_hcp_mni_concat} ${hcp_t1_mrbias} ${hcp_t1_hcp_mni_mtx}; then
+  ants antsApplyTransforms -d 3 -o [${hcp_t1_hcp_mni_concat},1] -r ${hcp_t1_mrbias} -t ${hcp_t1_hcp_mni_mtx}
+  LWDP_lockfile_delete ${hcp_t1_hcp_mni_concat}
+fi
+hcp_mni_hcp_t1_concat=${WORKDIR}/structural/registration/hcp_mni_hcp_t1/concat/ants_0Warp.nii.gz
+if LWDP_needs_update_and_lock ${hcp_mni_hcp_t1_concat} ${hcp_mni_atlas_t1} ${hcp_t1_hcp_mni_mtx}; then
+  ants antsApplyTransforms -d 3 -o [${hcp_mni_hcp_t1_concat},1] -r ${hcp_mni_atlas_t1} -t ${hcp_mni_hcp_t1_mtx}
+  LWDP_lockfile_delete ${hcp_mni_hcp_t1_concat}
+fi
+
+## testing fnirt
+#hcp_mni_atlas_t1_2mm=${DATA_DIR}/hcp/templates/MNI152_T1_2mm.nii.gz
+#hcp_mni_atlas_t1_2mm_mask=${DATA_DIR}/hcp/templates/MNI152_T1_2mm_brain_mask_dil.nii.gz
+#FNIRTConfig=${DATA_DIR}/hcp/config/T1_2_MNI152_2mm.cnf
+#
+## linear then non-linear registration to MNI
+#hcp_t1_hcp_mni_xfms_dir=${WORKDIR}/structural/registration/hcp_t1_hcp_mni/xfms
+#hcp_t1_hcp_mni_xfms_affine=${hcp_t1_hcp_mni_xfms_dir}/acpc2MNILinear.mat
+#if LWDP_needs_update_and_lock ${hcp_t1_hcp_mni_xfms_affine} ${hcp_t1_brain} ${hcp_mni_atlas_t1_brain}; then
+#  fsl flirt -interp spline -dof 12 -in ${hcp_t1_brain} -ref ${hcp_mni_atlas_t1_brain} -omat ${hcp_t1_hcp_mni_xfms_affine} -out ${hcp_t1_hcp_mni_xfms_dir}/t1_to_MNILinear
+#  LWDP_lockfile_delete ${hcp_t1_hcp_mni_xfms_affine}
+#fi
+#hcp_t1_hcp_mni_xfms_warp=${hcp_t1_hcp_mni_xfms_dir}/acpc_dc2standard.nii.gz
+#if LWDP_needs_update_and_lock ${hcp_t1_hcp_mni_xfms_warp} ${hcp_t1_mrbias} ${hcp_mni_atlas_t1_2mm} ${hcp_mni_atlas_t1_2mm_mask} ${hcp_t1_hcp_mni_xfms_affine}; then
+#  fsl fnirt --in=${hcp_t1_mrbias} --ref=${hcp_mni_atlas_t1_2mm} --aff=${hcp_t1_hcp_mni_xfms_affine} --refmask=${hcp_mni_atlas_t1_2mm_mask} --fout=${hcp_t1_hcp_mni_xfms_warp} --jout=${hcp_t1_hcp_mni_xfms_dir}/NonlinearRegJacobians.nii.gz --refout=${hcp_t1_hcp_mni_xfms_dir}/IntensityModulatedT1.nii.gz --iout=${hcp_t1_hcp_mni_xfms_dir}/2mmReg.nii.gz --logout=${hcp_t1_hcp_mni_xfms_dir}/NonlinearReg.txt --intout=${hcp_t1_hcp_mni_xfms_dir}/NonlinearIntensities.nii.gz --cout=${hcp_t1_hcp_mni_xfms_dir}/NonlinearReg.nii.gz --config=${FNIRTConfig}
+#  LWDP_lockfile_delete ${hcp_t1_hcp_mni_xfms_warp}
+#fi
+#hcp_t1_hcp_mni_xfms_warp_inv=${hcp_t1_hcp_mni_xfms_dir}/standard2acpc_dc.nii.gz
+#if LWDP_needs_update_and_lock ${hcp_t1_hcp_mni_xfms_warp_inv} ${hcp_t1_hcp_mni_xfms_warp} ${hcp_t1_mrbias}; then
+#  fsl invwarp -w ${hcp_t1_hcp_mni_xfms_warp} -o ${hcp_t1_hcp_mni_xfms_warp_inv} -r ${hcp_t1_mrbias}
+#  LWDP_lockfile_delete ${hcp_t1_hcp_mni_xfms_warp_inv}
+#fi
+
+# align structural to hcp_mni
+inp[1]=${hcp_t1_mrbias}
+inp[2]=${hcp_t2_mrbias}
+out[1]=${WORKDIR}/structural/hcp/hcp_mni/t1_mrbias.nii.gz
+out[2]=${WORKDIR}/structural/hcp/hcp_mni/t2_mrbias.nii.gz
+for i in 1 2; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_mni_atlas_t1} ${hcp_mni_hcp_t1_concat}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${hcp_mni_atlas_t1} -o ${out[${i}]} -t ${hcp_mni_hcp_t1_concat}
+    c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+
+#
+# convert freesurfer volumes and surfaces
+#
+
+# hcp variables
+SurfaceAtlasDIR=${DATA_DIR}/hcp/templates/standard_mesh_atlases
+GrayordinatesSpaceDIR=${DATA_DIR}/hcp/templates/91282_Greyordinates
+GrayordinatesResolutions=2
+HighResMesh=164
+LowResMeshes=32
+SubcorticalGrayLabels=${DATA_DIR}/hcp/config/FreeSurferSubcorticalLabelTableLut.txt
+FreeSurferLabels=${DATA_DIR}/hcp/config/FreeSurferAllLut.txt
+#RegName=FS
+RegName=MSMSulc
+InflateExtraScale=1
+
+#FreeSurferFolder=${WORKDIR}/structural/freesurfer/${SUBJECT}_${ARM}_${VISIT}
+#FreeSurferFolder=${WORKDIR}/structural/freesurfer_t2/${SUBJECT}_${ARM}_${VISIT}
+if [ -d ${WORKDIR}/structural/freesurfer_refined3/${SUBJECT}_${ARM}_${VISIT} ]; then
+  FreeSurferFolder=${WORKDIR}/structural/freesurfer_refined3/${SUBJECT}_${ARM}_${VISIT}
+elif [ -d ${WORKDIR}/structural/freesurfer_refined2/${SUBJECT}_${ARM}_${VISIT} ]; then
+  FreeSurferFolder=${WORKDIR}/structural/freesurfer_refined2/${SUBJECT}_${ARM}_${VISIT}
+else
+  FreeSurferFolder=${WORKDIR}/structural/freesurfer_refined/${SUBJECT}_${ARM}_${VISIT}
+fi
+T1wFolder=${WORKDIR}/structural/hcp/hcp_t1
+AtlasSpaceFolder=${WORKDIR}/structural/hcp/hcp_mni
+NativeFolder=Native
+
+# convert freesurfer volumes
+for map in wmparc aparc.a2009s+aseg aparc+aseg; do
+  inp=${FreeSurferFolder}/mri/${map}.mgz
+  out_hcp_t1=${T1wFolder}/${map}.nii.gz
+  if LWDP_needs_update_and_lock ${out_hcp_t1} ${inp} ${hcp_t1_mrbias} ${FreeSurferLabels}; then
+    #mri_label2vol --seg ${inp} --temp ${hcp_t1_mrbias} --o ${out_hcp_t1}
+    mri_convert -rt nearest -rl ${hcp_t1_mrbias} ${inp} ${out_hcp_t1}
+    caret7 wb_command -volume-label-import ${out_hcp_t1} ${FreeSurferLabels} ${out_hcp_t1} -drop-unused-labels
+    # sync the header to ensure consistency
+    c3d c3d ${hcp_t1_mrbias} ${out_hcp_t1} -copy-transform -o ${out_hcp_t1}
+    LWDP_lockfile_delete ${out_hcp_t1}
+  fi
+  out_hcp_mni=${AtlasSpaceFolder}/${map}.nii.gz
+  if LWDP_needs_update_and_lock ${out_hcp_mni} ${out_hcp_t1} ${hcp_mni_atlas_t1} ${hcp_mni_hcp_t1_concat} ${FreeSurferLabels}; then
+    ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${out_hcp_t1} -r ${hcp_mni_atlas_t1} -o ${out_hcp_mni} -t ${hcp_mni_hcp_t1_concat}
+    caret7 wb_command -volume-label-import ${out_hcp_mni} ${FreeSurferLabels} ${out_hcp_mni} -drop-unused-labels
+    c3d c3d ${out_hcp_mni} -type short -o ${out_hcp_mni}
+    LWDP_lockfile_delete ${out_hcp_mni}
+  fi
+done
+
+# create freesurfer brain mask
+inp=${T1wFolder}/wmparc.nii.gz
+out_hcp_t1=${T1wFolder}/brainmask_fs.nii.gz
+if LWDP_needs_update_and_lock ${out_hcp_t1} ${inp} ${hcp_t1_mrbias}; then
+  fsl fslmaths ${inp} -bin -dilD -dilD -dilD -ero -ero ${out_hcp_t1}
+  caret7 wb_command -volume-fill-holes ${out_hcp_t1} ${out_hcp_t1}
+  fsl fslmaths ${out_hcp_t1} -bin ${out_hcp_t1}
+  # sync the header to ensure consistency
+  c3d c3d ${hcp_t1_mrbias} ${out_hcp_t1} -copy-transform -o ${out_hcp_t1}
+  LWDP_lockfile_delete ${out_hcp_t1}
+fi
+out_hcp_mni=${AtlasSpaceFolder}/brainmaks_fs.nii.gz
+if LWDP_needs_update_and_lock ${out_hcp_mni} ${out_hcp_t1} ${hcp_mni_hcp_t1_concat}; then
+  ants antsApplyTransforms -n NearestNeighbor -i ${out_hcp_t1} -r ${hcp_mni_atlas_t1} -o ${out_hcp_mni} -t ${hcp_mni_hcp_t1_concat}
+  c3d c3d ${out_hcp_mni} -type short -o ${out_hcp_mni}
+  LWDP_lockfile_delete ${out_hcp_mni}
+fi
+
+# import subcortical ROIs
+for GrayordinatesResolution in ${GrayordinatesResolutions}; do
+  roi=${GrayordinatesSpaceDIR}/Atlas_ROIs.${GrayordinatesResolution}.nii.gz
+
+  inp=${AtlasSpaceFolder}/wmparc.nii.gz
+  out=${AtlasSpaceFolder}/ROIs/wmparc.${GrayordinatesResolution}.nii.gz
+  if LWDP_needs_update_and_lock ${out} ${inp} ${roi}; then
+    fsl applywarp --interp=nn -i ${inp} -r ${roi} -o ${out}
+    caret7 wb_command -volume-label-import ${out} ${FreeSurferLabels} ${out} -drop-unused-labels
+    LWDP_lockfile_delete ${out}
+  fi
+
+  inp=${SurfaceAtlasDIR}/Avgwmparc.nii.gz
+  out=${AtlasSpaceFolder}/ROIs/Atlas_wmparc.${GrayordinatesResolution}.nii.gz
+  if LWDP_needs_update_and_lock ${out} ${inp} ${roi}; then
+    fsl applywarp --interp=nn -i ${inp} -r ${roi} -o ${out}
+    caret7 wb_command -volume-label-import ${out} ${FreeSurferLabels} ${out} -drop-unused-labels
+    LWDP_lockfile_delete ${out}
+  fi
+
+  inp=${AtlasSpaceFolder}/ROIs/wmparc.${GrayordinatesResolution}.nii.gz
+  out=${AtlasSpaceFolder}/ROIs/ROIs.${GrayordinatesResolution}.nii.gz
+  if LWDP_needs_update_and_lock ${out} ${inp}; then
+    caret7 wb_command -volume-label-import ${inp} ${SubcorticalGrayLabels} ${out} -discard-others
+    LWDP_lockfile_delete ${out}
+  fi
+
+  inp[1]=${AtlasSpaceFolder}/t1_mrbias.nii.gz
+  inp[2]=${AtlasSpaceFolder}/t2_mrbias.nii.gz
+  out[1]=${AtlasSpaceFolder}/ROIs/t1.${GrayordinatesResolution}.nii.gz
+  out[2]=${AtlasSpaceFolder}/ROIs/t2.${GrayordinatesResolution}.nii.gz
+  for i in 1 2; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]}; then
+      fsl applywarp --interp=spline -i ${inp[${i}]} -r ${roi} -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+done 
+
+# loop through left and right hemispheres
+for Hemisphere in L R; do
+  # set a bunch of different ways of saying left and right
+  if [ "${Hemisphere}" = "L" ]; then 
+    hemisphere=l
+    Structure=CORTEX_LEFT
+  elif [ "${Hemisphere}" = "R" ]; then 
+    hemisphere=r
+    Structure=CORTEX_RIGHT
+  fi
+  
+  # native mesh processing
+  # convert and volumetrically register white and pial surfaces making linear and nonlinear copies, add each to the appropriate spec file
+  Types="ANATOMICAL%GRAY_WHITE ANATOMICAL%PIAL"
+  i=1
+  for Surface in white pial; do
+    Type=`echo "$Types" | cut -d " " -f $i`
+    Secondary=`echo "$Type" | cut -d "%" -f 2`
+    Type=`echo "$Type" | cut -d "%" -f 1`
+    if [ ! $Secondary = $Type ] ; then
+      Secondary=`echo " -surface-secondary-type ""$Secondary"`
+    else
+      Secondary=""
+    fi
+
+    inp=${FreeSurferFolder}/surf/${hemisphere}h.${Surface}
+    out_hcp_t1=${T1wFolder}/${NativeFolder}/${Hemisphere}.${Surface}.native.surf.gii
+    if LWDP_needs_update_and_lock ${out_hcp_t1} ${inp}; then
+      tmpdir=$(mktemp -d)
+
+      mris_convert ${inp} ${out_hcp_t1}
+      caret7 wb_command -set-structure ${out_hcp_t1} ${Structure} -surface-type ${Type}${Secondary}
+
+      # find c_ras offset between FreeSurfer surface and volume and generate matrix to transform surfaces
+      MatrixX=`mri_info ${FreeSurferFolder}/mri/brain.finalsurfs.mgz | grep "c_r" | cut -d "=" -f 5 | sed s/" "/""/g`
+      MatrixY=`mri_info ${FreeSurferFolder}/mri/brain.finalsurfs.mgz | grep "c_a" | cut -d "=" -f 5 | sed s/" "/""/g`
+      MatrixZ=`mri_info ${FreeSurferFolder}/mri/brain.finalsurfs.mgz | grep "c_s" | cut -d "=" -f 5 | sed s/" "/""/g`
+      echo "1 0 0 ""$MatrixX" > ${tmpdir}/c_ras.mat
+      echo "0 1 0 ""$MatrixY" >> ${tmpdir}/c_ras.mat
+      echo "0 0 1 ""$MatrixZ" >> ${tmpdir}/c_ras.mat
+      echo "0 0 0 1" >> ${tmpdir}/c_ras.mat
+
+      caret7 wb_command -surface-apply-affine ${out_hcp_t1} ${tmpdir}/c_ras.mat ${out_hcp_t1}
+
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${out_hcp_t1}
+    fi
+
+    out_hcp_mni=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Surface}.native.surf.gii
+    # testing using fnirt warp
+    #if LWDP_needs_update_and_lock ${out_hcp_mni} ${out_hcp_t1} ${hcp_t1_hcp_mni_xfms_warp} ${hcp_t1_hcp_mni_xfms_warp_inv}; then
+    #  caret7 wb_command -surface-apply-warpfield ${out_hcp_t1} ${hcp_t1_hcp_mni_xfms_warp_inv} ${out_hcp_mni} -fnirt ${hcp_t1_hcp_mni_xfms_warp}
+    #  LWDP_lockfile_delete ${out_hcp_mni}
+    #fi
+    if LWDP_needs_update_and_lock ${out_hcp_mni} ${out_hcp_t1} ${hcp_t1_hcp_mni_concat}; then
+      tmpdir=$(mktemp -d)
+
+      cp ${out_hcp_t1} ${tmpdir}/${hemisphere}h.${Surface}.surf.gii
+      mris_convert ${tmpdir}/${hemisphere}h.${Surface}.surf.gii ${tmpdir}/${hemisphere}h.${Surface}.surf.asc
+      v_num=`sed -n 2p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | cut -d " " -f1`
+      e_num=`sed -n 2p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | cut -d " " -f2`
+      v_a=3
+      v_b=`expr ${v_num} + 2`
+      echo "x,y,z,t" > ${tmpdir}/${hemisphere}h_lps.csv
+      sed -n ${v_a},${v_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | tr -s " " | cut -d " " -f1 > ${tmpdir}/${hemisphere}h_ras_x.csv
+      sed -n ${v_a},${v_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | tr -s " " | cut -d " " -f2 > ${tmpdir}/${hemisphere}h_ras_y.csv
+      sed -n ${v_a},${v_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | tr -s " " | cut -d " " -f3 > ${tmpdir}/${hemisphere}h_ras_z.csv
+      sed -n ${v_a},${v_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc | tr -s " " | cut -d " " -f4 > ${tmpdir}/${hemisphere}h_ras_t.csv
+      cat ${tmpdir}/${hemisphere}h_ras_x.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${hemisphere}h_lps_x.csv
+      cat ${tmpdir}/${hemisphere}h_ras_y.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${hemisphere}h_lps_y.csv
+      cat ${tmpdir}/${hemisphere}h_ras_z.csv > ${tmpdir}/${hemisphere}h_lps_z.csv
+      cat ${tmpdir}/${hemisphere}h_ras_t.csv > ${tmpdir}/${hemisphere}h_lps_t.csv
+      paste -d "," ${tmpdir}/${hemisphere}h_lps_x.csv ${tmpdir}/${hemisphere}h_lps_y.csv ${tmpdir}/${hemisphere}h_lps_z.csv ${tmpdir}/${hemisphere}h_lps_t.csv >> ${tmpdir}/${hemisphere}h_lps.csv
+      
+      ants antsApplyTransformsToPoints -d 3 -p 1 -i ${tmpdir}/${hemisphere}h_lps.csv -o ${tmpdir}/${hemisphere}h_warp_lps.csv -t ${hcp_t1_hcp_mni_concat}
+      
+      sed -n 1,2p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc > ${tmpdir}/${hemisphere}h.${Surface}.native.surf.asc
+      c_a=2
+      c_b=`expr ${v_num} + 1`
+      sed -n ${c_a},${c_b}p ${tmpdir}/${hemisphere}h_warp_lps.csv | cut -d "," -f1 > ${tmpdir}/${hemisphere}h_warp_lps_x.csv
+      sed -n ${c_a},${c_b}p ${tmpdir}/${hemisphere}h_warp_lps.csv | cut -d "," -f2 > ${tmpdir}/${hemisphere}h_warp_lps_y.csv
+      sed -n ${c_a},${c_b}p ${tmpdir}/${hemisphere}h_warp_lps.csv | cut -d "," -f3 > ${tmpdir}/${hemisphere}h_warp_lps_z.csv
+      sed -n ${c_a},${c_b}p ${tmpdir}/${hemisphere}h_warp_lps.csv | cut -d "," -f4 > ${tmpdir}/${hemisphere}h_warp_lps_t.csv
+      cat ${tmpdir}/${hemisphere}h_warp_lps_x.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${hemisphere}h_warp_ras_x.csv
+      cat ${tmpdir}/${hemisphere}h_warp_lps_y.csv | awk '{ if( $NF ~ /^-/ ) { sub(/-/, "", $NF); print $0; } else { $NF="-"$NF; print $0 } }' > ${tmpdir}/${hemisphere}h_warp_ras_y.csv
+      cat ${tmpdir}/${hemisphere}h_warp_lps_z.csv > ${tmpdir}/${hemisphere}h_warp_ras_z.csv
+      cat ${tmpdir}/${hemisphere}h_warp_lps_t.csv > ${tmpdir}/${hemisphere}h_warp_ras_t.csv
+      paste -d " " ${tmpdir}/${hemisphere}h_warp_ras_x.csv ${tmpdir}/${hemisphere}h_warp_ras_y.csv ${tmpdir}/${hemisphere}h_warp_ras_z.csv ${tmpdir}/${hemisphere}h_warp_ras_t.csv >> ${tmpdir}/${hemisphere}h.${Surface}.native.surf.asc
+      
+      e_a=`expr ${v_b} + 1`
+      e_b=`expr ${v_b} + ${e_num}`
+      sed -n ${e_a},${e_b}p ${tmpdir}/${hemisphere}h.${Surface}.surf.asc >> ${tmpdir}/${hemisphere}h.${Surface}.native.surf.asc
+      
+      mris_convert ${tmpdir}/${hemisphere}h.${Surface}.native.surf.asc ${out_hcp_mni}
+
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${out_hcp_mni}
+    fi
+
+    let i++
+  done
+
+  # create midthickness by averaging white and pial surfaces and use it to make inflated surfaces
+  for Folder in ${T1wFolder} ${AtlasSpaceFolder}; do
+    inp_white=${Folder}/${NativeFolder}/${Hemisphere}.white.native.surf.gii
+    inp_pial=${Folder}/${NativeFolder}/${Hemisphere}.pial.native.surf.gii
+    out_mid=${Folder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+    if LWDP_needs_update_and_lock ${out_mid} ${inp_white} ${inp_pial}; then
+      caret7 wb_command -surface-average ${out_mid} -surf ${inp_white} -surf ${inp_pial}
+      caret7 wb_command -set-structure ${out_mid} ${Structure} -surface-type ANATOMICAL -surface-secondary-type MIDTHICKNESS
+      LWDP_lockfile_delete ${out_mid}
+    fi
+   
+    # get number of vertices from native file
+    NativeVerts=`caret7 wb_command -file-information ${out_mid} | grep 'Number of Vertices:' | cut -f2 -d: | tr -d '[:space:]'`
+    # HCP fsaverage_LR32k used -iterations-scale 0.75. Compute new param value for native mesh density
+    NativeInflationScale=`echo "scale=4; ${InflateExtraScale} * 0.75 * ${NativeVerts} / 32492" | bc -l`
+
+    out_inf=${Folder}/${NativeFolder}/${Hemisphere}.inflated.native.surf.gii
+    out_inf2=${Folder}/${NativeFolder}/${Hemisphere}.very_inflated.native.surf.gii
+    if LWDP_needs_update_and_lock ${out_inf} ${out_mid}; then
+      caret7 wb_command -surface-generate-inflated ${out_mid} ${out_inf} ${out_inf2} -iterations-scale ${NativeInflationScale}
+      LWDP_lockfile_delete ${out_inf}
+    fi
+  done
+  mid_hcp_t1=${T1wFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+
+  # convert original and registered spherical surfaces and add them to the nonlinear spec file
+  for Surface in sphere.reg sphere; do
+    inp=${FreeSurferFolder}/surf/${hemisphere}h.${Surface}
+    out=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Surface}.native.surf.gii
+    if LWDP_needs_update_and_lock ${out} ${inp}; then
+      mris_convert ${inp} ${out}
+      caret7 wb_command -set-structure ${out} ${Structure} -surface-type SPHERICAL
+      LWDP_lockfile_delete ${out}
+    fi
+  done
+  sphere_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.native.surf.gii
+  mid_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+
+  # convert FreeSurfer surface data (sulc) to metric/gifti
+  inp_sulc=${FreeSurferFolder}/surf/${hemisphere}h.sulc
+  inp_white=${FreeSurferFolder}/surf/${hemisphere}h.white
+  sulc_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sulc.native.shape.gii
+  if LWDP_needs_update_and_lock ${sulc_native} ${inp_sulc} ${inp_white} ${mid_native}; then
+    mris_convert -c ${inp_sulc} ${inp_white} ${sulc_native}
+    caret7 wb_command -set-structure ${sulc_native} ${Structure}
+    caret7 wb_command -metric-math "(var*(-1))" ${sulc_native} -var var ${sulc_native}
+    caret7 wb_command -set-map-names ${sulc_native} -map 1 "${Hemisphere}_Sulc"
+    caret7 wb_command -metric-palette ${sulc_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 2 98 -palette-name Gray_Interp -disp-pos true -disp-neg true -disp-zero true
+    LWDP_lockfile_delete ${sulc_native}
+  fi
+
+  # label operations
+  for Map in aparc aparc.a2009s BA; do
+    inp_annot=${FreeSurferFolder}/label/${hemisphere}h.${Map}.annot
+    if [ -e ${inp_annot} ] ; then
+      inp_white=${FreeSurferFolder}/surf/${hemisphere}h.white
+      out=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}.native.label.gii
+      if LWDP_needs_update_and_lock ${out} ${inp_annot} ${inp_white}; then
+        mris_convert --annot ${inp_annot} ${inp_white} ${out}
+        caret7 wb_command -set-structure ${out} ${Structure}
+        caret7 wb_command -set-map-names ${out} -map 1 "${Hemisphere}_${Map}"
+        caret7 wb_command -gifti-label-add-prefix ${out} ${Hemisphere}_ ${out}
+        LWDP_lockfile_delete ${out}
+      fi
+    fi
+  done
+
+  # copy atlas files
+  fsaverage_sphere_org=${SurfaceAtlasDIR}/fs_${Hemisphere}/fsaverage.${Hemisphere}.sphere.${HighResMesh}k_fs_${Hemisphere}.surf.gii
+  fsaverage_sphere=${AtlasSpaceFolder}/fsaverage/${Hemisphere}.sphere.${HighResMesh}k_fs_${Hemisphere}.surf.gii
+  if LWDP_needs_update_and_lock ${fsaverage_sphere} ${fsaverage_sphere_org}; then
+    cp ${fsaverage_sphere_org} ${fsaverage_sphere}
+    LWDP_lockfile_delete ${fsaverage_sphere}
+  fi
+  fsaverage_def_sphere_org=${SurfaceAtlasDIR}/fs_${Hemisphere}/fs_${Hemisphere}-to-fs_LR_fsaverage.${Hemisphere}_LR.spherical_std.${HighResMesh}k_fs_${Hemisphere}.surf.gii
+  fsaverage_def_sphere=${AtlasSpaceFolder}/fsaverage/${Hemisphere}.def_sphere.${HighResMesh}k_fs_${Hemisphere}.surf.gii
+  if LWDP_needs_update_and_lock ${fsaverage_def_sphere} ${fsaverage_def_sphere_org}; then
+    cp ${fsaverage_def_sphere_org} ${fsaverage_def_sphere}
+    LWDP_lockfile_delete ${fsaverage_def_sphere}
+  fi
+  spherical_std_org=${SurfaceAtlasDIR}/fsaverage.${Hemisphere}_LR.spherical_std.${HighResMesh}k_fs_LR.surf.gii
+  spherical_std=${AtlasSpaceFolder}/${Hemisphere}.sphere.${HighResMesh}k_fs_LR.surf.gii
+  if LWDP_needs_update_and_lock ${spherical_std} ${spherical_std_org}; then
+    cp ${spherical_std_org} ${spherical_std}
+    LWDP_lockfile_delete ${spherical_std}
+  fi
+  atlasroi_org=${SurfaceAtlasDIR}/${Hemisphere}.atlasroi.${HighResMesh}k_fs_LR.shape.gii
+  atlasroi=${AtlasSpaceFolder}/${Hemisphere}.atlasroi.${HighResMesh}k_fs_LR.shape.gii
+  if LWDP_needs_update_and_lock ${atlasroi} ${atlasroi_org}; then
+    cp ${atlasroi_org} ${atlasroi}
+    LWDP_lockfile_delete ${atlasroi}
+  fi
+  if [ "${VISIT}" == "baseline" ]; then
+    refsulc_org=${SurfaceAtlasDIR}/${Hemisphere}.refsulc.${HighResMesh}k_fs_LR.shape.gii
+  else
+    refsulc_org=${WORKDIR}/../baseline/structural/hcp/hcp_mni/${Hemisphere}.sulc.${HighResMesh}k_fs_LR.shape.gii
+  fi
+  refsulc=${AtlasSpaceFolder}/${Hemisphere}.refsulc.${HighResMesh}k_fs_LR.shape.gii
+  if LWDP_needs_update_and_lock ${refsulc} ${refsulc_org}; then
+    cp ${refsulc_org} ${refsulc}
+    LWDP_lockfile_delete ${refsulc}
+  fi
+  flat_org=${SurfaceAtlasDIR}/colin.cerebral.${Hemisphere}.flat.${HighResMesh}k_fs_LR.surf.gii
+  flat=${AtlasSpaceFolder}/${Hemisphere}.flat.${HighResMesh}k_fs_LR.surf.gii
+  if LWDP_needs_update_and_lock ${flat} ${flat_org}; then
+    cp ${flat_org} ${flat}
+    LWDP_lockfile_delete ${flat}
+  fi
+ 
+  # concatinate FS registration to FS --> FS_LR registration
+  spherereg=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.reg.native.surf.gii
+  spherereg_fs=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.reg.reg_LR.native.surf.gii
+  if LWDP_needs_update_and_lock ${spherereg_fs} ${spherereg} ${fsaverage_sphere}; then
+    caret7 wb_command -surface-sphere-project-unproject ${spherereg} ${fsaverage_sphere} ${fsaverage_def_sphere} ${spherereg_fs}
+    LWDP_lockfile_delete ${spherereg_fs}
+  fi
+
+  # make FreeSurfer Registration Areal Distortion Maps
+  arealdistortion_fs=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.ArealDistortion_FS.native.shape.gii
+  if LWDP_needs_update_and_lock ${arealdistortion_fs} ${sphere_native} ${spherereg_fs}; then
+    tmpdir=$(mktemp -d)
+    caret7 wb_command -surface-vertex-areas ${sphere_native} ${tmpdir}/${Hemisphere}.sphere.native.shape.gii
+    caret7 wb_command -surface-vertex-areas ${spherereg_fs} ${tmpdir}/${Hemisphere}.sphere.reg.reg_LR.native.shape.gii
+    caret7 wb_command -metric-math "(ln(spherereg/sphere)/ln(2))" ${arealdistortion_fs} -var sphere ${tmpdir}/${Hemisphere}.sphere.native.shape.gii -var spherereg ${tmpdir}/${Hemisphere}.sphere.reg.reg_LR.native.shape.gii
+    caret7 wb_command -set-map-names ${arealdistortion_fs} -map 1 "${Hemisphere}_Areal_Distortion_FS"
+    caret7 wb_command -metric-palette ${arealdistortion_fs} MODE_AUTO_SCALE -palette-name ROY-BIG-BL -thresholding THRESHOLD_TYPE_NORMAL THRESHOLD_TEST_SHOW_OUTSIDE -1 1
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${arealdistortion_fs}
+  fi
+
+  # if desired, run MSMSulc folding-based registration to FS_LR initialized with FS affine
+  if [ "${RegName}" == "MSMSulc" ] ; then
+    # calculate affine transform and apply
+    affine_mat=${AtlasSpaceFolder}/${NativeFolder}/MSMSulc/${Hemisphere}.mat
+    if LWDP_needs_update_and_lock ${affine_mat} ${sphere_native} ${spherereg_fs}; then
+      caret7 wb_command -surface-affine-regression ${sphere_native} ${spherereg_fs} ${affine_mat}
+      LWDP_lockfile_delete ${affine_mat}
+    fi
+
+    sphere_rot=${AtlasSpaceFolder}/${NativeFolder}/MSMSulc/${Hemisphere}.sphere_rot.surf.gii
+    if LWDP_needs_update_and_lock ${sphere_rot} ${sphere_native} ${affine_mat}; then
+      caret7 wb_command -surface-apply-affine ${sphere_native} ${affine_mat} ${sphere_rot}
+      caret7 wb_command -surface-modify-sphere ${sphere_rot} 100 ${sphere_rot}
+      #cp ${sphere_rot} ${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.rot.native.surf.gii
+      LWDP_lockfile_delete ${sphere_rot}
+    fi
+
+    msm_prefix=${AtlasSpaceFolder}/${NativeFolder}/MSMSulc/${Hemisphere}.
+    spherereg_msm=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.MSMSulc.native.surf.gii
+    if LWDP_needs_update_and_lock ${spherereg_msm} ${sphere_rot} ${spherical_std} ${sulc_native} ${refsulc}; then
+      # register using freesurfer sulc folding map using MSM algorithm configured for reduced distortion 
+      #msm msm --levels=4 --conf=${MSM_DIR}/allparameterssulcDRconf --inmesh=${sphere_rot} --trans=${sphere_rot} --refmesh=${spherical_std} --indata=${sulc_native} --refdata=${refsulc} --out=${msm_prefix} --verbose
+      msm msm --levels=4 --conf=${MSM_DIR}/allparameterssulcDRconfStage1to4 --inmesh=${sphere_rot} --trans=${sphere_rot} --refmesh=${spherical_std} --indata=${sulc_native} --refdata=${refsulc} --out=${msm_prefix} --verbose
+
+      #cp ${msm_prefix}HIGHRES_transformed.surf.gii ${spherereg_msm}
+      cp -p ${msm_prefix}sphere.reg.surf.gii ${spherereg_msm}
+      caret7 wb_command -set-structure ${spherereg_msm} ${Structure}
+
+      LWDP_lockfile_delete ${spherereg_msm}
+    fi
+
+    # make MSMSulc registration areal distortion maps
+    arealdistortion_msm=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.ArealDistortion_MSMSulc.native.shape.gii
+    if LWDP_needs_update_and_lock ${arealdistortion_msm} ${sphere_native} ${spherereg_msm}; then
+      tmpdir=$(mktemp -d)
+      caret7 wb_command -surface-vertex-areas ${sphere_native} ${tmpdir}/${Hemisphere}.sphere.native.shape.gii
+      caret7 wb_command -surface-vertex-areas ${spherereg_msm} ${tmpdir}/${Hemisphere}.sphere.MSMSulc.native.shape.gii
+      caret7 wb_command -metric-math "(ln(spherereg/sphere)/ln(2))" ${arealdistortion_msm} -var sphere ${tmpdir}/${Hemisphere}.sphere.native.shape.gii -var spherereg ${tmpdir}/${Hemisphere}.sphere.MSMSulc.native.shape.gii
+      caret7 wb_command -set-map-names ${arealdistortion_msm} -map 1 "${Hemisphere}_Areal_Distortion_MSMSulc"
+      caret7 wb_command -metric-palette ${arealdistortion_msm} MODE_AUTO_SCALE -palette-name ROY-BIG-BL -thresholding THRESHOLD_TYPE_NORMAL THRESHOLD_TEST_SHOW_OUTSIDE -1 1
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${arealdistortion_msm}
+    fi
+
+    RegSphere=${spherereg_msm}
+  else
+    RegSphere=${spherereg_fs}
+  fi
+
+  # ensure no zeros in atlas medial wall ROI
+  atlasroi_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.atlasroi.native.shape.gii
+  if LWDP_needs_update_and_lock ${atlasroi_native} ${atlasroi} ${spherical_std} ${RegSphere}; then
+    caret7 wb_command -metric-resample ${atlasroi} ${spherical_std} ${RegSphere} BARYCENTRIC ${atlasroi_native} -largest
+    LWDP_lockfile_delete ${atlasroi_native}
+  fi
+  # convert FreeSurfer surface data (thickness, curv) to metric/gifti
+  inp_thickness=${FreeSurferFolder}/surf/${hemisphere}h.thickness
+  roi_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+  thickness_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.thickness.native.shape.gii
+  if LWDP_needs_update_and_lock ${thickness_native} ${inp_thickness} ${inp_white} ${mid_native} ${atlasroi_native}; then
+    mris_convert -c ${inp_thickness} ${inp_white} ${thickness_native}
+    caret7 wb_command -set-structure ${thickness_native} ${Structure}
+    caret7 wb_command -metric-math "(var*(-1))" ${thickness_native} -var var ${thickness_native}
+    caret7 wb_command -set-map-names ${thickness_native} -map 1 "${Hemisphere}_Thickness"
+    caret7 wb_command -metric-palette ${thickness_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 2 98 -palette-name Gray_Interp -disp-pos true -disp-neg true -disp-zero true
+    # thickness specific operations
+    # roi_native is always updated with thickness_native
+    caret7 wb_command -metric-math "abs(thickness)" ${thickness_native} -var thickness ${thickness_native}
+    caret7 wb_command -metric-palette ${thickness_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    caret7 wb_command -metric-math "(thickness>0)" ${roi_native} -var thickness ${thickness_native}
+    caret7 wb_command -metric-fill-holes ${mid_native} ${roi_native} ${roi_native}
+    caret7 wb_command -metric-remove-islands ${mid_native} ${roi_native} ${roi_native}
+    caret7 wb_command -set-map-names ${roi_native} -map 1 "${Hemisphere}_ROI"
+    #
+    caret7 wb_command -metric-dilate ${thickness_native} ${mid_native} 10 ${thickness_native} -nearest
+    #
+    caret7 wb_command -metric-math "((atlas+individual)>0)" ${roi_native} -var atlas ${atlasroi_native} -var individual ${roi_native}
+    caret7 wb_command -metric-mask ${thickness_native} ${roi_native} ${thickness_native}
+    LWDP_lockfile_delete ${thickness_native}
+  fi
+  inp_curvature=${FreeSurferFolder}/surf/${hemisphere}h.curv
+  curvature_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.curvature.native.shape.gii
+  if LWDP_needs_update_and_lock ${curvature_native} ${inp_curvature} ${inp_white} ${mid_native} ${roi_native}; then
+    mris_convert -c ${inp_curvature} ${inp_white} ${curvature_native}
+    caret7 wb_command -set-structure ${curvature_native} ${Structure}
+    caret7 wb_command -metric-math "(var*(-1))" ${curvature_native} -var var ${curvature_native}
+    caret7 wb_command -set-map-names ${curvature_native} -map 1 "${Hemisphere}_Curvature"
+    caret7 wb_command -metric-palette ${curvature_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 2 98 -palette-name Gray_Interp -disp-pos true -disp-neg true -disp-zero true
+    #
+    caret7 wb_command -metric-dilate ${curvature_native} ${mid_native} 10 ${curvature_native} -nearest
+    #
+    caret7 wb_command -metric-mask ${curvature_native} ${roi_native} ${curvature_native}
+    LWDP_lockfile_delete ${curvature_native}
+  fi
+
+  # populate Highres fs_LR spec file. deform surfaces and other data according to native to folding-based registration selected above. regenerate inflated surfaces.
+  for Surface in white midthickness pial; do
+    inp=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Surface}.native.surf.gii
+    out=${AtlasSpaceFolder}/${Hemisphere}.${Surface}.${HighResMesh}k_fs_LR.surf.gii
+    if LWDP_needs_update_and_lock ${out} ${inp} ${RegSphere} ${spherical_std}; then
+      caret7 wb_command -surface-resample ${inp} ${RegSphere} ${spherical_std} BARYCENTRIC ${out}
+      LWDP_lockfile_delete ${out}
+    fi
+  done
+  mid_highres=${AtlasSpaceFolder}/${Hemisphere}.midthickness.${HighResMesh}k_fs_LR.surf.gii
+
+  # HCP fsaverage_LR32k used -iterations-scale 0.75. Compute new param value for high res mesh density
+  HighResInflationScale=`echo "scale=4; ${InflateExtraScale} * 0.75 * ${HighResMesh} / 32" | bc -l`
+
+  inflated_highres=${AtlasSpaceFolder}/${Hemisphere}.inflated.${HighResMesh}k_fs_LR.surf.gii
+  very_inflated_highres=${AtlasSpaceFolder}/${Hemisphere}.very_inflated.${HighResMesh}k_fs_LR.surf.gii
+  if LWDP_needs_update_and_lock ${inflated_highres} ${mid_highres}; then
+    caret7 wb_command -surface-generate-inflated ${mid_highres} ${inflated_highres} ${very_inflated_highres} -iterations-scale ${HighResInflationScale}
+    LWDP_lockfile_delete ${inflated_highres}
+  fi
+  
+  for Map in thickness curvature; do
+    inp=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}.native.shape.gii
+    out=${AtlasSpaceFolder}/${Hemisphere}.${Map}.${HighResMesh}k_fs_LR.shape.gii
+    if LWDP_needs_update_and_lock ${out} ${inp} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_highres} ${roi_native} ${atlasroi}; then
+      caret7 wb_command -metric-resample ${inp} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${out} -area-surfs ${mid_hcp_t1} ${mid_highres} -current-roi ${roi_native}
+      caret7 wb_command -metric-mask ${out} ${atlasroi} ${out}
+      LWDP_lockfile_delete ${out}
+    fi
+  done
+  out=${AtlasSpaceFolder}/${Hemisphere}.ArealDistortion_FS.${HighResMesh}k_fs_LR.shape.gii
+  if LWDP_needs_update_and_lock ${out} ${arealdistortion_fs} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_highres}; then
+    caret7 wb_command -metric-resample ${arealdistortion_fs} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${out} -area-surfs ${mid_hcp_t1} ${mid_highres}
+    LWDP_lockfile_delete ${out}
+  fi
+  if [ "${RegName}" == "MSMSulc" ]; then
+    out=${AtlasSpaceFolder}/${Hemisphere}.ArealDistortion_MSMSulc.${HighResMesh}k_fs_LR.shape.gii
+    if LWDP_needs_update_and_lock ${out} ${arealdistortion_msm} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_highres}; then
+      caret7 wb_command -metric-resample ${arealdistortion_msm} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${out} -area-surfs ${mid_hcp_t1} ${mid_highres}
+      LWDP_lockfile_delete ${out}
+    fi
+  fi
+  out=${AtlasSpaceFolder}/${Hemisphere}.sulc.${HighResMesh}k_fs_LR.shape.gii
+  if LWDP_needs_update_and_lock ${out} ${sulc_native} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_highres}; then
+    caret7 wb_command -metric-resample ${sulc_native} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${out} -area-surfs ${mid_hcp_t1} ${mid_highres}
+    LWDP_lockfile_delete ${out}
+  fi
+  for Map in aparc aparc.a2009s BA; do
+    inp=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}.native.label.gii
+    out=${AtlasSpaceFolder}/${Hemisphere}.${Map}.${HighResMesh}k_fs_LR.label.gii
+    if LWDP_needs_update_and_lock ${out} ${inp} ${RegSphere} ${spherical_std}; then
+      caret7 wb_command -label-resample ${inp} ${RegSphere} ${spherical_std} BARYCENTRIC ${out} -largest
+      LWDP_lockfile_delete ${out}
+    fi
+  done
+
+  for LowResMesh in ${LowResMeshes}; do
+    # copy atlas files
+    spherical_std_org=${SurfaceAtlasDIR}/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+    spherical_std=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+    if LWDP_needs_update_and_lock ${spherical_std} ${spherical_std_org}; then
+      cp ${spherical_std_org} ${spherical_std}
+      LWDP_lockfile_delete ${spherical_std}
+    fi
+    atlasroi_org=${GrayordinatesSpaceDIR}/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+    atlasroi=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+    if LWDP_needs_update_and_lock ${atlasroi} ${atlasroi_org}; then
+      cp ${atlasroi_org} ${atlasroi}
+      LWDP_lockfile_delete ${atlasroi}
+    fi
+    flat_org=${SurfaceAtlasDIR}/colin.cerebral.${Hemisphere}.flat.${LowResMesh}k_fs_LR.surf.gii
+    flat=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.flat.${LowResMesh}k_fs_LR.surf.gii
+    if LWDP_needs_update_and_lock ${flat} ${flat_org}; then
+      cp ${flat_org} ${flat}
+      LWDP_lockfile_delete ${flat}
+    fi
+
+    # create downsampled fs_LR spec files
+    for Surface in white midthickness pial ; do
+      inp=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Surface}.native.surf.gii
+      out=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Surface}.${LowResMesh}k_fs_LR.surf.gii
+      if LWDP_needs_update_and_lock ${out} ${inp} ${RegSphere} ${spherical_std}; then
+        caret7 wb_command -surface-resample ${inp} ${RegSphere} ${spherical_std} BARYCENTRIC ${out}
+        LWDP_lockfile_delete ${out}
+      fi
+    done
+    mid_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+
+    # HCP fsaverage_LR32k used -iterations-scale 0.75. Recalculate in case using a different mesh
+    LowResInflationScale=`echo "scale=4; $InflateExtraScale * 0.75 * $LowResMesh / 32" | bc -l`
+
+    inflated_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.inflated.${LowResMesh}k_fs_LR.surf.gii
+    very_inflated_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.very_inflated.${LowResMesh}k_fs_LR.surf.gii
+    if LWDP_needs_update_and_lock ${inflated_lowres} ${mid_lowres}; then
+      caret7 wb_command -surface-generate-inflated ${mid_lowres} ${inflated_lowres} ${very_inflated_lowres} -iterations-scale ${LowResInflationScale}
+      LWDP_lockfile_delete ${inflated_lowres}
+    fi
+  
+    for Map in sulc thickness curvature; do
+      inp=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}.native.shape.gii
+      out=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.shape.gii
+      if LWDP_needs_update_and_lock ${out} ${inp} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_lowres} ${roi_native} ${atlasroi}; then
+        caret7 wb_command -metric-resample ${inp} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${out} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+        caret7 wb_command -metric-mask ${out} ${atlasroi} ${out}
+        LWDP_lockfile_delete ${out}
+      fi
+    done
+    out=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.ArealDistortion_FS.${LowResMesh}k_fs_LR.shape.gii
+    if LWDP_needs_update_and_lock ${out} ${arealdistortion_fs} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_lowres}; then
+      caret7 wb_command -metric-resample ${arealdistortion_fs} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${out} -area-surfs ${mid_hcp_t1} ${mid_lowres}
+      LWDP_lockfile_delete ${out}
+    fi
+    if [ "${RegName}" == "MSMSulc" ]; then
+      out=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.ArealDistortion_MSMSulc.${LowResMesh}k_fs_LR.shape.gii
+      if LWDP_needs_update_and_lock ${out} ${arealdistortion_msm} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_lowres}; then
+        caret7 wb_command -metric-resample ${arealdistortion_msm} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${out} -area-surfs ${mid_hcp_t1} ${mid_lowres}
+        LWDP_lockfile_delete ${out}
+      fi
+    fi
+    out=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sulc.${LowResMesh}k_fs_LR.shape.gii
+    if LWDP_needs_update_and_lock ${out} ${sulc_native} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_lowres}; then
+      caret7 wb_command -metric-resample ${sulc_native} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${out} -area-surfs ${mid_hcp_t1} ${mid_lowres}
+      LWDP_lockfile_delete ${out}
+    fi
+    for Map in aparc aparc.a2009s BA; do
+      inp=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}.native.label.gii
+      out=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.label.gii
+      if LWDP_needs_update_and_lock ${out} ${inp} ${RegSphere} ${spherical_std}; then
+        caret7 wb_command -label-resample ${inp} ${RegSphere} ${spherical_std} BARYCENTRIC ${out} -largest
+        LWDP_lockfile_delete ${out}
+      fi
+    done
+
+    # create downsampled fs_LR spec file in structural space.  
+    for Surface in white midthickness pial; do
+      inp=${T1wFolder}/${NativeFolder}/${Hemisphere}.${Surface}.native.surf.gii
+      out=${T1wFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Surface}.${LowResMesh}k_fs_LR.surf.gii
+      if LWDP_needs_update_and_lock ${out} ${inp} ${RegSphere} ${spherical_std}; then
+        caret7 wb_command -surface-resample ${inp} ${RegSphere} ${spherical_std} BARYCENTRIC ${out}
+        LWDP_lockfile_delete ${out}
+      fi
+    done
+    mid_lowres=${T1wFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+
+    #HCP fsaverage_LR32k used -iterations-scale 0.75. Recalculate in case using a different mesh
+    LowResInflationScale=`echo "scale=4; ${InflateExtraScale} * 0.75 * ${LowResMesh} / 32" | bc -l`
+
+    inflated_lowres=${T1wFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.inflated.${LowResMesh}k_fs_LR.surf.gii
+    very_inflated_lowres=${T1wFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.very_inflated.${LowResMesh}k_fs_LR.surf.gii
+    if LWDP_needs_update_and_lock ${inflated_lowres} ${mid_lowres}; then
+      caret7 wb_command -surface-generate-inflated ${mid_lowres} ${inflated_lowres} ${very_inflated_lowres} -iterations-scale ${LowResInflationScale}
+      LWDP_lockfile_delete ${inflated_lowres}
+    fi
+  done
+done
+
+#
+# create cifti files
+#
+
+STRINGII=""
+for LowResMesh in ${LowResMeshes}; do
+  STRINGII=`echo "${STRINGII}${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k%${LowResMesh}k_fs_LR%atlasroi "`
+done
+for STRING in ${AtlasSpaceFolder}/${NativeFolder}%native%roi ${AtlasSpaceFolder}%${HighResMesh}k_fs_LR%atlasroi ${STRINGII}; do
+  Folder=`echo ${STRING} | cut -d "%" -f 1`
+  Mesh=`echo ${STRING} | cut -d "%" -f 2`
+  ROI=`echo ${STRING} | cut -d "%" -f 3`
+
+  inps="${Folder}/L.sulc.${Mesh}.shape.gii ${Folder}/R.sulc.${Mesh}.shape.gii"
+  out=${Folder}/sulc.${Mesh}.dscalar.nii
+  if LWDP_needs_update_and_lock ${out} ${inps}; then
+    caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.sulc.${Mesh}.shape.gii -right-metric ${Folder}/R.sulc.${Mesh}.shape.gii
+    caret7 wb_command -set-map-names ${out} -map 1 "Sulc"
+    caret7 wb_command -cifti-palette ${out} MODE_AUTO_SCALE_PERCENTAGE ${out} -pos-percent 2 98 -palette-name Gray_Interp -disp-pos true -disp-neg true -disp-zero true
+    LWDP_lockfile_delete ${out}
+  fi
+
+  if [ -e ${Folder}/L.refsulc.${Mesh}.shape.gii ]; then
+    inps="${Folder}/L.refsulc.${Mesh}.shape.gii ${Folder}/R.refsulc.${Mesh}.shape.gii"
+    out=${Folder}/refsulc.${Mesh}.dscalar.nii
+    if LWDP_needs_update_and_lock ${out} ${inps}; then
+      caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.refsulc.${Mesh}.shape.gii -right-metric ${Folder}/R.refsulc.${Mesh}.shape.gii
+      caret7 wb_command -set-map-names ${out} -map 1 "RefSulc"
+      caret7 wb_command -cifti-palette ${out} MODE_AUTO_SCALE_PERCENTAGE ${out} -pos-percent 2 98 -palette-name Gray_Interp -disp-pos true -disp-neg true -disp-zero true
+      LWDP_lockfile_delete ${out}
+    fi
+  fi
+
+  inps="${Folder}/L.curvature.${Mesh}.shape.gii ${Folder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.curvature.${Mesh}.shape.gii ${Folder}/R.${ROI}.${Mesh}.shape.gii"
+  out=${Folder}/curvature.${Mesh}.dscalar.nii
+  if LWDP_needs_update_and_lock ${out} ${inps}; then
+    caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.curvature.${Mesh}.shape.gii -roi-left ${Folder}/L.${ROI}.${Mesh}.shape.gii -right-metric ${Folder}/R.curvature.${Mesh}.shape.gii -roi-right ${Folder}/R.${ROI}.${Mesh}.shape.gii
+    caret7 wb_command -set-map-names ${out} -map 1 "Curvature"
+    caret7 wb_command -cifti-palette ${out} MODE_AUTO_SCALE_PERCENTAGE ${out} -pos-percent 2 98 -palette-name Gray_Interp -disp-pos true -disp-neg true -disp-zero true
+    LWDP_lockfile_delete ${out}
+  fi
+
+  inps="${Folder}/L.thickness.${Mesh}.shape.gii ${Folder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.thickness.${Mesh}.shape.gii ${Folder}/R.${ROI}.${Mesh}.shape.gii"
+  out=${Folder}/thickness.${Mesh}.dscalar.nii
+  if LWDP_needs_update_and_lock ${out} ${inps}; then
+    caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.thickness.${Mesh}.shape.gii -roi-left ${Folder}/L.${ROI}.${Mesh}.shape.gii -right-metric ${Folder}/R.thickness.${Mesh}.shape.gii -roi-right ${Folder}/R.${ROI}.${Mesh}.shape.gii
+    caret7 wb_command -set-map-names ${out} -map 1 "Thickness"
+    caret7 wb_command -cifti-palette ${out} MODE_AUTO_SCALE_PERCENTAGE ${out} -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${out}
+  fi
+
+  inps="${Folder}/L.ArealDistortion_FS.${Mesh}.shape.gii ${Folder}/R.ArealDistortion_FS.${Mesh}.shape.gii"
+  out=${Folder}/ArealDistortion_FS.${Mesh}.dscalar.nii
+  if LWDP_needs_update_and_lock ${out} ${inps}; then
+    caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.ArealDistortion_FS.${Mesh}.shape.gii -right-metric ${Folder}/R.ArealDistortion_FS.${Mesh}.shape.gii
+    caret7 wb_command -set-map-names ${out} -map 1 "ArealDistortion_FS"
+    caret7 wb_command -cifti-palette ${out} MODE_USER_SCALE ${Folder}/ArealDistortion_FS.${Mesh}.dscalar.nii -pos-user 0 1 -neg-user 0 -1 -interpolate true -palette-name ROY-BIG-BL -disp-pos true -disp-neg true -disp-zero false
+    LWDP_lockfile_delete ${out}
+  fi
+  if [ "${RegName}" == "MSMSulc" ]; then
+    inps="${Folder}/L.ArealDistortion_MSMSulc.${Mesh}.shape.gii ${Folder}/R.ArealDistortion_MSMSulc.${Mesh}.shape.gii"
+    out=${Folder}/ArealDistortion_MSMSulc.${Mesh}.dscalar.nii
+    if LWDP_needs_update_and_lock ${out} ${inps}; then
+      caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.ArealDistortion_MSMSulc.${Mesh}.shape.gii -right-metric ${Folder}/R.ArealDistortion_MSMSulc.${Mesh}.shape.gii
+      caret7 wb_command -set-map-names ${out} -map 1 "ArealDistortion_MSMSulc"
+      caret7 wb_command -cifti-palette ${out} MODE_USER_SCALE ${out} -pos-user 0 1 -neg-user 0 -1 -interpolate true -palette-name ROY-BIG-BL -disp-pos true -disp-neg true -disp-zero false
+      LWDP_lockfile_delete ${out}
+    fi
+  fi
+  
+  for Map in aparc aparc.a2009s BA; do
+    inps="${Folder}/L.${Map}.${Mesh}.label.gii ${Folder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.${Map}.${Mesh}.label.gii ${Folder}/R.${ROI}.${Mesh}.shape.gii"
+    out=${Folder}/${Map}.${Mesh}.dlabel.nii
+    if LWDP_needs_update_and_lock ${out} ${inps}; then
+      caret7 wb_command -cifti-create-label ${out} -left-label ${Folder}/L.${Map}.${Mesh}.label.gii -roi-left ${Folder}/L.${ROI}.${Mesh}.shape.gii -right-label ${Folder}/R.${Map}.${Mesh}.label.gii -roi-right ${Folder}/R.${ROI}.${Mesh}.shape.gii
+      caret7 wb_command -set-map-names ${out} -map 1 "${Map}"
+      LWDP_lockfile_delete ${out}
+    fi
+  done 
+done
+
+#
+# create ribbon
+#
+
+LeftGreyRibbonValue=3
+LeftWhiteMaskValue=2
+RightGreyRibbonValue=42
+RightWhiteMaskValue=41
+
+for Folder in ${T1wFolder} ${AtlasSpaceFolder}; do
+  inps="${Folder}/${NativeFolder}/L.pial.native.surf.gii ${Folder}/${NativeFolder}/R.pial.native.surf.gii ${Folder}/${NativeFolder}/L.white.native.surf.gii ${Folder}/${NativeFolder}/R.white.native.surf.gii"
+  out=${Folder}/ribbon.nii.gz
+  if LWDP_needs_update_and_lock ${out} ${inps}; then
+    tmpdir=$(mktemp -d)
+
+    for Hemisphere in L R; do
+      if [ ${Hemisphere} = "L" ] ; then
+        GreyRibbonValue=${LeftGreyRibbonValue}
+        WhiteMaskValue=${LeftWhiteMaskValue}
+      elif [ ${Hemisphere} = "R" ] ; then
+        GreyRibbonValue=${RightGreyRibbonValue}
+        WhiteMaskValue=${RightWhiteMaskValue}
+      fi
+
+      if [ "${Folder}" == "${T1wFolder}" ]; then
+        caret7 wb_command -create-signed-distance-volume ${Folder}/${NativeFolder}/${Hemisphere}.white.native.surf.gii ${hcp_t1_mrbias} ${tmpdir}/${Hemisphere}.white.native.nii.gz
+        caret7 wb_command -create-signed-distance-volume ${Folder}/${NativeFolder}/${Hemisphere}.pial.native.surf.gii ${hcp_t1_mrbias} ${tmpdir}/${Hemisphere}.pial.native.nii.gz
+      else
+        caret7 wb_command -create-signed-distance-volume ${Folder}/${NativeFolder}/${Hemisphere}.white.native.surf.gii ${Folder}/t1_mrbias.nii.gz ${tmpdir}/${Hemisphere}.white.native.nii.gz
+        caret7 wb_command -create-signed-distance-volume ${Folder}/${NativeFolder}/${Hemisphere}.pial.native.surf.gii ${Folder}/t1_mrbias.nii.gz ${tmpdir}/${Hemisphere}.pial.native.nii.gz
+      fi
+
+      fsl fslmaths ${tmpdir}/${Hemisphere}.white.native.nii.gz -thr 0 -bin -mul 255 ${tmpdir}/${Hemisphere}.white_thr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.white_thr0.native.nii.gz -bin ${tmpdir}/${Hemisphere}.white_thr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.pial.native.nii.gz -uthr 0 -abs -bin -mul 255 ${tmpdir}/${Hemisphere}.pial_uthr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.pial_uthr0.native.nii.gz -bin ${tmpdir}/${Hemisphere}.pial_uthr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.pial_uthr0.native.nii.gz -mas ${tmpdir}/${Hemisphere}.white_thr0.native.nii.gz -mul 255 ${tmpdir}/${Hemisphere}.ribbon.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.ribbon.nii.gz -bin -mul ${GreyRibbonValue} ${tmpdir}/${Hemisphere}.ribbon.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.white.native.nii.gz -uthr 0 -abs -bin -mul 255 ${tmpdir}/${Hemisphere}.white_uthr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.white_uthr0.native.nii.gz -bin ${tmpdir}/${Hemisphere}.white_uthr0.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.white_uthr0.native.nii.gz -mul ${WhiteMaskValue} ${tmpdir}/${Hemisphere}.white_mask.native.nii.gz
+      fsl fslmaths ${tmpdir}/${Hemisphere}.ribbon.nii.gz -add ${tmpdir}/${Hemisphere}.white_mask.native.nii.gz ${tmpdir}/${Hemisphere}.ribbon.nii.gz
+    done
+
+    fsl fslmaths ${tmpdir}/L.ribbon.nii.gz -add ${tmpdir}/R.ribbon.nii.gz ${out}
+
+    caret7 wb_command -volume-label-import ${out} ${FreeSurferLabels} ${out} -drop-unused-labels
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${out}
+  fi
+done
+
+#
+# bias field estimation for T1w * T2w
+#
+
+hcp_t1_aparc_aseg=${T1wFolder}/aparc+aseg.nii.gz
+
+hcp_t1_bias=${WORKDIR}/structural/hcp/hcp_t1/bias_field.nii.gz
+#if LWDP_needs_update_and_lock ${hcp_t1_bias} ${hcp_t1_denoised} ${hcp_t2_denoised} ${hcp_t1_brainmask} ${hcp_t2_brain_mask} ${hcp_t1_seg}; then
+#  #tmpdir=$(mktemp -d)
+#  tmpdir=${WORKDIR}/structural/hcp/tmp
+#  mkdir -p ${tmpdir}
+#
+#  BiasFieldSmoothingSigma=5
+#  Factor="0.5" # this is the number of standard deviations below the mean to threshold the non-brain tissues at
+#
+#  # form sqrt(T1w*T2w), mask this and normalise by the mean
+#  fsl fslmaths ${hcp_t1_denoised} -mul ${hcp_t2_denoised} -abs -sqrt ${tmpdir}/T1wmulT2w.nii.gz -odt float
+#  fsl fslmaths ${tmpdir}/T1wmulT2w.nii.gz -mas ${hcp_t1_brainmask} ${tmpdir}/T1wmulT2w_brain.nii.gz
+#
+#  c3d c3d ${hcp_t1_seg} -replace 1 0 2 1 3 1 -o ${tmpdir}/mask.nii.gz
+#  c3d c3d ${tmpdir}/T1wmulT2w_brain.nii.gz ${tmpdir}/mask.nii.gz -multiply ${hcp_t2_brain_mask} -multiply -o ${tmpdir}/T1wmulT2w_brain.nii.gz
+#
+#  meanbrainval=`fsl fslstats ${tmpdir}/T1wmulT2w_brain.nii.gz -M`
+#  fsl fslmaths ${tmpdir}/T1wmulT2w_brain.nii.gz -div ${meanbrainval} ${tmpdir}/T1wmulT2w_brain_norm.nii.gz
+#  
+#  ## smooth the normalised sqrt image, using within-mask smoothing : s(Mask*X)/s(Mask)
+#  #fsl fslmaths ${tmpdir}/T1wmulT2w_brain_norm.nii.gz -bin -s ${BiasFieldSmoothingSigma} ${tmpdir}/SmoothNorm_s${BiasFieldSmoothingSigma}.nii.gz
+#  #fsl fslmaths ${tmpdir}/T1wmulT2w_brain_norm.nii.gz -s ${BiasFieldSmoothingSigma} -div ${tmpdir}/SmoothNorm_s${BiasFieldSmoothingSigma}.nii.gz ${tmpdir}/T1wmulT2w_brain_norm_s${BiasFieldSmoothingSigma}.nii.gz
+#  #
+#  ## divide normalised sqrt image by smoothed version (to do simple bias correction)
+#  #fsl fslmaths ${tmpdir}/T1wmulT2w_brain_norm.nii.gz -div ${tmpdir}/T1wmulT2w_brain_norm_s${BiasFieldSmoothingSigma}.nii.gz ${tmpdir}/T1wmulT2w_brain_norm_modulate.nii.gz
+#  #
+#  ## create a mask using a threshold at Mean - 0.5*Stddev, with filling of holes to remove any non-grey/white tissue.
+#  #STD=`fsl fslstats ${tmpdir}/T1wmulT2w_brain_norm_modulate.nii.gz -S`
+#  #echo ${STD}
+#  #MEAN=`fsl fslstats ${tmpdir}/T1wmulT2w_brain_norm_modulate.nii.gz -M`
+#  #echo ${MEAN}
+#  #Lower=`echo "${MEAN} - (${STD} * ${Factor})" | bc -l`
+#  #echo ${Lower}
+#  #fsl fslmaths ${tmpdir}/T1wmulT2w_brain_norm_modulate.nii.gz -thr ${Lower} -bin -ero -mul 255 ${tmpdir}/T1wmulT2w_brain_norm_modulate_mask.nii.gz
+#  #caret7 wb_command -volume-remove-islands ${tmpdir}/T1wmulT2w_brain_norm_modulate_mask.nii.gz ${tmpdir}/T1wmulT2w_brain_norm_modulate_mask.nii.gz
+#  #c3d c3d ${tmpdir}/T1wmulT2w_brain_norm_modulate_mask.nii.gz ${tmpdir}/mask.nii.gz -multiply -o ${tmpdir}/T1wmulT2w_brain_norm_modulate_mask.nii.gz
+#
+#  # extrapolate normalised sqrt image from mask region out to whole FOV
+#  #fsl fslmaths ${tmpdir}/T1wmulT2w_brain_norm.nii.gz -mas ${tmpdir}/T1wmulT2w_brain_norm_modulate_mask.nii.gz -dilall ${tmpdir}/bias_raw.nii.gz -odt float
+#  fsl fslmaths ${tmpdir}/T1wmulT2w_brain_norm.nii.gz -mas ${tmpdir}/mask.nii.gz -dilall ${tmpdir}/bias_raw.nii.gz -odt float
+#  fsl fslmaths ${tmpdir}/bias_raw.nii.gz -s ${BiasFieldSmoothingSigma} ${hcp_t1_bias}
+#  
+#  #rm -rf ${tmpdir}
+#  LWDP_lockfile_delete ${hcp_t1_bias}
+#fi
+if LWDP_needs_update_and_lock ${hcp_t1_bias} ${hcp_t1_denoised} ${hcp_t2_denoised} ${hcp_t1_aparc_aseg}; then
+  tmpdir=$(mktemp -d)
+  #tmpdir=${WORKDIR}/structural/hcp/hcp_t1/bias
+  #mkdir -p ${tmpdir}
+  fsl fslmaths ${hcp_t1_denoised} -mul ${hcp_t2_denoised} -abs -sqrt ${tmpdir}/T1wmulT2w.nii.gz -odt float
+
+  c3d c3d ${hcp_t1_aparc_aseg} -thresh 1 inf 1 0 -o ${tmpdir}/mask.nii.gz
+  c3d c3d ${tmpdir}/T1wmulT2w.nii.gz ${tmpdir}/mask.nii.gz -copy-transform -o ${tmpdir}/mask.nii.gz 
+
+  fsl fslmaths ${tmpdir}/T1wmulT2w.nii.gz -mas ${tmpdir}/mask.nii.gz ${tmpdir}/T1wmulT2w_brain.nii.gz
+  meanbrainval=`fsl fslstats ${tmpdir}/T1wmulT2w_brain.nii.gz -M`
+  fsl fslmaths ${tmpdir}/T1wmulT2w.nii.gz -div ${meanbrainval} ${tmpdir}/T1wmulT2w_norm.nii.gz
+
+  ants N4BiasFieldCorrection -i ${tmpdir}/T1wmulT2w_norm.nii.gz -x ${tmpdir}/mask.nii.gz -o [${tmpdir}/T1wmulT2w_norm_corrected.nii.gz,${hcp_t1_bias}]
+
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${hcp_t1_bias}
+fi
+
+#
+# cross-sectional myelin mapping
+#
+
+CorrectionSigma=`echo "sqrt ( 200 )" | bc -l`
+MyelinMappingFWHM=5
+SurfaceSmoothingFWHM=4
+MyelinMappingSigma=`echo "${MyelinMappingFWHM} / ( 2 * ( sqrt ( 2 * l ( 2 ) ) ) )" | bc -l`
+SurfaceSmoothingSigma=`echo "${SurfaceSmoothingFWHM} / ( 2 * ( sqrt ( 2 * l ( 2 ) ) ) )" | bc -l`
+
+hcp_t1_hcp_mni_jacobian=${WORKDIR}/structural/registration/hcp_t1_hcp_mni/concat/ants_0Warp_jacobian.nii.gz
+if LWDP_needs_update_and_lock ${hcp_t1_hcp_mni_jacobian} ${hcp_t1_mrbias} ${hcp_t1_hcp_mni_concat}; then
+  #CreateJacobianDeterminantImage imageDimension deformationField outputImage [doLogJacobian=0] [useGeometric=0]
+  ants CreateJacobianDeterminantImage 3 ${hcp_t1_hcp_mni_concat} ${hcp_t1_hcp_mni_jacobian}
+  caret7 wb_command -volume-palette ${hcp_t1_hcp_mni_jacobian} MODE_AUTO_SCALE -interpolate true -disp-pos true -disp-neg false -disp-zero false -palette-name HSB8_clrmid -thresholding THRESHOLD_TYPE_NORMAL THRESHOLD_TEST_SHOW_OUTSIDE 0.5 2
+  LWDP_lockfile_delete ${hcp_t1_hcp_mni_jacobian}
+fi
+
+# align structural to hcp_mni
+hcp_mni_bias=${WORKDIR}/structural/hcp/hcp_mni/bias_field.nii.gz
+hcp_mni_t1_denoised=${WORKDIR}/structural/hcp/hcp_mni/t1_denoised.nii.gz
+hcp_mni_t2_denoised=${WORKDIR}/structural/hcp/hcp_mni/t2_denoised.nii.gz
+hcp_mni_t1_brainmask=${WORKDIR}/structural/hcp/hcp_mni/t1_brain_mask.nii.gz
+inp[1]=${hcp_t1_denoised}
+inp[2]=${hcp_t2_denoised}
+inp[3]=${hcp_t1_bias}
+out[1]=${hcp_mni_t1_denoised}
+out[2]=${hcp_mni_t2_denoised}
+out[3]=${hcp_mni_bias}
+for i in 1 2 3; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_mni_atlas_t1} ${hcp_mni_hcp_t1_concat}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${hcp_mni_atlas_t1} -o ${out[${i}]} -t ${hcp_mni_hcp_t1_concat}
+    c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+inp[1]=${hcp_t1_brainmask}
+out[1]=${hcp_mni_t1_brainmask}
+for i in 1; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_mni_atlas_t1} ${hcp_mni_hcp_t1_concat}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${hcp_mni_atlas_t1} -o ${out[${i}]} -t ${hcp_mni_hcp_t1_concat}
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+
+# use bias field output to create corrected images
+hcp_t1_restore=${WORKDIR}/structural/hcp/hcp_t1/t1_restore.nii.gz
+hcp_t2_restore=${WORKDIR}/structural/hcp/hcp_t1/t2_restore.nii.gz
+hcp_t1_restore_brain=${WORKDIR}/structural/hcp/hcp_t1/t1_restore_brain.nii.gz
+hcp_t2_restore_brain=${WORKDIR}/structural/hcp/hcp_t1/t2_restore_brain.nii.gz
+hcp_mni_t1_restore=${WORKDIR}/structural/hcp/hcp_mni/t1_restore.nii.gz
+hcp_mni_t2_restore=${WORKDIR}/structural/hcp/hcp_mni/t2_restore.nii.gz
+hcp_mni_t1_restore_brain=${WORKDIR}/structural/hcp/hcp_mni/t1_restore_brain.nii.gz
+hcp_mni_t2_restore_brain=${WORKDIR}/structural/hcp/hcp_mni/t2_restore_brain.nii.gz
+inp[1]=${hcp_t1_denoised}
+inp[2]=${hcp_t2_denoised}
+inp[3]=${hcp_mni_t1_denoised}
+inp[4]=${hcp_mni_t2_denoised}
+bias[1]=${hcp_t1_bias}
+bias[2]=${hcp_t1_bias}
+bias[3]=${hcp_mni_bias}
+bias[4]=${hcp_mni_bias}
+out[1]=${hcp_t1_restore}
+out[2]=${hcp_t2_restore}
+out[3]=${hcp_mni_t1_restore}
+out[4]=${hcp_mni_t2_restore}
+for i in 1 2 3 4; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${bias[${i}]}; then
+    fsl fslmaths ${inp[${i}]} -div ${bias[${i}]} ${out[${i}]} -odt float
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+mask[1]=${hcp_t1_brainmask}
+mask[2]=${hcp_t1_brainmask}
+mask[3]=${hcp_mni_t1_brainmask}
+mask[4]=${hcp_mni_t1_brainmask}
+out[1]=${hcp_t1_restore}
+out[2]=${hcp_t2_restore}
+out[3]=${hcp_mni_t1_restore}
+out[4]=${hcp_mni_t2_restore}
+for i in 1 2 3 4; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${bias[${i}]} ${mask[${i}]}; then
+    fsl fslmaths ${inp[${i}]} -div ${bias[${i}]} -mas ${mask[${i}]} ${out[${i}]} -odt float
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+inp[1]=${hcp_t1_denoised}
+inp[2]=${hcp_t2_denoised}
+out[1]=${WORKDIR}/structural/hcp/hcp_t1/t1_denoised_brain.nii.gz
+out[2]=${WORKDIR}/structural/hcp/hcp_t1/t2_denoised_brain.nii.gz
+for i in 1 2; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_t1_brainmask} ${hcp_t2_brain_mask}; then
+    c3d c3d ${inp[${i}]} ${hcp_t1_brainmask} -multiply ${hcp_t2_brain_mask} -multiply -type float -o ${out[${i}]}
+    # if failed, try to match headers first
+    if [ ! -e ${out[${i}]} ]; then
+      tmpdir=$(mktemp -d)
+      cp ${hcp_t1_brainmask} ${tmpdir}/t1_brain_mask.nii.gz
+      cp ${hcp_t2_brain_mask} ${tmpdir}/t2_brain_mask.nii.gz
+      fsl fslcpgeom ${inp[${i}]} ${tmpdir}/t1_brain_mask.nii.gz
+      fsl fslcpgeom ${inp[${i}]} ${tmpdir}/t2_brain_mask.nii.gz
+      c3d c3d ${inp[${i}]} ${tmpdir}/t1_brain_mask.nii.gz -multiply ${tmpdir}/t2_brain_mask.nii.gz -multiply -type float -o ${out[${i}]}
+      rm -rf ${tmpdir}
+    fi
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+hcp_t1_denoised_brain=${out[1]}
+hcp_t2_denoised_brain=${out[2]}
+
+hcp_t1_ribbon=${T1wFolder}/ribbon.nii.gz
+hcp_t1_div_t2=${T1wFolder}/t1_div_t2.nii.gz
+hcp_t1_div_t2_ribbon=${T1wFolder}/t1_div_t2_ribbon.nii.gz
+if LWDP_needs_update_and_lock ${hcp_t1_div_t2_ribbon} ${hcp_t1_denoised_brain} ${hcp_t2_denoised_brain} ${hcp_t1_ribbon}; then
+  tmpdir=$(mktemp -d)
+  # sometimes wb_command -volume-math failed due to header mismatch, so match headers first
+  cp ${hcp_t1_denoised_brain} ${tmpdir}/t1_brain.nii.gz
+  cp ${hcp_t2_denoised_brain} ${tmpdir}/t2_brain.nii.gz
+  fsl fslcpgeom ${hcp_t1_ribbon} ${tmpdir}/t1_brain.nii.gz
+  fsl fslcpgeom ${hcp_t1_ribbon} ${tmpdir}/t2_brain.nii.gz
+  #
+  caret7 wb_command -volume-math "clamp((T1w/T2w),0,100)" ${hcp_t1_div_t2} -var T1w ${tmpdir}/t1_brain.nii.gz -var T2w ${tmpdir}/t2_brain.nii.gz -fixnan 0
+  caret7 wb_command -volume-palette ${hcp_t1_div_t2} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+  #
+  caret7 wb_command -volume-math "((T1w/T2w)*(((ribbon>(${LeftGreyRibbonValue}-0.01))*(ribbon<(${LeftGreyRibbonValue}+0.01)))+((ribbon>(${RightGreyRibbonValue}-0.01))*(ribbon<(${RightGreyRibbonValue}+0.01)))))" ${hcp_t1_div_t2_ribbon} -var T1w ${tmpdir}/t1_brain.nii.gz -var T2w ${tmpdir}/t2_brain.nii.gz -var ribbon ${hcp_t1_ribbon}
+  caret7 wb_command -volume-palette ${hcp_t1_div_t2_ribbon} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+  #
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${hcp_t1_div_t2_ribbon}
+fi
+if [ ! -e ${hcp_t1_div_t2} ]; then
+  echo "ERROR: failed generating ${hcp_t1_div_t2}"
+  exit 1
+fi
+if [ ! -e ${hcp_t1_div_t2_ribbon} ]; then
+  echo "ERROR: failed generating ${hcp_t1_div_t2_ribbon}"
+  exit 1
+fi
+
+#inp[1]=${WORKDIR}/structural/hcp/hcp_t1/t1_div_t2.nii.gz
+#out[1]=${WORKDIR}/structural/hcp/hcp_mni/t1_div_t2.nii.gz
+#for i in 1; do
+#  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_mni_atlas_t1} ${hcp_mni_hcp_t1_concat}; then
+#    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${hcp_mni_atlas_t1} -o ${out[${i}]} -t ${hcp_mni_hcp_t1_concat}
+#    c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+#    LWDP_lockfile_delete ${out[${i}]}
+#  fi
+#done
+
+ReferenceMyelinMaps=${DATA_DIR}/hcp/templates/standard_mesh_atlases/Conte69.MyelinMap_BC.${HighResMesh}k_fs_LR.dscalar.nii
+myelin_ref_left=${AtlasSpaceFolder}/L.RefMyelinMap.${HighResMesh}k_fs_LR.func.gii
+if LWDP_needs_update_and_lock ${myelin_ref_left} ${ReferenceMyelinMaps}; then
+  caret7 wb_command -cifti-separate-all ${ReferenceMyelinMaps} -left ${AtlasSpaceFolder}/L.RefMyelinMap.${HighResMesh}k_fs_LR.func.gii -right ${AtlasSpaceFolder}/R.RefMyelinMap.${HighResMesh}k_fs_LR.func.gii
+  LWDP_lockfile_delete ${myelin_ref_left}
+fi
+
+for Hemisphere in L R; do
+  if [ "${Hemisphere}" == "L" ]; then
+    Structure=CORTEX_LEFT
+    ribbon=${LeftGreyRibbonValue}
+  elif [ "${Hemisphere}" == "R" ]; then
+    Structure=CORTEX_RIGHT
+    ribbon=${RightGreyRibbonValue}
+  fi
+  if [ "${RegName}" == "MSMSulc" ]; then
+    RegSphere=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.MSMSulc.native.surf.gii
+  else
+    RegSphere=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.reg.reg_LR.native.surf.gii
+  fi
+
+  mid_hcp_t1=${T1wFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+  thickness_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.thickness.native.shape.gii
+  spherical_std=${AtlasSpaceFolder}/${Hemisphere}.sphere.${HighResMesh}k_fs_LR.surf.gii
+  mid_highres=${AtlasSpaceFolder}/${Hemisphere}.midthickness.${HighResMesh}k_fs_LR.surf.gii
+  atlasroi=${AtlasSpaceFolder}/${Hemisphere}.atlasroi.${HighResMesh}k_fs_LR.shape.gii
+  roi_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+
+  # myelin mapping
+  myelin_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.MyelinMap.native.func.gii
+  if LWDP_needs_update_and_lock ${myelin_native} ${hcp_t1_div_t2} ${mid_hcp_t1} ${thickness_native} ${hcp_t1_ribbon}; then
+    tmpdir=$(mktemp -d)
+    caret7 wb_command -volume-math "((ribbon>(${ribbon}-0.01))*(ribbon<(${ribbon}+0.01)))" ${tmpdir}/temp_ribbon.nii.gz -var ribbon ${hcp_t1_ribbon}
+    #
+    #caret7 wb_command -volume-to-surface-mapping ${hcp_t1_div_t2} ${mid_hcp_t1} ${myelin_native} -myelin-style ${tmpdir}/temp_ribbon.nii.gz ${thickness_native} ${MyelinMappingSigma}
+    caret7 wb_command -volume-math "clamp(VAL,0,5)" ${tmpdir}/temp_t1_div_t2.nii.gz -var VAL ${hcp_t1_div_t2} -fixnan 0
+    caret7 wb_command -volume-to-surface-mapping ${tmpdir}/temp_t1_div_t2.nii.gz ${mid_hcp_t1} ${myelin_native} -myelin-style ${tmpdir}/temp_ribbon.nii.gz ${thickness_native} ${MyelinMappingSigma}
+    #
+    caret7 wb_command -set-map-name ${myelin_native} 1 "${Hemisphere}_MyelinMap"
+    caret7 wb_command -metric-palette ${myelin_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${myelin_native}
+  fi
+  # t1, t2 mapping
+  for tx in t1 t2; do
+    tx_input=${WORKDIR}/structural/hcp/hcp_t1/${tx}_denoised.nii.gz
+    tx_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${tx}.native.func.gii
+    if [ "${VISIT}" == "baseline" ]; then
+      if LWDP_needs_update_and_lock ${tx_native} ${tx_input} ${mid_hcp_t1} ${thickness_native} ${hcp_t1_ribbon}; then
+        tmpdir=$(mktemp -d)
+        # sometimes wb_command failed due to header mismatch, so match headers first
+        cp ${tx_input} ${tmpdir}/${tx}_denoised.nii.gz
+        fsl fslcpgeom ${hcp_t1_ribbon} ${tmpdir}/${tx}_denoised.nii.gz
+        #
+        caret7 wb_command -volume-math "((ribbon>(${ribbon}-0.01))*(ribbon<(${ribbon}+0.01)))" ${tmpdir}/temp_ribbon.nii.gz -var ribbon ${hcp_t1_ribbon}
+        caret7 wb_command -volume-to-surface-mapping ${tmpdir}/${tx}_denoised.nii.gz ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii -myelin-style ${tmpdir}/temp_ribbon.nii.gz ${thickness_native} ${MyelinMappingSigma}
+        caret7 wb_command -set-map-name ${tmpdir}/${Hemisphere}.${tx}.native.func.gii 1 "${Hemisphere}_${tx}"
+        caret7 wb_command -metric-palette ${tmpdir}/${Hemisphere}.${tx}.native.func.gii MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+        #        
+        cp ${tmpdir}/${Hemisphere}.${tx}.native.func.gii ${tx_native}
+        #
+        #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii ${SurfaceSmoothingSigma} ${tmpdir}/${Hemisphere}.${tx}_smoothed.native.func.gii -roi ${roi_native}
+        #cp ${tmpdir}/${Hemisphere}.${tx}_smoothed.native.func.gii ${tx_native}
+        #
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${tx_native}
+      fi
+    else
+      tx_ref=${WORKDIR}/../baseline/structural/hcp/hcp_mni/${Hemisphere}.${tx}.${HighResMesh}k_fs_LR.func.gii
+      tx_ref_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${tx}_ref.native.func.gii
+      if LWDP_needs_update_and_lock ${tx_ref_native} ${tx_ref} ${spherical_std} ${RegSphere} ${mid_highres} ${mid_hcp_t1} ${atlasroi}; then
+        caret7 wb_command -metric-resample ${tx_ref} ${spherical_std} ${RegSphere} ADAP_BARY_AREA ${tx_ref_native} -area-surfs ${mid_highres} ${mid_hcp_t1} -current-roi ${atlasroi}
+        caret7 wb_command -metric-dilate ${tx_ref_native} ${mid_hcp_t1} 30 ${tx_ref_native} -nearest
+        caret7 wb_command -metric-mask ${tx_ref_native} ${roi_native} ${tx_ref_native}
+        LWDP_lockfile_delete ${tx_ref_native}
+      fi
+      if LWDP_needs_update_and_lock ${tx_native} ${tx_input} ${tx_ref_native} ${mid_hcp_t1} ${thickness_native} ${hcp_t1_ribbon} ${roi_native}; then
+        tmpdir=$(mktemp -d)
+        #tmpdir=${AtlasSpaceFolder}/${NativeFolder}/tmp
+        #mkdir -p ${tmpdir}
+        # sometimes wb_command failed due to header mismatch, so match headers first
+        cp ${tx_input} ${tmpdir}/${tx}_denoised.nii.gz
+        fsl fslcpgeom ${hcp_t1_ribbon} ${tmpdir}/${tx}_denoised.nii.gz
+        #
+        cp ${tx_ref_native} ${tmpdir}/${Hemisphere}.${tx}_ref.native.func.gii
+        #
+        caret7 wb_command -volume-math "((ribbon>(${ribbon}-0.01))*(ribbon<(${ribbon}+0.01)))" ${tmpdir}/temp_ribbon.nii.gz -var ribbon ${hcp_t1_ribbon}
+        caret7 wb_command -volume-to-surface-mapping ${tmpdir}/${tx}_denoised.nii.gz ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii -myelin-style ${tmpdir}/temp_ribbon.nii.gz ${thickness_native} ${MyelinMappingSigma}
+        caret7 wb_command -set-map-name ${tmpdir}/${Hemisphere}.${tx}.native.func.gii 1 "${Hemisphere}_${tx}"
+        caret7 wb_command -metric-palette ${tmpdir}/${Hemisphere}.${tx}.native.func.gii MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+        #
+        #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii ${SurfaceSmoothingSigma} ${tmpdir}/${Hemisphere}.${tx}_smoothed.native.func.gii -roi ${roi_native}
+        #cp ${tmpdir}/${Hemisphere}.${tx}_smoothed.native.func.gii ${tmpdir}/${Hemisphere}.${tx}.native.func.gii
+
+        # reduce memory usage by smoothing on downsampled mesh
+        LowResMesh=`echo ${LowResMeshes} | cut -d " " -f 1`
+        for Map in ${tx} ${tx}_ref; do
+          spherical_std_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+          mid_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+          atlasroi_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+
+          inp=${tmpdir}/${Hemisphere}.${Map}.native.func.gii
+          map_smoothed_native=${tmpdir}/${Hemisphere}.${Map}_s.native.func.gii
+
+          map=${tmpdir}/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.func.gii
+          caret7 wb_command -metric-resample ${inp} ${RegSphere} ${spherical_std_lowres} ADAP_BARY_AREA ${map} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+
+          map_smoothed=${tmpdir}/${Hemisphere}.${Map}_s.${LowResMesh}k_fs_LR.func.gii
+          caret7 wb_command -metric-smoothing ${mid_lowres} ${map} ${CorrectionSigma} ${map_smoothed} -roi ${atlasroi_lowres}
+
+          caret7 wb_command -metric-resample ${map_smoothed} ${spherical_std_lowres} ${RegSphere} ADAP_BARY_AREA ${map_smoothed_native} -area-surfs ${mid_lowres} ${mid_hcp_t1} -current-roi ${atlasroi_lowres}
+          caret7 wb_command -metric-dilate ${map_smoothed_native} ${mid_hcp_t1} 30 ${map_smoothed_native} -nearest
+          caret7 wb_command -metric-mask ${map_smoothed_native} ${roi_native} ${map_smoothed_native}
+        done
+        #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${tx_ref_native} ${CorrectionSigma} ${tmpdir}/${Hemisphere}.${tx}_ref_s.native.func.gii -roi ${roi_native}
+        #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii ${CorrectionSigma} ${tmpdir}/${Hemisphere}.${tx}_s.native.func.gii -roi ${roi_native}
+
+        caret7 wb_command -metric-math "(ref/img)" ${tmpdir}/${Hemisphere}.${tx}_scale.native.func.gii -var ref ${tmpdir}/${Hemisphere}.${tx}_ref_s.native.func.gii -var img ${tmpdir}/${Hemisphere}.${tx}_s.native.func.gii
+        caret7 wb_command -metric-math "(img*scale)" ${tx_native} -var img ${tmpdir}/${Hemisphere}.${tx}.native.func.gii -var scale ${tmpdir}/${Hemisphere}.${tx}_scale.native.func.gii
+
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${tx_native}
+      fi
+    fi
+  done
+  # t1_div_t2 mapping
+  t1_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1.native.func.gii
+  t2_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t2.native.func.gii
+  t1_div_t2_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2.native.func.gii
+  if LWDP_needs_update_and_lock ${t1_div_t2_native} ${t1_native} ${t2_native}; then
+    caret7 wb_command -metric-math "clamp((T1w/T2w),0,5)" ${t1_div_t2_native} -var T1w ${t1_native} -var T2w ${t2_native} -fixnan 0
+    caret7 wb_command -set-map-name ${t1_div_t2_native} 1 "${Hemisphere}_t1_div_t2"
+    caret7 wb_command -metric-palette ${t1_div_t2_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${t1_div_t2_native}
+  fi
+
+  curvature_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.curvature.native.shape.gii
+  thickness_corr_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.corrThickness.native.shape.gii
+  if LWDP_needs_update_and_lock ${thickness_corr_native} ${thickness_native} ${roi_native} ${curvature_native}; then
+    caret7 wb_command -metric-regression ${thickness_native} ${thickness_corr_native} -roi ${roi_native} -remove ${curvature_native}
+    caret7 wb_command -set-map-name ${thickness_corr_native} 1 "${Hemisphere}_corrThickness"
+    caret7 wb_command -metric-palette ${thickness_corr_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${thickness_corr_native}
+  fi
+  myelin_smoothed_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.SmoothedMyelinMap.native.func.gii
+  if LWDP_needs_update_and_lock ${myelin_smoothed_native} ${mid_hcp_t1} ${myelin_native} ${roi_native}; then
+    caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${myelin_native} ${SurfaceSmoothingSigma} ${myelin_smoothed_native} -roi ${roi_native}
+    caret7 wb_command -set-map-name ${myelin_smoothed_native} 1 "${Hemisphere}_SmoothedMyelinMap"
+    caret7 wb_command -metric-palette ${myelin_smoothed_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${myelin_smoothed_native}
+  fi
+
+  myelin_ref=${AtlasSpaceFolder}/${Hemisphere}.RefMyelinMap.${HighResMesh}k_fs_LR.func.gii
+  myelin_ref_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.RefMyelinMap.native.func.gii
+  if LWDP_needs_update_and_lock ${myelin_ref_native} ${myelin_ref} ${spherical_std} ${RegSphere} ${mid_highres} ${mid_hcp_t1} ${atlasroi}; then
+    caret7 wb_command -metric-resample ${myelin_ref} ${spherical_std} ${RegSphere} ADAP_BARY_AREA ${myelin_ref_native} -area-surfs ${mid_highres} ${mid_hcp_t1} -current-roi ${atlasroi}
+    caret7 wb_command -metric-dilate ${myelin_ref_native} ${mid_hcp_t1} 30 ${myelin_ref_native} -nearest
+    caret7 wb_command -metric-mask ${myelin_ref_native} ${roi_native} ${myelin_ref_native}
+    LWDP_lockfile_delete ${myelin_ref_native}
+  fi
+
+  # reduce memory usage by smoothing on downsampled mesh
+  LowResMesh=`echo ${LowResMeshes} | cut -d " " -f 1`
+  for Map in MyelinMap RefMyelinMap t1_div_t2; do
+    spherical_std_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+    mid_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+    atlasroi_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+
+    inp=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}.native.func.gii
+    map_smoothed_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}_s.native.func.gii
+    if LWDP_needs_update_and_lock ${map_smoothed_native} ${inp} ${RegSphere} ${spherical_std_lowres} ${mid_hcp_t1} ${mid_lowres} ${roi_native} ${atlasroi_lowres}; then
+      tmpdir=$(mktemp -d)
+
+      #map=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.func.gii
+      map=${tmpdir}/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.func.gii
+      caret7 wb_command -metric-resample ${inp} ${RegSphere} ${spherical_std_lowres} ADAP_BARY_AREA ${map} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+
+      #map_smoothed=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Map}_s.${LowResMesh}k_fs_LR.func.gii
+      map_smoothed=${tmpdir}/${Hemisphere}.${Map}_s.${LowResMesh}k_fs_LR.func.gii
+      caret7 wb_command -metric-smoothing ${mid_lowres} ${map} ${CorrectionSigma} ${map_smoothed} -roi ${atlasroi_lowres}
+
+      caret7 wb_command -metric-resample ${map_smoothed} ${spherical_std_lowres} ${RegSphere} ADAP_BARY_AREA ${map_smoothed_native} -area-surfs ${mid_lowres} ${mid_hcp_t1} -current-roi ${atlasroi_lowres}
+      caret7 wb_command -metric-dilate ${map_smoothed_native} ${mid_hcp_t1} 30 ${map_smoothed_native} -nearest
+      caret7 wb_command -metric-mask ${map_smoothed_native} ${roi_native} ${map_smoothed_native}
+
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${map_smoothed_native}
+    fi
+  done
+  myelin_s_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.MyelinMap_s.native.func.gii
+  myelin_ref_s_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.RefMyelinMap_s.native.func.gii
+  t1_div_t2_s_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_s.native.func.gii
+  #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${myelin_native} ${CorrectionSigma} ${myelin_s_native} -roi ${roi_native}
+  #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${myellin_ref_native} ${CorrectionSigma} ${myelin_ref_s_native} -roi ${roi_native}
+  #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${t1_div_t2_native} ${CorrectionSigma} ${t1_div_t2_s_native} -roi ${roi_native}
+
+  #if [ "${VISIT}" == "baseline" ]; then
+    bias_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.BiasField.native.func.gii
+    if LWDP_needs_update_and_lock ${bias_native} ${myelin_s_native} ${myelin_ref_s_native} ${roi_native}; then
+      caret7 wb_command -metric-math "((Individual-Reference)*Mask)" ${bias_native} -var Individual ${myelin_s_native} -var Reference ${myelin_ref_s_native} -var Mask ${roi_native}
+      LWDP_lockfile_delete ${bias_native}
+    fi
+  #else
+  #  bias_ref=${WORKDIR}/../baseline/structural/hcp/hcp_mni/${Hemisphere}.BiasField.${HighResMesh}k_fs_LR.func.gii
+  #  bias_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.BiasField.native.func.gii
+  #  if LWDP_needs_update_and_lock ${bias_native} ${bias_ref} ${spherical_std} ${RegSphere} ${mid_highres} ${mid_hcp_t1} ${atlasroi}; then
+  #    caret7 wb_command -metric-resample ${bias_ref} ${spherical_std} ${RegSphere} ADAP_BARY_AREA ${bias_native} -area-surfs ${mid_highres} ${mid_hcp_t1} -current-roi ${atlasroi}
+  #    caret7 wb_command -metric-dilate ${bias_native} ${mid_hcp_t1} 30 ${bias_native} -nearest
+  #    caret7 wb_command -metric-mask ${bias_native} ${roi_native} ${bias_native}
+  #    LWDP_lockfile_delete ${bias_native}
+  #  fi
+  #fi
+  myelin_bc_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.MyelinMap_BC.native.func.gii
+  if LWDP_needs_update_and_lock ${myelin_bc_native} ${myelin_native} ${bias_native} ${roi_native}; then
+    caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${myelin_bc_native} -var Individual ${myelin_native} -var Bias ${bias_native} -var Mask ${roi_native}
+    caret7 wb_command -set-map-name ${myelin_bc_native} 1 "${Hemisphere}_MyelinMap_BC"
+    caret7 wb_command -metric-palette ${myelin_bc_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${myelin_bc_native}
+  fi
+  myelin_bc_smoothed_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.SmoothedMyelinMap_BC.native.func.gii
+  if LWDP_needs_update_and_lock ${myelin_bc_smoothed_native} ${myelin_smoothed_native} ${bias_native} ${roi_native}; then
+    caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${myelin_bc_smoothed_native} -var Individual ${myelin_smoothed_native} -var Bias ${bias_native} -var Mask ${roi_native}
+    caret7 wb_command -set-map-name ${myelin_bc_smoothed_native} 1 "${Hemisphere}_SmoothedMyelinMap_BC"
+    caret7 wb_command -metric-palette ${myelin_bc_smoothed_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${myelin_bc_smoothed_native}
+  fi
+
+  #if [ "${VISIT}" == "baseline" ]; then
+    t1_div_t2_bias_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bias.native.func.gii
+    if LWDP_needs_update_and_lock ${t1_div_t2_bias_native} ${t1_div_t2_s_native} ${myelin_ref_s_native} ${roi_native}; then
+      caret7 wb_command -metric-math "((Individual-Reference)*Mask)" ${t1_div_t2_bias_native} -var Individual ${t1_div_t2_s_native} -var Reference ${myelin_ref_s_native} -var Mask ${roi_native}
+      LWDP_lockfile_delete ${t1_div_t2_bias_native}
+    fi
+  #else
+  #  t1_div_t2_bias_ref=${WORKDIR}/../baseline/structural/hcp/hcp_mni/${Hemisphere}.t1_div_t2_bias.${HighResMesh}k_fs_LR.func.gii
+  #  t1_div_t2_bias_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bias.native.func.gii
+  #  if LWDP_needs_update_and_lock ${t1_div_t2_bias_native} ${t1_div_t2_bias_ref} ${spherical_std} ${RegSphere} ${mid_highres} ${mid_hcp_t1} ${atlasroi}; then
+  #    caret7 wb_command -metric-resample ${t1_div_t2_bias_ref} ${spherical_std} ${RegSphere} ADAP_BARY_AREA ${t1_div_t2_bias_native} -area-surfs ${mid_highres} ${mid_hcp_t1} -current-roi ${atlasroi}
+  #    caret7 wb_command -metric-dilate ${t1_div_t2_bias_native} ${mid_hcp_t1} 30 ${t1_div_t2_bias_native} -nearest
+  #    caret7 wb_command -metric-mask ${t1_div_t2_bias_native} ${roi_native} ${t1_div_t2_bias_native}
+  #    LWDP_lockfile_delete ${t1_div_t2_bias_native}
+  #  fi
+  #fi
+  t1_div_t2_bc_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bc.native.func.gii
+  if LWDP_needs_update_and_lock ${t1_div_t2_bc_native} ${t1_div_t2_native} ${t1_div_t2_bias_native} ${roi_native}; then
+    caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${t1_div_t2_bc_native} -var Individual ${t1_div_t2_native} -var Bias ${t1_div_t2_bias_native} -var Mask ${roi_native}
+    caret7 wb_command -set-map-name ${t1_div_t2_bc_native} 1 "${Hemisphere}_t1_div_t2_bc"
+    caret7 wb_command -metric-palette ${t1_div_t2_bc_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${t1_div_t2_bc_native}
+  fi
+
+  for corr in curvature sulc; do
+    corr_s=`echo ${corr} | cut -c1-4`
+    corr_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${corr}.native.shape.gii
+    for metric in MyelinMap_BC t1_div_t2_bc; do
+      metric_in_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${metric}.native.func.gii
+      metric_out_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${metric}_${corr_s}.native.func.gii
+      if LWDP_needs_update_and_lock ${metric_out_native} ${metric_in_native} ${roi_native} ${corr_native}; then
+        caret7 wb_command -metric-regression ${metric_in_native} ${metric_out_native} -roi ${roi_native} -remove ${corr_native}
+        caret7 wb_command -set-map-name ${metric_out_native} 1 "${Hemisphere}_${metric}_${corr_s}"
+        caret7 wb_command -metric-palette ${metric_out_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+        LWDP_lockfile_delete ${metric_out_native}
+      fi
+    done
+  done
+done
+
+# apply demeaned bias
+bias_native_L=${AtlasSpaceFolder}/${NativeFolder}/L.BiasField.native.func.gii
+bias_native_R=${AtlasSpaceFolder}/${NativeFolder}/R.BiasField.native.func.gii
+roi_native_L=${AtlasSpaceFolder}/${NativeFolder}/L.roi.native.shape.gii
+roi_native_R=${AtlasSpaceFolder}/${NativeFolder}/R.roi.native.shape.gii
+t1_div_t2_bias_native_L=${AtlasSpaceFolder}/${NativeFolder}/L.t1_div_t2_bias.native.func.gii
+t1_div_t2_bias_native_R=${AtlasSpaceFolder}/${NativeFolder}/R.t1_div_t2_bias.native.func.gii
+for Hemisphere in L R; do
+  if [ "${Hemisphere}" == "L" ]; then
+    Structure=CORTEX_LEFT
+    ribbon=${LeftGreyRibbonValue}
+  elif [ "${Hemisphere}" == "R" ]; then
+    Structure=CORTEX_RIGHT
+    ribbon=${RightGreyRibbonValue}
+  fi
+  myelin_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.MyelinMap.native.func.gii
+  myelin_smoothed_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.SmoothedMyelinMap.native.func.gii
+  roi_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+  bias_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.BiasField.native.func.gii
+  bias_dm_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.BiasFieldDM.native.func.gii
+  if LWDP_needs_update_and_lock ${bias_dm_native} ${bias_native_L} ${bias_native_R} ${roi_native_L} ${roi_native_R}; then
+    mean_L=`caret7 wb_command -metric-stats ${bias_native_L} -reduce MEAN -roi ${roi_native_L}`
+    mean_R=`caret7 wb_command -metric-stats ${bias_native_R} -reduce MEAN -roi ${roi_native_R}`
+    mean_L=`printf %.10f ${mean_L}`
+    mean_R=`printf %.10f ${mean_R}`
+    mean_LR=`bc -l <<< "(${mean_L} + ${mean_R}) / 2"`
+    echo mean_L = ${mean_L}, mean_R = ${mean_R}, mean_LR = ${mean_LR}
+    caret7 wb_command -metric-math "(Bias-(${mean_LR})*Mask)" ${bias_dm_native} -var Bias ${bias_native} -var Mask ${roi_native}
+    LWDP_lockfile_delete ${bias_dm_native}
+  fi
+  myelin_bcdm_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.MyelinMap_BCDM.native.func.gii
+  if LWDP_needs_update_and_lock ${myelin_bcdm_native} ${myelin_native} ${bias_dm_native} ${roi_native}; then
+    caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${myelin_bcdm_native} -var Individual ${myelin_native} -var Bias ${bias_dm_native} -var Mask ${roi_native}
+    caret7 wb_command -set-map-name ${myelin_bcdm_native} 1 "${Hemisphere}_MyelinMap_BCDM"
+    caret7 wb_command -metric-palette ${myelin_bcdm_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${myelin_bcdm_native}
+  fi
+  myelin_bcdm_smoothed_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.SmoothedMyelinMap_BCDM.native.func.gii
+  if LWDP_needs_update_and_lock ${myelin_bcdm_smoothed_native} ${myelin_smoothed_native} ${bias_dm_native} ${roi_native}; then
+    caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${myelin_bcdm_smoothed_native} -var Individual ${myelin_smoothed_native} -var Bias ${bias_dm_native} -var Mask ${roi_native}
+    caret7 wb_command -set-map-name ${myelin_bcdm_smoothed_native} 1 "${Hemisphere}_SmoothedMyelinMap_BCDM"
+    caret7 wb_command -metric-palette ${myelin_bcdm_smoothed_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${myelin_bcdm_smoothed_native}
+  fi
+  #
+  t1_div_t2_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2.native.func.gii
+  t1_div_t2_bias_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bias.native.func.gii
+  t1_div_t2_bias_dm_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bias_dm.native.func.gii
+  if LWDP_needs_update_and_lock ${t1_div_t2_bias_dm_native} ${t1_div_t2_bias_native_L} ${t1_div_t2_bias_native_R} ${roi_native_L} ${roi_native_R}; then
+    mean_L=`caret7 wb_command -metric-stats ${t1_div_t2_bias_native_L} -reduce MEAN -roi ${roi_native_L}`
+    mean_R=`caret7 wb_command -metric-stats ${t1_div_t2_bias_native_R} -reduce MEAN -roi ${roi_native_R}`
+    mean_L=`printf %.10f ${mean_L}`
+    mean_R=`printf %.10f ${mean_R}`
+    mean_LR=`bc -l <<< "(${mean_L} + ${mean_R}) / 2"`
+    echo mean_L = ${mean_L}, mean_R = ${mean_R}, mean_LR = ${mean_LR}
+    caret7 wb_command -metric-math "(Bias-(${mean_LR})*Mask)" ${t1_div_t2_bias_dm_native} -var Bias ${t1_div_t2_bias_native} -var Mask ${roi_native}
+    LWDP_lockfile_delete ${t1_div_t2_bias_dm_native}
+  fi
+  t1_div_t2_bcdm_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bcdm.native.func.gii
+  if LWDP_needs_update_and_lock ${t1_div_t2_bcdm_native} ${t1_div_t2_native} ${t1_div_t2_bias_dm_native} ${roi_native}; then
+    caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${t1_div_t2_bcdm_native} -var Individual ${t1_div_t2_native} -var Bias ${t1_div_t2_bias_dm_native} -var Mask ${roi_native}
+    caret7 wb_command -set-map-name ${t1_div_t2_bcdm_native} 1 "${Hemisphere}_t1_div_t2_bcdm"
+    caret7 wb_command -metric-palette ${t1_div_t2_bcdm_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    LWDP_lockfile_delete ${t1_div_t2_bcdm_native}
+  fi
+done
+myelin_bc_native_L=${AtlasSpaceFolder}/${NativeFolder}/L.MyelinMap_BC.native.func.gii
+myelin_bc_native_R=${AtlasSpaceFolder}/${NativeFolder}/R.MyelinMap_BC.native.func.gii
+myelin_bcsm_native_L=${AtlasSpaceFolder}/${NativeFolder}/L.MyelinMap_BCSM.native.func.gii
+myelin_bcsm_native_R=${AtlasSpaceFolder}/${NativeFolder}/R.MyelinMap_BCSM.native.func.gii
+if LWDP_needs_update_and_lock ${myelin_bcsm_native_L} ${myelin_bc_native_L} ${myelin_bc_native_R} ${roi_native_L} ${roi_native_R}; then
+  mean_L=`caret7 wb_command -metric-stats ${myelin_bc_native_L} -reduce MEAN -roi ${roi_native_L}`
+  mean_R=`caret7 wb_command -metric-stats ${myelin_bc_native_R} -reduce MEAN -roi ${roi_native_R}`
+  mean_L=`printf %.10f ${mean_L}`
+  mean_R=`printf %.10f ${mean_R}`
+  mean_LR=`bc -l <<< "(${mean_L} + ${mean_R}) / 2"`
+  echo mean_L = ${mean_L}, mean_R = ${mean_R}, mean_LR = ${mean_LR}
+  caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${myelin_bcsm_native_L} -var Individual ${myelin_bc_native_L} -var Mask ${roi_native_L}
+  caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${myelin_bcsm_native_R} -var Individual ${myelin_bc_native_R} -var Mask ${roi_native_R}
+  caret7 wb_command -set-map-name ${myelin_bcsm_native_L} 1 "${Hemisphere}_MyelinMap_BCSM"
+  caret7 wb_command -set-map-name ${myelin_bcsm_native_R} 1 "${Hemisphere}_MyelinMap_BCSM"
+  caret7 wb_command -metric-palette ${myelin_bcsm_native_L} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+  caret7 wb_command -metric-palette ${myelin_bcsm_native_R} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+  LWDP_lockfile_delete ${myelin_bcsm_native_L}
+fi
+t1_div_t2_bc_native_L=${AtlasSpaceFolder}/${NativeFolder}/L.t1_div_t2_bc.native.func.gii
+t1_div_t2_bc_native_R=${AtlasSpaceFolder}/${NativeFolder}/R.t1_div_t2_bc.native.func.gii
+t1_div_t2_bcsm_native_L=${AtlasSpaceFolder}/${NativeFolder}/L.t1_div_t2_bcsm.native.func.gii
+t1_div_t2_bcsm_native_R=${AtlasSpaceFolder}/${NativeFolder}/R.t1_div_t2_bcsm.native.func.gii
+if LWDP_needs_update_and_lock ${t1_div_t2_bcsm_native_L} ${t1_div_t2_bc_native_L} ${t1_div_t2_bc_native_R} ${roi_native_L} ${roi_native_R}; then
+  mean_L=`caret7 wb_command -metric-stats ${t1_div_t2_bc_native_L} -reduce MEAN -roi ${roi_native_L}`
+  mean_R=`caret7 wb_command -metric-stats ${t1_div_t2_bc_native_R} -reduce MEAN -roi ${roi_native_R}`
+  mean_L=`printf %.10f ${mean_L}`
+  mean_R=`printf %.10f ${mean_R}`
+  mean_LR=`bc -l <<< "(${mean_L} + ${mean_R}) / 2"`
+  echo mean_L = ${mean_L}, mean_R = ${mean_R}, mean_LR = ${mean_LR}
+  caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${t1_div_t2_bcsm_native_L} -var Individual ${t1_div_t2_bc_native_L} -var Mask ${roi_native_L}
+  caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${t1_div_t2_bcsm_native_R} -var Individual ${t1_div_t2_bc_native_R} -var Mask ${roi_native_R}
+  caret7 wb_command -set-map-name ${t1_div_t2_bcsm_native_L} 1 "${Hemisphere}_t1_div_t2_bcsm"
+  caret7 wb_command -set-map-name ${t1_div_t2_bcsm_native_R} 1 "${Hemisphere}_t1_div_t2_bcsm"
+  caret7 wb_command -metric-palette ${t1_div_t2_bcsm_native_L} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+  caret7 wb_command -metric-palette ${t1_div_t2_bcsm_native_R} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+  LWDP_lockfile_delete ${t1_div_t2_bcsm_native_L}
+fi
+
+for Hemisphere in L R; do
+  if [ "${Hemisphere}" == "L" ]; then
+    Structure=CORTEX_LEFT
+    ribbon=${LeftGreyRibbonValue}
+  elif [ "${Hemisphere}" == "R" ]; then
+    Structure=CORTEX_RIGHT
+    ribbon=${RightGreyRibbonValue}
+  fi
+  if [ "${RegName}" == "MSMSulc" ]; then
+    RegSphere=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.MSMSulc.native.surf.gii
+  else
+    RegSphere=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.reg.reg_LR.native.surf.gii
+  fi
+  mid_hcp_t1=${T1wFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+  roi_native=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+
+  for STRING in MyelinMap%func SmoothedMyelinMap%func MyelinMap_BC%func SmoothedMyelinMap_BC%func MyelinMap_BCDM%func SmoothedMyelinMap_BCDM%func MyelinMap_BCSM%func corrThickness%shape BiasField%func t1%func t2%func t1_div_t2%func t1_div_t2_bc%func t1_div_t2_bcdm%func t1_div_t2_bcsm%func t1_div_t2_bias%func MyelinMap_BC_curv%func MyelinMap_BC_sulc%func t1_div_t2_bc_curv%func t1_div_t2_bc_sulc%func; do
+    Map=`echo $STRING | cut -d "%" -f 1`
+    Ext=`echo $STRING | cut -d "%" -f 2`
+
+    spherical_std=${AtlasSpaceFolder}/${Hemisphere}.sphere.${HighResMesh}k_fs_LR.surf.gii
+    mid_highres=${AtlasSpaceFolder}/${Hemisphere}.midthickness.${HighResMesh}k_fs_LR.surf.gii
+    atlasroi=${AtlasSpaceFolder}/${Hemisphere}.atlasroi.${HighResMesh}k_fs_LR.shape.gii
+    map=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}.native.${Ext}.gii
+    map_highres=${AtlasSpaceFolder}/${Hemisphere}.${Map}.${HighResMesh}k_fs_LR.${Ext}.gii
+    if LWDP_needs_update_and_lock ${map_highres} ${map} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_highres} ${roi_native}; then
+      caret7 wb_command -metric-resample ${map} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${map_highres} -area-surfs ${mid_hcp_t1} ${mid_highres} -current-roi ${roi_native}
+      caret7 wb_command -metric-mask ${map_highres} ${atlasroi} ${map_highres}
+      LWDP_lockfile_delete ${map_highres}
+    fi
+
+    for LowResMesh in ${LowResMeshes}; do
+      spherical_std=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+      mid_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+      atlasroi=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+      map=${AtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${Map}.native.${Ext}.gii
+      map_lowres=${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.${Ext}.gii
+      if LWDP_needs_update_and_lock ${map_lowres} ${map} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_lowres} ${roi_native}; then
+        caret7 wb_command -metric-resample ${map} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${map_lowres} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+        caret7 wb_command -metric-mask ${map_lowres} ${atlasroi} ${map_lowres}
+        LWDP_lockfile_delete ${map_lowres}
+      fi
+    done
+  done
+done
+
+# create cifti files
+STRINGII=""
+for LowResMesh in ${LowResMeshes}; do
+  STRINGII=`echo "${STRINGII}${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k%${LowResMesh}k_fs_LR%atlasroi "`
+done
+for STRING in ${AtlasSpaceFolder}/${NativeFolder}%native%roi ${AtlasSpaceFolder}%${HighResMesh}k_fs_LR%atlasroi ${STRINGII}; do
+  Folder=`echo $STRING | cut -d "%" -f 1`
+  Mesh=`echo $STRING | cut -d "%" -f 2`
+  ROI=`echo $STRING | cut -d "%" -f 3`
+  for STRINGII in MyelinMap%func SmoothedMyelinMap%func MyelinMap_BC%func SmoothedMyelinMap_BC%func MyelinMap_BCDM%func SmoothedMyelinMap_BCDM%func corrThickness%shape RefMyelinMap%func BiasField%func t1%func t2%func t1_div_t2%func t1_div_t2_bc%func t1_div_t2_bcdm%func t1_div_t2_bias%func MyelinMap_BC_curv%func MyelinMap_BC_sulc%func t1_div_t2_bc_curv%func t1_div_t2_bc_sulc%func; do
+    Map=`echo $STRINGII | cut -d "%" -f 1`
+    Ext=`echo $STRINGII | cut -d "%" -f 2`
+    if [ ! -e ${Folder}/L.${Map}.${Mesh}.${Ext}.gii ]; then
+      continue
+    fi
+    inps="${Folder}/L.${Map}.${Mesh}.${Ext}.gii ${Folder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.${Map}.${Mesh}.${Ext}.gii ${Folder}/R.${ROI}.${Mesh}.shape.gii"
+    out=${Folder}/${Map}.${Mesh}.dscalar.nii
+    if LWDP_needs_update_and_lock ${out} ${inps}; then
+      caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.${Map}.${Mesh}.${Ext}.gii -roi-left ${Folder}/L.${ROI}.${Mesh}.shape.gii -right-metric ${Folder}/R.${Map}.${Mesh}.${Ext}.gii -roi-right ${Folder}/R.${ROI}.${Mesh}.shape.gii
+      caret7 wb_command -set-map-names ${out} -map 1 "${Map}"
+      caret7 wb_command -cifti-palette ${out} MODE_AUTO_SCALE_PERCENTAGE ${out} -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      LWDP_lockfile_delete ${out}
+    fi
+  done
+  for STRINGII in MyelinMap_BCSM%func t1_div_t2_bcsm%func; do
+    Map=`echo $STRINGII | cut -d "%" -f 1`
+    Ext=`echo $STRINGII | cut -d "%" -f 2`
+    if [ ! -e ${Folder}/L.${Map}.${Mesh}.${Ext}.gii ]; then
+      continue
+    fi
+    inps="${Folder}/L.${Map}.${Mesh}.${Ext}.gii ${Folder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.${Map}.${Mesh}.${Ext}.gii ${Folder}/R.${ROI}.${Mesh}.shape.gii"
+    out=${Folder}/${Map}.${Mesh}.dscalar.nii
+    if LWDP_needs_update_and_lock ${out} ${inps}; then
+      caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.${Map}.${Mesh}.${Ext}.gii -roi-left ${Folder}/L.${ROI}.${Mesh}.shape.gii -right-metric ${Folder}/R.${Map}.${Mesh}.${Ext}.gii -roi-right ${Folder}/R.${ROI}.${Mesh}.shape.gii
+      caret7 wb_command -set-map-names ${out} -map 1 "${Map}"
+      caret7 wb_command -cifti-palette ${out} MODE_USER_SCALE ${out} -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid -interpolate true
+      LWDP_lockfile_delete ${out}
+    fi
+  done
+done
+
+#
+# create spec files
+#
+
+STRINGII=""
+for LowResMesh in ${LowResMeshes}; do
+  STRINGII=`echo "${STRINGII}${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k%${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k%${LowResMesh}k_fs_LR ${T1wFolder}/fsaverage_LR${LowResMesh}k%${AtlasSpaceFolder}/fsaverage_LR${LowResMesh}k%${LowResMesh}k_fs_LR "`
+done
+for STRING in ${T1wFolder}/${NativeFolder}%${AtlasSpaceFolder}/${NativeFolder}%native ${AtlasSpaceFolder}/${NativeFolder}%${AtlasSpaceFolder}/${NativeFolder}%native ${AtlasSpaceFolder}%${AtlasSpaceFolder}%${HighResMesh}k_fs_LR ${STRINGII}; do
+  FolderI=`echo ${STRING} | cut -d "%" -f 1`
+  FolderII=`echo ${STRING} | cut -d "%" -f 2`
+  Mesh=`echo ${STRING} | cut -d "%" -f 3`
+  FolderI_1=`dirname ${FolderI}`
+
+  # listing input files
+  if [ "${FolderI_1}" == "${T1wFolder}" ]; then
+    inps="${WORKDIR}/structural/hcp/hcp_t1/t2_mrbias.nii.gz ${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias.nii.gz"
+  else
+    inps="${WORKDIR}/structural/hcp/hcp_mni/t2_mrbias.nii.gz ${WORKDIR}/structural/hcp/hcp_mni/t1_mrbias.nii.gz"
+  fi
+  for Hemisphere in L R; do
+    if [ -e ${FolderI}/${Hemisphere}.sphere.${Mesh}.surf.gii ]; then
+      inps="${inps} ${FolderI}/${Hemisphere}.sphere.${Mesh}.surf.gii"
+    fi
+    if [ -e ${FolderI}/${Hemisphere}.flat.${Mesh}.surf.gii ]; then
+      inps="${inps} ${FolderI}/${Hemisphere}.flat.${Mesh}.surf.gii"
+    fi
+    inps="${inps} ${FolderI}/${Hemisphere}.white.${Mesh}.surf.gii ${FolderI}/${Hemisphere}.pial.${Mesh}.surf.gii ${FolderI}/${Hemisphere}.midthickness.${Mesh}.surf.gii ${FolderI}/${Hemisphere}.inflated.${Mesh}.surf.gii ${FolderI}/${Hemisphere}.very_inflated.${Mesh}.surf.gii"
+  done
+  for STRINGII in sulc%dscalar thickness%dscalar curvature%dscalar aparc%dlabel aparc.a2009s%dlabel BA%dlabel refsulc%dscalar ArealDistortion_FS%dscalar ArealDistortion_MSMSulc%dscalar; do
+    Map=`echo $STRINGII | cut -d "%" -f 1`
+    Ext=`echo $STRINGII | cut -d "%" -f 2`
+    if [ -e ${FolderII}/${Map}.${Mesh}.${Ext}.nii ]; then
+      inps="${inps} ${FolderII}/${Map}.${Mesh}.${Ext}.nii"
+    fi
+  done
+  if [ "${FolderI}" == "${T1wFolder}/${NativeFolder}" ]; then
+    inps="${inps} ${T1wFolder}/t1_div_t2.nii.gz ${T1wFolder}/t1_div_t2_ribbon.nii.gz"
+  fi
+  for STRINGII in MyelinMap_BC%dscalar SmoothedMyelinMap_BC%dscalar MyelinMap_BCDM%dscalar MyelinMap_BCSM%dscalar corrThickness%dscalar RefMyelinMap%dscalar MyelinMap%dscalar BiasField%dscalar t1%dscalar t2%dscalar t1_div_t2%dscalar t1_div_t2_bc%dscalar t1_div_t2_bcdm%dscalar t1_div_t2_bcsm%dscalar t1_div_t2_bias%dscalar MyelinMap_BC_curv%dscalar MyelinMap_BC_sulc%dscalar t1_div_t2_bc_curv%dscalar t1_div_t2_bc_sulc%dscalar; do
+    Map=`echo $STRINGII | cut -d "%" -f 1`
+    Ext=`echo $STRINGII | cut -d "%" -f 2`
+    if [ -e ${FolderII}/${Map}.${Mesh}.${Ext}.nii ]; then
+      inps="${inps} ${FolderII}/${Map}.${Mesh}.${Ext}.nii"
+    fi
+  done
+
+  spec=${FolderI}/${Mesh}.wb.spec
+  if LWDP_needs_update_and_lock ${spec} ${inps}; then
+    rm -f ${spec}
+
+    # add volume files to spec files
+    if [ "${FolderI_1}" == "${T1wFolder}" ]; then
+      caret7 wb_command -add-to-spec-file ${spec} INVALID ${WORKDIR}/structural/hcp/hcp_t1/t2_mrbias.nii.gz
+      caret7 wb_command -add-to-spec-file ${spec} INVALID ${WORKDIR}/structural/hcp/hcp_t1/t1_mrbias.nii.gz
+    else
+      caret7 wb_command -add-to-spec-file ${spec} INVALID ${WORKDIR}/structural/hcp/hcp_mni/t2_mrbias.nii.gz
+      caret7 wb_command -add-to-spec-file ${spec} INVALID ${WORKDIR}/structural/hcp/hcp_mni/t1_mrbias.nii.gz
+    fi
+    # add surface files to spec files
+    for Hemisphere in L R; do
+      if [ "${Hemisphere}" = "L" ]; then 
+        hemisphere=l
+        Structure=CORTEX_LEFT
+      elif [ "${Hemisphere}" = "R" ]; then 
+        hemisphere=r
+        Structure=CORTEX_RIGHT
+      fi
+      if [ -e ${FolderI}/${Hemisphere}.sphere.${Mesh}.surf.gii ]; then
+        caret7 wb_command -add-to-spec-file ${spec} ${Structure} ${FolderI}/${Hemisphere}.sphere.${Mesh}.surf.gii
+      fi
+      if [ -e ${FolderI}/${Hemisphere}.flat.${Mesh}.surf.gii ]; then
+        caret7 wb_command -add-to-spec-file ${spec} ${Structure} ${FolderI}/${Hemisphere}.flat.${Mesh}.surf.gii
+      fi
+      caret7 wb_command -add-to-spec-file ${spec} ${Structure} ${FolderI}/${Hemisphere}.white.${Mesh}.surf.gii
+      caret7 wb_command -add-to-spec-file ${spec} ${Structure} ${FolderI}/${Hemisphere}.pial.${Mesh}.surf.gii
+      caret7 wb_command -add-to-spec-file ${spec} ${Structure} ${FolderI}/${Hemisphere}.midthickness.${Mesh}.surf.gii
+      caret7 wb_command -add-to-spec-file ${spec} ${Structure} ${FolderI}/${Hemisphere}.inflated.${Mesh}.surf.gii
+      caret7 wb_command -add-to-spec-file ${spec} ${Structure} ${FolderI}/${Hemisphere}.very_inflated.${Mesh}.surf.gii
+    done
+    # add cifti maps to spec files
+    for STRINGII in sulc%dscalar thickness%dscalar curvature%dscalar aparc%dlabel aparc.a2009s%dlabel BA%dlabel refsulc%dscalar ArealDistortion_FS%dscalar ArealDistortion_MSMSulc%dscalar; do
+      Map=`echo $STRINGII | cut -d "%" -f 1`
+      Ext=`echo $STRINGII | cut -d "%" -f 2`
+      if [ -e ${FolderII}/${Map}.${Mesh}.${Ext}.nii ]; then
+        caret7 wb_command -add-to-spec-file ${spec} INVALID ${FolderII}/${Map}.${Mesh}.${Ext}.nii
+      fi
+    done
+
+    # for myelin maps
+    # add volume files to spec files
+    if [ "${FolderI}" == "${T1wFolder}/${NativeFolder}" ]; then
+      caret7 wb_command -add-to-spec-file ${spec} INVALID ${T1wFolder}/t1_div_t2.nii.gz
+      caret7 wb_command -add-to-spec-file ${spec} INVALID ${T1wFolder}/t1_div_t2_ribbon.nii.gz
+    fi
+    # add cifti maps to spec files
+    for STRINGII in MyelinMap_BC%dscalar SmoothedMyelinMap_BC%dscalar MyelinMap_BCDM%dscalar MyelinMap_BCSM%dscalar corrThickness%dscalar RefMyelinMap%dscalar MyelinMap%dscalar BiasField%dscalar t1%dscalar t2%dscalar t1_div_t2%dscalar t1_div_t2_bc%dscalar t1_div_t2_bcdm%dscalar t1_div_t2_bcsm%dscalar t1_div_t2_bias%dscalar MyelinMap_BC_curv%dscalar MyelinMap_BC_sulc%dscalar t1_div_t2_bc_curv%dscalar t1_div_t2_bc_sulc%dscalar; do
+      Map=`echo $STRINGII | cut -d "%" -f 1`
+      Ext=`echo $STRINGII | cut -d "%" -f 2`
+      if [ -e ${FolderII}/${Map}.${Mesh}.${Ext}.nii ]; then
+        caret7 wb_command -add-to-spec-file ${spec} INVALID ${FolderII}/${Map}.${Mesh}.${Ext}.nii
+      fi
+    done
+
+    LWDP_lockfile_delete ${spec}
+  fi
+done
+
+#
+# longitudinal myelin mapping by registering images
+#
+
+if [ "${VISIT}" != "baseline" ]; then
+  BaselineAtlasSpaceFolder=${WORKDIR}/../baseline/structural/hcp/hcp_mni
+  BaselineT1wFolder=${WORKDIR}/../baseline/structural/hcp/hcp_t1
+
+  # align with baseline
+  for tx in t1_denoised t2_denoised; do
+    hcp_tx=${WORKDIR}/structural/hcp/hcp_t1/${tx}.nii.gz
+    hcp_tx_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/hcp/hcp_t1/${tx}.nii.gz)
+
+    hcp_tx_to_baseline_pfx=${WORKDIR}/structural/longitudinal/registration/hcp_${tx}_to_baseline/ants_
+    hcp_tx_to_baseline_affine=${hcp_tx_to_baseline_pfx}0GenericAffine.mat
+    if LWDP_needs_update_and_lock ${hcp_tx_to_baseline_affine} ${hcp_tx} ${hcp_tx_at_baseline}; then
+      log_out=${hcp_tx_to_baseline_pfx}0GenericAffine.log
+      ants antsRegistration -d 3 -r [${hcp_tx},${hcp_tx_at_baseline},1] -t Rigid[0.1] -m MI[${hcp_tx},${hcp_tx_at_baseline},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${hcp_tx},${hcp_tx_at_baseline},1,32,Regular,0.25] -c [1000x500x250x100,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox -o ${hcp_tx_to_baseline_pfx} > ${log_out}
+      LWDP_lockfile_delete ${hcp_tx_to_baseline_affine}
+    fi
+
+    hcp_tx_to_baseline_affine=$(LWDP_get_override_file ${hcp_tx_to_baseline_affine})
+
+    hcp_tx_to_baseline_warp=${hcp_tx_to_baseline_pfx}1Warp.nii.gz
+    if LWDP_needs_update_and_lock ${hcp_tx_to_baseline_warp} ${hcp_tx} ${hcp_tx_at_baseline}; then
+      log_out=${hcp_tx_to_baseline_pfx}1Warp.log
+      ants antsRegistration -d 3 --initial-moving-transform ${hcp_tx_to_baseline_affine} -t SyN[0.5,3,0.5] -m CC[${hcp_tx},${hcp_tx_at_baseline},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${hcp_tx_to_baseline_pfx} > ${log_out}
+      LWDP_lockfile_delete ${hcp_tx_to_baseline_warp}
+    fi
+
+    hcp_tx_to_baseline_warp=$(LWDP_get_override_file ${hcp_tx_to_baseline_warp})
+    hcp_tx_to_baseline_warp_inv=$(LWDP_get_override_file ${hcp_tx_to_baseline_pfx}1InverseWarp.nii.gz)
+
+    inp[1]=${hcp_tx}
+    out[1]=${WORKDIR}/structural/hcp/hcp_t1/baseline/${tx}.nii.gz
+    for i in 1; do
+      if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_tx_at_baseline} ${hcp_tx_to_baseline_warp} ${hcp_tx_to_baseline_affine}; then
+        ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${hcp_tx_at_baseline} -o ${out[${i}]} -t [${hcp_tx_to_baseline_affine},1] ${hcp_tx_to_baseline_warp_inv}
+        c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+        LWDP_lockfile_delete ${out[${i}]}
+      fi
+    done
+  done
+
+  hcp_t1_brainmask=${WORKDIR}/../baseline/structural/hcp/hcp_t1/t1_brain_mask.nii.gz
+  hcp_t2_brain_mask=${WORKDIR}/../baseline/structural/hcp/hcp_t1/t2_refined_brain_mask.nii.gz
+
+  inp[1]=${WORKDIR}/structural/hcp/hcp_t1/baseline/t1_denoised.nii.gz
+  inp[2]=${WORKDIR}/structural/hcp/hcp_t1/baseline/t2_denoised.nii.gz
+  out[1]=${WORKDIR}/structural/hcp/hcp_t1/baseline/t1_denoised_brain.nii.gz
+  out[2]=${WORKDIR}/structural/hcp/hcp_t1/baseline/t2_denoised_brain.nii.gz
+  for i in 1 2; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${hcp_t1_brainmask} ${hcp_t2_brain_mask}; then
+      c3d c3d ${inp[${i}]} ${hcp_t1_brainmask} -multiply ${hcp_t2_brain_mask} -multiply -type float -o ${out[${i}]}
+      # if failed, try to match headers first
+      if [ ! -e ${out[${i}]} ]; then
+        tmpdir=$(mktemp -d)
+        cp ${hcp_t1_brainmask} ${tmpdir}/t1_brain_mask.nii.gz
+        cp ${hcp_t2_brain_mask} ${tmpdir}/t2_brain_mask.nii.gz
+        fsl fslcpgeom ${inp[${i}]} ${tmpdir}/t1_brain_mask.nii.gz
+        fsl fslcpgeom ${inp[${i}]} ${tmpdir}/t2_brain_mask.nii.gz
+        c3d c3d ${inp[${i}]} ${tmpdir}/t1_brain_mask.nii.gz -multiply ${tmpdir}/t2_brain_mask.nii.gz -multiply -type float -o ${out[${i}]}
+        rm -rf ${tmpdir}
+      fi
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+  hcp_t1_denoised_brain=${out[1]}
+  hcp_t2_denoised_brain=${out[2]}
+  
+  hcp_t1_ribbon=${BaselineT1wFolder}/ribbon.nii.gz
+  hcp_t1_div_t2=${T1wFolder}/baseline/t1_div_t2.nii.gz
+  hcp_t1_div_t2_ribbon=${T1wFolder}/baseline/t1_div_t2_ribbon.nii.gz
+  if LWDP_needs_update_and_lock ${hcp_t1_div_t2_ribbon} ${hcp_t1_denoised_brain} ${hcp_t2_denoised_brain} ${hcp_t1_ribbon}; then
+    tmpdir=$(mktemp -d)
+    # sometimes wb_command -volume-math failed due to header mismatch, so match headers first
+    cp ${hcp_t1_denoised_brain} ${tmpdir}/t1_brain.nii.gz
+    cp ${hcp_t2_denoised_brain} ${tmpdir}/t2_brain.nii.gz
+    fsl fslcpgeom ${hcp_t1_ribbon} ${tmpdir}/t1_brain.nii.gz
+    fsl fslcpgeom ${hcp_t1_ribbon} ${tmpdir}/t2_brain.nii.gz
+    #
+    caret7 wb_command -volume-math "clamp((T1w/T2w),0,100)" ${hcp_t1_div_t2} -var T1w ${tmpdir}/t1_brain.nii.gz -var T2w ${tmpdir}/t2_brain.nii.gz -fixnan 0
+    caret7 wb_command -volume-palette ${hcp_t1_div_t2} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    #
+    caret7 wb_command -volume-math "((T1w/T2w)*(((ribbon>(${LeftGreyRibbonValue}-0.01))*(ribbon<(${LeftGreyRibbonValue}+0.01)))+((ribbon>(${RightGreyRibbonValue}-0.01))*(ribbon<(${RightGreyRibbonValue}+0.01)))))" ${hcp_t1_div_t2_ribbon} -var T1w ${tmpdir}/t1_brain.nii.gz -var T2w ${tmpdir}/t2_brain.nii.gz -var ribbon ${hcp_t1_ribbon}
+    caret7 wb_command -volume-palette ${hcp_t1_div_t2_ribbon} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+    #
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${hcp_t1_div_t2_ribbon}
+  fi
+  if [ ! -e ${hcp_t1_div_t2} ]; then
+    echo "ERROR: failed generating ${hcp_t1_div_t2}"
+    exit 1
+  fi
+  if [ ! -e ${hcp_t1_div_t2_ribbon} ]; then
+    echo "ERROR: failed generating ${hcp_t1_div_t2_ribbon}"
+    exit 1
+  fi
+
+  for Hemisphere in L R; do
+    if [ "${Hemisphere}" == "L" ]; then
+      Structure=CORTEX_LEFT
+      ribbon=${LeftGreyRibbonValue}
+    elif [ "${Hemisphere}" == "R" ]; then
+      Structure=CORTEX_RIGHT
+      ribbon=${RightGreyRibbonValue}
+    fi
+    if [ "${RegName}" == "MSMSulc" ]; then
+      RegSphere=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.MSMSulc.native.surf.gii
+    else
+      RegSphere=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.reg.reg_LR.native.surf.gii
+    fi
+  
+    mid_hcp_t1=${BaselineT1wFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+    thickness_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.thickness.native.shape.gii
+    spherical_std=${BaselineAtlasSpaceFolder}/${Hemisphere}.sphere.${HighResMesh}k_fs_LR.surf.gii
+    mid_highres=${BaselineAtlasSpaceFolder}/${Hemisphere}.midthickness.${HighResMesh}k_fs_LR.surf.gii
+    atlasroi=${BaselineAtlasSpaceFolder}/${Hemisphere}.atlasroi.${HighResMesh}k_fs_LR.shape.gii
+    roi_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+  
+    # myelin mapping
+    myelin_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.MyelinMap.native.func.gii
+    if LWDP_needs_update_and_lock ${myelin_native} ${hcp_t1_div_t2} ${mid_hcp_t1} ${thickness_native} ${hcp_t1_ribbon}; then
+      tmpdir=$(mktemp -d)
+      caret7 wb_command -volume-math "((ribbon>(${ribbon}-0.01))*(ribbon<(${ribbon}+0.01)))" ${tmpdir}/temp_ribbon.nii.gz -var ribbon ${hcp_t1_ribbon}
+      #
+      #caret7 wb_command -volume-to-surface-mapping ${hcp_t1_div_t2} ${mid_hcp_t1} ${myelin_native} -myelin-style ${tmpdir}/temp_ribbon.nii.gz ${thickness_native} ${MyelinMappingSigma}
+      caret7 wb_command -volume-math "clamp(VAL,0,5)" ${tmpdir}/temp_t1_div_t2.nii.gz -var VAL ${hcp_t1_div_t2} -fixnan 0
+      caret7 wb_command -volume-to-surface-mapping ${tmpdir}/temp_t1_div_t2.nii.gz ${mid_hcp_t1} ${myelin_native} -myelin-style ${tmpdir}/temp_ribbon.nii.gz ${thickness_native} ${MyelinMappingSigma}
+      #
+      caret7 wb_command -set-map-name ${myelin_native} 1 "${Hemisphere}_MyelinMap"
+      caret7 wb_command -metric-palette ${myelin_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${myelin_native}
+    fi
+    # t1, t2 mapping
+    for tx in t1 t2; do
+      tx_ref_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${tx}.native.func.gii
+      tx_input=${WORKDIR}/structural/hcp/hcp_t1/baseline/${tx}_denoised.nii.gz
+      tx_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.${tx}.native.func.gii
+      if LWDP_needs_update_and_lock ${tx_native} ${tx_input} ${tx_ref_native} ${mid_hcp_t1} ${thickness_native} ${hcp_t1_ribbon} ${roi_native}; then
+        tmpdir=$(mktemp -d)
+        #tmpdir=${AtlasSpaceFolder}/baseline/${NativeFolder}/tmp
+        #mkdir -p ${tmpdir}
+        # sometimes wb_command failed due to header mismatch, so match headers first
+        cp ${tx_input} ${tmpdir}/${tx}_denoised.nii.gz
+        fsl fslcpgeom ${hcp_t1_ribbon} ${tmpdir}/${tx}_denoised.nii.gz
+        #
+        cp ${tx_ref_native} ${tmpdir}/${Hemisphere}.${tx}_ref.native.func.gii
+        #
+        caret7 wb_command -volume-math "((ribbon>(${ribbon}-0.01))*(ribbon<(${ribbon}+0.01)))" ${tmpdir}/temp_ribbon.nii.gz -var ribbon ${hcp_t1_ribbon}
+        caret7 wb_command -volume-to-surface-mapping ${tmpdir}/${tx}_denoised.nii.gz ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii -myelin-style ${tmpdir}/temp_ribbon.nii.gz ${thickness_native} ${MyelinMappingSigma}
+        caret7 wb_command -set-map-name ${tmpdir}/${Hemisphere}.${tx}.native.func.gii 1 "${Hemisphere}_${tx}"
+        caret7 wb_command -metric-palette ${tmpdir}/${Hemisphere}.${tx}.native.func.gii MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+        #
+        #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii ${SurfaceSmoothingSigma} ${tmpdir}/${Hemisphere}.${tx}_smoothed.native.func.gii -roi ${roi_native}
+        #cp ${tmpdir}/${Hemisphere}.${tx}_smoothed.native.func.gii ${tmpdir}/${Hemisphere}.${tx}.native.func.gii
+  
+        # reduce memory usage by smoothing on downsampled mesh
+        LowResMesh=`echo ${LowResMeshes} | cut -d " " -f 1`
+        for Map in ${tx} ${tx}_ref; do
+          spherical_std_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+          mid_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+          atlasroi_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+  
+          inp=${tmpdir}/${Hemisphere}.${Map}.native.func.gii
+          map_smoothed_native=${tmpdir}/${Hemisphere}.${Map}_s.native.func.gii
+  
+          map=${tmpdir}/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.func.gii
+          caret7 wb_command -metric-resample ${inp} ${RegSphere} ${spherical_std_lowres} ADAP_BARY_AREA ${map} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+  
+          map_smoothed=${tmpdir}/${Hemisphere}.${Map}_s.${LowResMesh}k_fs_LR.func.gii
+          caret7 wb_command -metric-smoothing ${mid_lowres} ${map} ${CorrectionSigma} ${map_smoothed} -roi ${atlasroi_lowres}
+  
+          caret7 wb_command -metric-resample ${map_smoothed} ${spherical_std_lowres} ${RegSphere} ADAP_BARY_AREA ${map_smoothed_native} -area-surfs ${mid_lowres} ${mid_hcp_t1} -current-roi ${atlasroi_lowres}
+          caret7 wb_command -metric-dilate ${map_smoothed_native} ${mid_hcp_t1} 30 ${map_smoothed_native} -nearest
+          caret7 wb_command -metric-mask ${map_smoothed_native} ${roi_native} ${map_smoothed_native}
+        done
+        #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${tx_ref_native} ${CorrectionSigma} ${tmpdir}/${Hemisphere}.${tx}_ref_s.native.func.gii -roi ${roi_native}
+        #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii ${CorrectionSigma} ${tmpdir}/${Hemisphere}.${tx}_s.native.func.gii -roi ${roi_native}
+  
+        caret7 wb_command -metric-math "(ref/img)" ${tmpdir}/${Hemisphere}.${tx}_scale.native.func.gii -var ref ${tmpdir}/${Hemisphere}.${tx}_ref_s.native.func.gii -var img ${tmpdir}/${Hemisphere}.${tx}_s.native.func.gii
+        caret7 wb_command -metric-math "(img*scale)" ${tx_native} -var img ${tmpdir}/${Hemisphere}.${tx}.native.func.gii -var scale ${tmpdir}/${Hemisphere}.${tx}_scale.native.func.gii
+  
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${tx_native}
+      fi
+    done
+    # t1_div_t2 mapping
+    t1_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.t1.native.func.gii
+    t2_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.t2.native.func.gii
+    t1_div_t2_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.t1_div_t2.native.func.gii
+    if LWDP_needs_update_and_lock ${t1_div_t2_native} ${t1_native} ${t2_native}; then
+      caret7 wb_command -metric-math "clamp((T1w/T2w),0,5)" ${t1_div_t2_native} -var T1w ${t1_native} -var T2w ${t2_native} -fixnan 0
+      caret7 wb_command -set-map-name ${t1_div_t2_native} 1 "${Hemisphere}_t1_div_t2"
+      caret7 wb_command -metric-palette ${t1_div_t2_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      LWDP_lockfile_delete ${t1_div_t2_native}
+    fi
+  
+    #baseline_myelin_ref_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.MyelinMap_BC.native.func.gii
+    baseline_myelin_ref_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.RefMyelinMap.native.func.gii
+    myelin_ref_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.RefMyelinMap.native.func.gii
+    if LWDP_needs_update_and_lock ${myelin_ref_native} ${baseline_myelin_ref_native}; then
+      cp ${baseline_myelin_ref_native} ${myelin_ref_native}
+      LWDP_lockfile_delete ${myelin_ref_native}
+    fi
+  
+    # reduce memory usage by smoothing on downsampled mesh
+    LowResMesh=`echo ${LowResMeshes} | cut -d " " -f 1`
+    for Map in MyelinMap RefMyelinMap t1_div_t2; do
+      spherical_std_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+      mid_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+      atlasroi_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+  
+      inp=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.${Map}.native.func.gii
+      map_smoothed_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.${Map}_s.native.func.gii
+      if LWDP_needs_update_and_lock ${map_smoothed_native} ${inp} ${RegSphere} ${spherical_std_lowres} ${mid_hcp_t1} ${mid_lowres} ${roi_native} ${atlasroi_lowres}; then
+        tmpdir=$(mktemp -d)
+  
+        map=${tmpdir}/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.func.gii
+        caret7 wb_command -metric-resample ${inp} ${RegSphere} ${spherical_std_lowres} ADAP_BARY_AREA ${map} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+  
+        map_smoothed=${tmpdir}/${Hemisphere}.${Map}_s.${LowResMesh}k_fs_LR.func.gii
+        caret7 wb_command -metric-smoothing ${mid_lowres} ${map} ${CorrectionSigma} ${map_smoothed} -roi ${atlasroi_lowres}
+  
+        caret7 wb_command -metric-resample ${map_smoothed} ${spherical_std_lowres} ${RegSphere} ADAP_BARY_AREA ${map_smoothed_native} -area-surfs ${mid_lowres} ${mid_hcp_t1} -current-roi ${atlasroi_lowres}
+        caret7 wb_command -metric-dilate ${map_smoothed_native} ${mid_hcp_t1} 30 ${map_smoothed_native} -nearest
+        caret7 wb_command -metric-mask ${map_smoothed_native} ${roi_native} ${map_smoothed_native}
+  
+        rm -rf ${tmpdir}
+        LWDP_lockfile_delete ${map_smoothed_native}
+      fi
+    done
+    myelin_s_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.MyelinMap_s.native.func.gii
+    myelin_ref_s_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.RefMyelinMap_s.native.func.gii
+    t1_div_t2_s_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.t1_div_t2_s.native.func.gii
+    #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${myelin_native} ${CorrectionSigma} ${myelin_s_native} -roi ${roi_native}
+    #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${myellin_ref_native} ${CorrectionSigma} ${myelin_ref_s_native} -roi ${roi_native}
+    #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${t1_div_t2_native} ${CorrectionSigma} ${t1_div_t2_s_native} -roi ${roi_native}
+  
+    bias_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.BiasField.native.func.gii
+    if LWDP_needs_update_and_lock ${bias_native} ${myelin_s_native} ${myelin_ref_s_native} ${roi_native}; then
+      caret7 wb_command -metric-math "((Individual-Reference)*Mask)" ${bias_native} -var Individual ${myelin_s_native} -var Reference ${myelin_ref_s_native} -var Mask ${roi_native}
+      LWDP_lockfile_delete ${bias_native}
+    fi
+    myelin_bc_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.MyelinMap_BC.native.func.gii
+    if LWDP_needs_update_and_lock ${myelin_bc_native} ${myelin_native} ${bias_native} ${roi_native}; then
+      caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${myelin_bc_native} -var Individual ${myelin_native} -var Bias ${bias_native} -var Mask ${roi_native}
+      caret7 wb_command -set-map-name ${myelin_bc_native} 1 "${Hemisphere}_MyelinMap_BC"
+      caret7 wb_command -metric-palette ${myelin_bc_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      LWDP_lockfile_delete ${myelin_bc_native}
+    fi
+  
+    #t1_div_t2_bias_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bias.native.func.gii
+    t1_div_t2_bias_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.t1_div_t2_bias.native.func.gii
+    if LWDP_needs_update_and_lock ${t1_div_t2_bias_native} ${t1_div_t2_s_native} ${myelin_ref_s_native} ${roi_native}; then
+      caret7 wb_command -metric-math "((Individual-Reference)*Mask)" ${t1_div_t2_bias_native} -var Individual ${t1_div_t2_s_native} -var Reference ${myelin_ref_s_native} -var Mask ${roi_native}
+      LWDP_lockfile_delete ${t1_div_t2_bias_native}
+    fi
+
+    t1_div_t2_bc_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.t1_div_t2_bc.native.func.gii
+    if LWDP_needs_update_and_lock ${t1_div_t2_bc_native} ${t1_div_t2_native} ${t1_div_t2_bias_native} ${roi_native}; then
+      caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${t1_div_t2_bc_native} -var Individual ${t1_div_t2_native} -var Bias ${t1_div_t2_bias_native} -var Mask ${roi_native}
+      caret7 wb_command -set-map-name ${t1_div_t2_bc_native} 1 "${Hemisphere}_t1_div_t2_bc"
+      caret7 wb_command -metric-palette ${t1_div_t2_bc_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      LWDP_lockfile_delete ${t1_div_t2_bc_native}
+    fi
+
+    for corr in curvature sulc; do
+      corr_s=`echo ${corr} | cut -c1-4`
+      corr_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${corr}.native.shape.gii
+      for metric in MyelinMap_BC t1_div_t2_bc; do
+        metric_in_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.${metric}.native.func.gii
+        metric_out_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.${metric}_${corr_s}.native.func.gii
+        if LWDP_needs_update_and_lock ${metric_out_native} ${metric_in_native} ${roi_native} ${corr_native}; then
+          caret7 wb_command -metric-regression ${metric_in_native} ${metric_out_native} -roi ${roi_native} -remove ${corr_native}
+          caret7 wb_command -set-map-name ${metric_out_native} 1 "${Hemisphere}_${metric}_${corr_s}"
+          caret7 wb_command -metric-palette ${metric_out_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+          LWDP_lockfile_delete ${metric_out_native}
+        fi
+      done
+    done
+  done
+  
+  # apply demeaned bias
+  bias_native_L=${AtlasSpaceFolder}/baseline/${NativeFolder}/L.BiasField.native.func.gii
+  bias_native_R=${AtlasSpaceFolder}/baseline/${NativeFolder}/R.BiasField.native.func.gii
+  roi_native_L=${BaselineAtlasSpaceFolder}/${NativeFolder}/L.roi.native.shape.gii
+  roi_native_R=${BaselineAtlasSpaceFolder}/${NativeFolder}/R.roi.native.shape.gii
+  t1_div_t2_bias_native_L=${AtlasSpaceFolder}/baseline/${NativeFolder}/L.t1_div_t2_bias.native.func.gii
+  t1_div_t2_bias_native_R=${AtlasSpaceFolder}/baseline/${NativeFolder}/R.t1_div_t2_bias.native.func.gii
+  for Hemisphere in L R; do
+    if [ "${Hemisphere}" == "L" ]; then
+      Structure=CORTEX_LEFT
+      ribbon=${LeftGreyRibbonValue}
+    elif [ "${Hemisphere}" == "R" ]; then
+      Structure=CORTEX_RIGHT
+      ribbon=${RightGreyRibbonValue}
+    fi
+    myelin_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.MyelinMap.native.func.gii
+    roi_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+    bias_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.BiasField.native.func.gii
+    bias_dm_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.BiasFieldDM.native.func.gii
+    if LWDP_needs_update_and_lock ${bias_dm_native} ${bias_native_L} ${bias_native_R} ${roi_native_L} ${roi_native_R}; then
+      mean_L=`caret7 wb_command -metric-stats ${bias_native_L} -reduce MEAN -roi ${roi_native_L}`
+      mean_R=`caret7 wb_command -metric-stats ${bias_native_R} -reduce MEAN -roi ${roi_native_R}`
+      mean_L=`printf %.10f ${mean_L}`
+      mean_R=`printf %.10f ${mean_R}`
+      mean_LR=`bc -l <<< "(${mean_L} + ${mean_R}) / 2"`
+      echo mean_L = ${mean_L}, mean_R = ${mean_R}, mean_LR = ${mean_LR}
+      caret7 wb_command -metric-math "(Bias-(${mean_LR})*Mask)" ${bias_dm_native} -var Bias ${bias_native} -var Mask ${roi_native}
+      LWDP_lockfile_delete ${bias_dm_native}
+    fi
+    myelin_bcdm_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.MyelinMap_BCDM.native.func.gii
+    if LWDP_needs_update_and_lock ${myelin_bcdm_native} ${myelin_native} ${bias_dm_native} ${roi_native}; then
+      caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${myelin_bcdm_native} -var Individual ${myelin_native} -var Bias ${bias_dm_native} -var Mask ${roi_native}
+      caret7 wb_command -set-map-name ${myelin_bcdm_native} 1 "${Hemisphere}_MyelinMap_BCDM"
+      caret7 wb_command -metric-palette ${myelin_bcdm_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      LWDP_lockfile_delete ${myelin_bcdm_native}
+    fi
+    #
+    t1_div_t2_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.t1_div_t2.native.func.gii
+    t1_div_t2_bias_dm_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bias_dm.native.func.gii
+    t1_div_t2_bcdm_native=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.t1_div_t2_bcdm.native.func.gii
+    if LWDP_needs_update_and_lock ${t1_div_t2_bcdm_native} ${t1_div_t2_native} ${t1_div_t2_bias_dm_native} ${roi_native}; then
+      caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${t1_div_t2_bcdm_native} -var Individual ${t1_div_t2_native} -var Bias ${t1_div_t2_bias_dm_native} -var Mask ${roi_native}
+      caret7 wb_command -set-map-name ${t1_div_t2_bcdm_native} 1 "${Hemisphere}_t1_div_t2_bcdm"
+      caret7 wb_command -metric-palette ${t1_div_t2_bcdm_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+      LWDP_lockfile_delete ${t1_div_t2_bcdm_native}
+    fi
+  done
+  myelin_bc_native_L=${AtlasSpaceFolder}/baseline/${NativeFolder}/L.MyelinMap_BC.native.func.gii
+  myelin_bc_native_R=${AtlasSpaceFolder}/baseline/${NativeFolder}/R.MyelinMap_BC.native.func.gii
+  myelin_bcsm_native_L=${AtlasSpaceFolder}/baseline/${NativeFolder}/L.MyelinMap_BCSM.native.func.gii
+  myelin_bcsm_native_R=${AtlasSpaceFolder}/baseline/${NativeFolder}/R.MyelinMap_BCSM.native.func.gii
+  if LWDP_needs_update_and_lock ${myelin_bcsm_native_L} ${myelin_bc_native_L} ${myelin_bc_native_R} ${roi_native_L} ${roi_native_R}; then
+    mean_L=`caret7 wb_command -metric-stats ${myelin_bc_native_L} -reduce MEAN -roi ${roi_native_L}`
+    mean_R=`caret7 wb_command -metric-stats ${myelin_bc_native_R} -reduce MEAN -roi ${roi_native_R}`
+    mean_L=`printf %.10f ${mean_L}`
+    mean_R=`printf %.10f ${mean_R}`
+    mean_LR=`bc -l <<< "(${mean_L} + ${mean_R}) / 2"`
+    echo mean_L = ${mean_L}, mean_R = ${mean_R}, mean_LR = ${mean_LR}
+    caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${myelin_bcsm_native_L} -var Individual ${myelin_bc_native_L} -var Mask ${roi_native_L}
+    caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${myelin_bcsm_native_R} -var Individual ${myelin_bc_native_R} -var Mask ${roi_native_R}
+    caret7 wb_command -set-map-name ${myelin_bcsm_native_L} 1 "${Hemisphere}_MyelinMap_BCSM"
+    caret7 wb_command -set-map-name ${myelin_bcsm_native_R} 1 "${Hemisphere}_MyelinMap_BCSM"
+    caret7 wb_command -metric-palette ${myelin_bcsm_native_L} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+    caret7 wb_command -metric-palette ${myelin_bcsm_native_R} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+    LWDP_lockfile_delete ${myelin_bcsm_native_L}
+  fi
+  t1_div_t2_bc_native_L=${AtlasSpaceFolder}/baseline/${NativeFolder}/L.t1_div_t2_bc.native.func.gii
+  t1_div_t2_bc_native_R=${AtlasSpaceFolder}/baseline/${NativeFolder}/R.t1_div_t2_bc.native.func.gii
+  t1_div_t2_bcsm_native_L=${AtlasSpaceFolder}/baseline/${NativeFolder}/L.t1_div_t2_bcsm.native.func.gii
+  t1_div_t2_bcsm_native_R=${AtlasSpaceFolder}/baseline/${NativeFolder}/R.t1_div_t2_bcsm.native.func.gii
+  if LWDP_needs_update_and_lock ${t1_div_t2_bcsm_native_L} ${t1_div_t2_bc_native_L} ${t1_div_t2_bc_native_R} ${roi_native_L} ${roi_native_R}; then
+    mean_L=`caret7 wb_command -metric-stats ${t1_div_t2_bc_native_L} -reduce MEAN -roi ${roi_native_L}`
+    mean_R=`caret7 wb_command -metric-stats ${t1_div_t2_bc_native_R} -reduce MEAN -roi ${roi_native_R}`
+    mean_L=`printf %.10f ${mean_L}`
+    mean_R=`printf %.10f ${mean_R}`
+    mean_LR=`bc -l <<< "(${mean_L} + ${mean_R}) / 2"`
+    echo mean_L = ${mean_L}, mean_R = ${mean_R}, mean_LR = ${mean_LR}
+    caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${t1_div_t2_bcsm_native_L} -var Individual ${t1_div_t2_bc_native_L} -var Mask ${roi_native_L}
+    caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${t1_div_t2_bcsm_native_R} -var Individual ${t1_div_t2_bc_native_R} -var Mask ${roi_native_R}
+    caret7 wb_command -set-map-name ${t1_div_t2_bcsm_native_L} 1 "${Hemisphere}_t1_div_t2_bcsm"
+    caret7 wb_command -set-map-name ${t1_div_t2_bcsm_native_R} 1 "${Hemisphere}_t1_div_t2_bcsm"
+    caret7 wb_command -metric-palette ${t1_div_t2_bcsm_native_L} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+    caret7 wb_command -metric-palette ${t1_div_t2_bcsm_native_R} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+    LWDP_lockfile_delete ${t1_div_t2_bcsm_native_L}
+  fi
+
+  for Hemisphere in L R; do
+    if [ "${Hemisphere}" == "L" ]; then
+      Structure=CORTEX_LEFT
+      ribbon=${LeftGreyRibbonValue}
+    elif [ "${Hemisphere}" == "R" ]; then
+      Structure=CORTEX_RIGHT
+      ribbon=${RightGreyRibbonValue}
+    fi
+    if [ "${RegName}" == "MSMSulc" ]; then
+      RegSphere=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.MSMSulc.native.surf.gii
+    else
+      RegSphere=${BasekubeAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.reg.reg_LR.native.surf.gii
+    fi
+    mid_hcp_t1=${BaselineT1wFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+    roi_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+  
+    for STRING in MyelinMap%func MyelinMap_BC%func MyelinMap_BCDM%func MyelinMap_BCSM%func BiasField%func t1%func t2%func t1_div_t2%func t1_div_t2_bc%func t1_div_t2_bcdm%func t1_div_t2_bcsm%func MyelinMap_BC_curv%func MyelinMap_BC_sulc%func t1_div_t2_bc_curv%func t1_div_t2_bc_sulc%func; do
+      Map=`echo $STRING | cut -d "%" -f 1`
+      Ext=`echo $STRING | cut -d "%" -f 2`
+  
+      spherical_std=${BaselineAtlasSpaceFolder}/${Hemisphere}.sphere.${HighResMesh}k_fs_LR.surf.gii
+      mid_highres=${BaselineAtlasSpaceFolder}/${Hemisphere}.midthickness.${HighResMesh}k_fs_LR.surf.gii
+      atlasroi=${BaselineAtlasSpaceFolder}/${Hemisphere}.atlasroi.${HighResMesh}k_fs_LR.shape.gii
+      map=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.${Map}.native.${Ext}.gii
+      map_highres=${AtlasSpaceFolder}/baseline/${Hemisphere}.${Map}.${HighResMesh}k_fs_LR.${Ext}.gii
+      if LWDP_needs_update_and_lock ${map_highres} ${map} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_highres} ${roi_native}; then
+        caret7 wb_command -metric-resample ${map} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${map_highres} -area-surfs ${mid_hcp_t1} ${mid_highres} -current-roi ${roi_native}
+        caret7 wb_command -metric-mask ${map_highres} ${atlasroi} ${map_highres}
+        LWDP_lockfile_delete ${map_highres}
+      fi
+  
+      for LowResMesh in ${LowResMeshes}; do
+        spherical_std=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+        mid_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+        atlasroi=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+        map=${AtlasSpaceFolder}/baseline/${NativeFolder}/${Hemisphere}.${Map}.native.${Ext}.gii
+        map_lowres=${AtlasSpaceFolder}/baseline/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.${Ext}.gii
+        if LWDP_needs_update_and_lock ${map_lowres} ${map} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_lowres} ${roi_native}; then
+          caret7 wb_command -metric-resample ${map} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${map_lowres} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+          caret7 wb_command -metric-mask ${map_lowres} ${atlasroi} ${map_lowres}
+          LWDP_lockfile_delete ${map_lowres}
+        fi
+      done
+    done
+  done
+
+  # create cifti files
+  STRINGII=""
+  for LowResMesh in ${LowResMeshes}; do
+    STRINGII=`echo "${STRINGII}${AtlasSpaceFolder}/baseline/fsaverage_LR${LowResMesh}k%${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k%${LowResMesh}k_fs_LR%atlasroi "`
+  done
+  for STRING in ${AtlasSpaceFolder}/baseline/${NativeFolder}%${BaselineAtlasSpaceFolder}/${NativeFolder}%native%roi ${AtlasSpaceFolder}/baseline%${BaselineAtlasSpaceFolder}%${HighResMesh}k_fs_LR%atlasroi ${STRINGII}; do
+    Folder=`echo $STRING | cut -d "%" -f 1`
+    BaselineFolder=`echo $STRING | cut -d "%" -f 2`
+    Mesh=`echo $STRING | cut -d "%" -f 3`
+    ROI=`echo $STRING | cut -d "%" -f 4`
+    for STRINGII in MyelinMap%func MyelinMap_BC%func MyelinMap_BCDM%func RefMyelinMap%func BiasField%func t1%func t2%func t1_div_t2%func t1_div_t2_bc%func t1_div_t2_bcdm%func t1_div_t2_bias%func MyelinMap_BC_curv%func MyelinMap_BC_sulc%func t1_div_t2_bc_curv%func t1_div_t2_bc_sulc%func; do
+      Map=`echo $STRINGII | cut -d "%" -f 1`
+      Ext=`echo $STRINGII | cut -d "%" -f 2`
+      if [ ! -e ${Folder}/L.${Map}.${Mesh}.${Ext}.gii ]; then
+        continue
+      fi
+      inps="${Folder}/L.${Map}.${Mesh}.${Ext}.gii ${BaselineFolder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.${Map}.${Mesh}.${Ext}.gii ${BaselineFolder}/R.${ROI}.${Mesh}.shape.gii"
+      out=${Folder}/${Map}.${Mesh}.dscalar.nii
+      if LWDP_needs_update_and_lock ${out} ${inps}; then
+        caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.${Map}.${Mesh}.${Ext}.gii -roi-left ${BaselineFolder}/L.${ROI}.${Mesh}.shape.gii -right-metric ${Folder}/R.${Map}.${Mesh}.${Ext}.gii -roi-right ${BaselineFolder}/R.${ROI}.${Mesh}.shape.gii
+        caret7 wb_command -set-map-names ${out} -map 1 "${Map}"
+        caret7 wb_command -cifti-palette ${out} MODE_AUTO_SCALE_PERCENTAGE ${out} -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+        LWDP_lockfile_delete ${out}
+      fi
+    done
+    for STRINGII in MyelinMap_BCSM%func t1_div_t2_bcsm%func; do
+      Map=`echo $STRINGII | cut -d "%" -f 1`
+      Ext=`echo $STRINGII | cut -d "%" -f 2`
+      if [ ! -e ${Folder}/L.${Map}.${Mesh}.${Ext}.gii ]; then
+        continue
+      fi
+      inps="${Folder}/L.${Map}.${Mesh}.${Ext}.gii ${BaselineFolder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.${Map}.${Mesh}.${Ext}.gii ${BaselineFolder}/R.${ROI}.${Mesh}.shape.gii"
+      out=${Folder}/${Map}.${Mesh}.dscalar.nii
+      if LWDP_needs_update_and_lock ${out} ${inps}; then
+        caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.${Map}.${Mesh}.${Ext}.gii -roi-left ${BaselineFolder}/L.${ROI}.${Mesh}.shape.gii -right-metric ${Folder}/R.${Map}.${Mesh}.${Ext}.gii -roi-right ${BaselineFolder}/R.${ROI}.${Mesh}.shape.gii
+        caret7 wb_command -set-map-names ${out} -map 1 "${Map}"
+        caret7 wb_command -cifti-palette ${out} MODE_USER_SCALE ${out} -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid -interpolate true
+        LWDP_lockfile_delete ${out}
+      fi
+    done
+  done
+
+  ## baselinex scheme
+  ##baseline=baseline2
+  ##CorrectionSigma2=`echo "sqrt ( 50 )" | bc -l`
+  #baseline=baseline3
+  #CorrectionSigma2=`echo "sqrt ( 10 )" | bc -l`
+
+  #for Hemisphere in L R; do
+  #  if [ "${Hemisphere}" == "L" ]; then
+  #    Structure=CORTEX_LEFT
+  #    ribbon=${LeftGreyRibbonValue}
+  #  elif [ "${Hemisphere}" == "R" ]; then
+  #    Structure=CORTEX_RIGHT
+  #    ribbon=${RightGreyRibbonValue}
+  #  fi
+  #  if [ "${RegName}" == "MSMSulc" ]; then
+  #    RegSphere=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.MSMSulc.native.surf.gii
+  #  else
+  #    RegSphere=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.reg.reg_LR.native.surf.gii
+  #  fi
+  #
+  #  mid_hcp_t1=${BaselineT1wFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+  #  thickness_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.thickness.native.shape.gii
+  #  spherical_std=${BaselineAtlasSpaceFolder}/${Hemisphere}.sphere.${HighResMesh}k_fs_LR.surf.gii
+  #  mid_highres=${BaselineAtlasSpaceFolder}/${Hemisphere}.midthickness.${HighResMesh}k_fs_LR.surf.gii
+  #  atlasroi=${BaselineAtlasSpaceFolder}/${Hemisphere}.atlasroi.${HighResMesh}k_fs_LR.shape.gii
+  #  roi_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+
+  #  # t1, t2 mapping
+  #  for tx in t1 t2; do
+  #    tx_ref_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.${tx}.native.func.gii
+  #    tx_input=${WORKDIR}/structural/hcp/hcp_t1/baseline/${tx}_denoised.nii.gz
+  #    tx_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.${tx}.native.func.gii
+  #    if LWDP_needs_update_and_lock ${tx_native} ${tx_input} ${tx_ref_native} ${mid_hcp_t1} ${thickness_native} ${hcp_t1_ribbon} ${roi_native}; then
+  #      tmpdir=$(mktemp -d)
+  #      #tmpdir=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/tmp
+  #      #mkdir -p ${tmpdir}
+  #      # sometimes wb_command failed due to header mismatch, so match headers first
+  #      cp ${tx_input} ${tmpdir}/${tx}_denoised.nii.gz
+  #      fsl fslcpgeom ${hcp_t1_ribbon} ${tmpdir}/${tx}_denoised.nii.gz
+  #      #
+  #      cp ${tx_ref_native} ${tmpdir}/${Hemisphere}.${tx}_ref.native.func.gii
+  #      #
+  #      caret7 wb_command -volume-math "((ribbon>(${ribbon}-0.01))*(ribbon<(${ribbon}+0.01)))" ${tmpdir}/temp_ribbon.nii.gz -var ribbon ${hcp_t1_ribbon}
+  #      caret7 wb_command -volume-to-surface-mapping ${tmpdir}/${tx}_denoised.nii.gz ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii -myelin-style ${tmpdir}/temp_ribbon.nii.gz ${thickness_native} ${MyelinMappingSigma}
+  #      caret7 wb_command -set-map-name ${tmpdir}/${Hemisphere}.${tx}.native.func.gii 1 "${Hemisphere}_${tx}"
+  #      caret7 wb_command -metric-palette ${tmpdir}/${Hemisphere}.${tx}.native.func.gii MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+  #      #
+  #      #caret7 wb_command -metric-smoothing ${mid_hcp_t1} ${tmpdir}/${Hemisphere}.${tx}.native.func.gii ${SurfaceSmoothingSigma} ${tmpdir}/${Hemisphere}.${tx}_smoothed.native.func.gii -roi ${roi_native}
+  #      #cp ${tmpdir}/${Hemisphere}.${tx}_smoothed.native.func.gii ${tmpdir}/${Hemisphere}.${tx}.native.func.gii
+  #
+  #      # reduce memory usage by smoothing on downsampled mesh
+  #      LowResMesh=`echo ${LowResMeshes} | cut -d " " -f 1`
+  #      for Map in ${tx} ${tx}_ref; do
+  #        spherical_std_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+  #        mid_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+  #        atlasroi_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+  #
+  #        inp=${tmpdir}/${Hemisphere}.${Map}.native.func.gii
+  #        map_smoothed_native=${tmpdir}/${Hemisphere}.${Map}_s.native.func.gii
+  #
+  #        map=${tmpdir}/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.func.gii
+  #        caret7 wb_command -metric-resample ${inp} ${RegSphere} ${spherical_std_lowres} ADAP_BARY_AREA ${map} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+  #
+  #        map_smoothed=${tmpdir}/${Hemisphere}.${Map}_s.${LowResMesh}k_fs_LR.func.gii
+  #        caret7 wb_command -metric-smoothing ${mid_lowres} ${map} ${CorrectionSigma2} ${map_smoothed} -roi ${atlasroi_lowres}
+  #
+  #        caret7 wb_command -metric-resample ${map_smoothed} ${spherical_std_lowres} ${RegSphere} ADAP_BARY_AREA ${map_smoothed_native} -area-surfs ${mid_lowres} ${mid_hcp_t1} -current-roi ${atlasroi_lowres}
+  #        caret7 wb_command -metric-dilate ${map_smoothed_native} ${mid_hcp_t1} 30 ${map_smoothed_native} -nearest
+  #        caret7 wb_command -metric-mask ${map_smoothed_native} ${roi_native} ${map_smoothed_native}
+  #      done
+  #
+  #      caret7 wb_command -metric-math "(ref/img)" ${tmpdir}/${Hemisphere}.${tx}_scale.native.func.gii -var ref ${tmpdir}/${Hemisphere}.${tx}_ref_s.native.func.gii -var img ${tmpdir}/${Hemisphere}.${tx}_s.native.func.gii
+  #      caret7 wb_command -metric-math "(img*scale)" ${tx_native} -var img ${tmpdir}/${Hemisphere}.${tx}.native.func.gii -var scale ${tmpdir}/${Hemisphere}.${tx}_scale.native.func.gii
+  #
+  #      rm -rf ${tmpdir}
+  #      LWDP_lockfile_delete ${tx_native}
+  #    fi
+  #  done
+  #  # t1_div_t2 mapping
+  #  t1_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1.native.func.gii
+  #  t2_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t2.native.func.gii
+  #  t1_div_t2_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1_div_t2.native.func.gii
+  #  if LWDP_needs_update_and_lock ${t1_div_t2_native} ${t1_native} ${t2_native}; then
+  #    caret7 wb_command -metric-math "clamp((T1w/T2w),0,5)" ${t1_div_t2_native} -var T1w ${t1_native} -var T2w ${t2_native} -fixnan 0
+  #    caret7 wb_command -set-map-name ${t1_div_t2_native} 1 "${Hemisphere}_t1_div_t2"
+  #    caret7 wb_command -metric-palette ${t1_div_t2_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+  #    LWDP_lockfile_delete ${t1_div_t2_native}
+  #  fi
+  #
+  #  baseline_t1_div_t2_ref_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bc.native.func.gii
+  #  t1_div_t2_ref_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1_div_t2_ref.native.func.gii
+  #  if LWDP_needs_update_and_lock ${t1_div_t2_ref_native} ${baseline_t1_div_t2_ref_native}; then
+  #    cp ${baseline_t1_div_t2_ref_native} ${t1_div_t2_ref_native}
+  #    LWDP_lockfile_delete ${t1_div_t2_ref_native}
+  #  fi
+  #
+  #  # reduce memory usage by smoothing on downsampled mesh
+  #  LowResMesh=`echo ${LowResMeshes} | cut -d " " -f 1`
+  #  for Map in t1_div_t2_ref t1_div_t2; do
+  #    spherical_std_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+  #    mid_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+  #    atlasroi_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+  #
+  #    inp=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.${Map}.native.func.gii
+  #    map_smoothed_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.${Map}_s.native.func.gii
+  #    if LWDP_needs_update_and_lock ${map_smoothed_native} ${inp} ${RegSphere} ${spherical_std_lowres} ${mid_hcp_t1} ${mid_lowres} ${roi_native} ${atlasroi_lowres}; then
+  #      tmpdir=$(mktemp -d)
+  #
+  #      map=${tmpdir}/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.func.gii
+  #      caret7 wb_command -metric-resample ${inp} ${RegSphere} ${spherical_std_lowres} ADAP_BARY_AREA ${map} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+  #
+  #      map_smoothed=${tmpdir}/${Hemisphere}.${Map}_s.${LowResMesh}k_fs_LR.func.gii
+  #      caret7 wb_command -metric-smoothing ${mid_lowres} ${map} ${CorrectionSigma2} ${map_smoothed} -roi ${atlasroi_lowres}
+  #
+  #      caret7 wb_command -metric-resample ${map_smoothed} ${spherical_std_lowres} ${RegSphere} ADAP_BARY_AREA ${map_smoothed_native} -area-surfs ${mid_lowres} ${mid_hcp_t1} -current-roi ${atlasroi_lowres}
+  #      caret7 wb_command -metric-dilate ${map_smoothed_native} ${mid_hcp_t1} 30 ${map_smoothed_native} -nearest
+  #      caret7 wb_command -metric-mask ${map_smoothed_native} ${roi_native} ${map_smoothed_native}
+  #
+  #      rm -rf ${tmpdir}
+  #      LWDP_lockfile_delete ${map_smoothed_native}
+  #    fi
+  #  done
+  #  t1_div_t2_ref_s_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1_div_t2_ref_s.native.func.gii
+  #  t1_div_t2_s_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1_div_t2_s.native.func.gii
+  #
+  #  t1_div_t2_bias_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1_div_t2_bias.native.func.gii
+  #  if LWDP_needs_update_and_lock ${t1_div_t2_bias_native} ${t1_div_t2_s_native} ${t1_div_t2_ref_s_native} ${roi_native}; then
+  #    caret7 wb_command -metric-math "((Individual-Reference)*Mask)" ${t1_div_t2_bias_native} -var Individual ${t1_div_t2_s_native} -var Reference ${t1_div_t2_ref_s_native} -var Mask ${roi_native}
+  #    LWDP_lockfile_delete ${t1_div_t2_bias_native}
+  #  fi
+
+  #  t1_div_t2_bc_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1_div_t2_bc.native.func.gii
+  #  if LWDP_needs_update_and_lock ${t1_div_t2_bc_native} ${t1_div_t2_native} ${t1_div_t2_bias_native} ${roi_native}; then
+  #    caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${t1_div_t2_bc_native} -var Individual ${t1_div_t2_native} -var Bias ${t1_div_t2_bias_native} -var Mask ${roi_native}
+  #    caret7 wb_command -set-map-name ${t1_div_t2_bc_native} 1 "${Hemisphere}_t1_div_t2_bc"
+  #    caret7 wb_command -metric-palette ${t1_div_t2_bc_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+  #    LWDP_lockfile_delete ${t1_div_t2_bc_native}
+  #  fi
+  #done
+  #
+  ## apply demeaned bias
+  #roi_native_L=${BaselineAtlasSpaceFolder}/${NativeFolder}/L.roi.native.shape.gii
+  #roi_native_R=${BaselineAtlasSpaceFolder}/${NativeFolder}/R.roi.native.shape.gii
+  #t1_div_t2_bias_native_L=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/L.t1_div_t2_bias.native.func.gii
+  #t1_div_t2_bias_native_R=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/R.t1_div_t2_bias.native.func.gii
+  #for Hemisphere in L R; do
+  #  if [ "${Hemisphere}" == "L" ]; then
+  #    Structure=CORTEX_LEFT
+  #    ribbon=${LeftGreyRibbonValue}
+  #  elif [ "${Hemisphere}" == "R" ]; then
+  #    Structure=CORTEX_RIGHT
+  #    ribbon=${RightGreyRibbonValue}
+  #  fi
+  #  roi_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+  #  t1_div_t2_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1_div_t2.native.func.gii
+  #  t1_div_t2_bias_dm_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.t1_div_t2_bias_dm.native.func.gii
+  #  t1_div_t2_bcdm_native=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.t1_div_t2_bcdm.native.func.gii
+  #  if LWDP_needs_update_and_lock ${t1_div_t2_bcdm_native} ${t1_div_t2_native} ${t1_div_t2_bias_dm_native} ${roi_native}; then
+  #    caret7 wb_command -metric-math "((Individual-Bias)*Mask)" ${t1_div_t2_bcdm_native} -var Individual ${t1_div_t2_native} -var Bias ${t1_div_t2_bias_dm_native} -var Mask ${roi_native}
+  #    caret7 wb_command -set-map-name ${t1_div_t2_bcdm_native} 1 "${Hemisphere}_t1_div_t2_bcdm"
+  #    caret7 wb_command -metric-palette ${t1_div_t2_bcdm_native} MODE_AUTO_SCALE_PERCENTAGE -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+  #    LWDP_lockfile_delete ${t1_div_t2_bcdm_native}
+  #  fi
+  #done
+  #t1_div_t2_bc_native_L=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/L.t1_div_t2_bc.native.func.gii
+  #t1_div_t2_bc_native_R=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/R.t1_div_t2_bc.native.func.gii
+  #t1_div_t2_bcsm_native_L=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/L.t1_div_t2_bcsm.native.func.gii
+  #t1_div_t2_bcsm_native_R=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/R.t1_div_t2_bcsm.native.func.gii
+  #if LWDP_needs_update_and_lock ${t1_div_t2_bcsm_native_L} ${t1_div_t2_bc_native_L} ${t1_div_t2_bc_native_R} ${roi_native_L} ${roi_native_R}; then
+  #  mean_L=`caret7 wb_command -metric-stats ${t1_div_t2_bc_native_L} -reduce MEAN -roi ${roi_native_L}`
+  #  mean_R=`caret7 wb_command -metric-stats ${t1_div_t2_bc_native_R} -reduce MEAN -roi ${roi_native_R}`
+  #  mean_L=`printf %.10f ${mean_L}`
+  #  mean_R=`printf %.10f ${mean_R}`
+  #  mean_LR=`bc -l <<< "(${mean_L} + ${mean_R}) / 2"`
+  #  echo mean_L = ${mean_L}, mean_R = ${mean_R}, mean_LR = ${mean_LR}
+  #  caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${t1_div_t2_bcsm_native_L} -var Individual ${t1_div_t2_bc_native_L} -var Mask ${roi_native_L}
+  #  caret7 wb_command -metric-math "((Individual-(${mean_LR}))*Mask)" ${t1_div_t2_bcsm_native_R} -var Individual ${t1_div_t2_bc_native_R} -var Mask ${roi_native_R}
+  #  caret7 wb_command -set-map-name ${t1_div_t2_bcsm_native_L} 1 "${Hemisphere}_t1_div_t2_bcsm"
+  #  caret7 wb_command -set-map-name ${t1_div_t2_bcsm_native_R} 1 "${Hemisphere}_t1_div_t2_bcsm"
+  #  caret7 wb_command -metric-palette ${t1_div_t2_bcsm_native_L} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+  #  caret7 wb_command -metric-palette ${t1_div_t2_bcsm_native_R} MODE_USER_SCALE -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid
+  #  LWDP_lockfile_delete ${t1_div_t2_bcsm_native_L}
+  #fi
+
+  #for Hemisphere in L R; do
+  #  if [ "${Hemisphere}" == "L" ]; then
+  #    Structure=CORTEX_LEFT
+  #    ribbon=${LeftGreyRibbonValue}
+  #  elif [ "${Hemisphere}" == "R" ]; then
+  #    Structure=CORTEX_RIGHT
+  #    ribbon=${RightGreyRibbonValue}
+  #  fi
+  #  if [ "${RegName}" == "MSMSulc" ]; then
+  #    RegSphere=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.MSMSulc.native.surf.gii
+  #  else
+  #    RegSphere=${BasekubeAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.sphere.reg.reg_LR.native.surf.gii
+  #  fi
+  #  mid_hcp_t1=${BaselineT1wFolder}/${NativeFolder}/${Hemisphere}.midthickness.native.surf.gii
+  #  roi_native=${BaselineAtlasSpaceFolder}/${NativeFolder}/${Hemisphere}.roi.native.shape.gii
+  #
+  #  for STRING in t1_div_t2%func t1_div_t2_bc%func t1_div_t2_bcdm%func t1_div_t2_bcsm%func; do
+  #    Map=`echo $STRING | cut -d "%" -f 1`
+  #    Ext=`echo $STRING | cut -d "%" -f 2`
+  #
+  #    spherical_std=${BaselineAtlasSpaceFolder}/${Hemisphere}.sphere.${HighResMesh}k_fs_LR.surf.gii
+  #    mid_highres=${BaselineAtlasSpaceFolder}/${Hemisphere}.midthickness.${HighResMesh}k_fs_LR.surf.gii
+  #    atlasroi=${BaselineAtlasSpaceFolder}/${Hemisphere}.atlasroi.${HighResMesh}k_fs_LR.shape.gii
+  #    map=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.${Map}.native.${Ext}.gii
+  #    map_highres=${AtlasSpaceFolder}/${baseline}/${Hemisphere}.${Map}.${HighResMesh}k_fs_LR.${Ext}.gii
+  #    if LWDP_needs_update_and_lock ${map_highres} ${map} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_highres} ${roi_native}; then
+  #      caret7 wb_command -metric-resample ${map} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${map_highres} -area-surfs ${mid_hcp_t1} ${mid_highres} -current-roi ${roi_native}
+  #      caret7 wb_command -metric-mask ${map_highres} ${atlasroi} ${map_highres}
+  #      LWDP_lockfile_delete ${map_highres}
+  #    fi
+  #
+  #    for LowResMesh in ${LowResMeshes}; do
+  #      spherical_std=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.sphere.${LowResMesh}k_fs_LR.surf.gii
+  #      mid_lowres=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.midthickness.${LowResMesh}k_fs_LR.surf.gii
+  #      atlasroi=${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k/${Hemisphere}.atlasroi.${LowResMesh}k_fs_LR.shape.gii
+  #      map=${AtlasSpaceFolder}/${baseline}/${NativeFolder}/${Hemisphere}.${Map}.native.${Ext}.gii
+  #      map_lowres=${AtlasSpaceFolder}/${baseline}/fsaverage_LR${LowResMesh}k/${Hemisphere}.${Map}.${LowResMesh}k_fs_LR.${Ext}.gii
+  #      if LWDP_needs_update_and_lock ${map_lowres} ${map} ${RegSphere} ${spherical_std} ${mid_hcp_t1} ${mid_lowres} ${roi_native}; then
+  #        caret7 wb_command -metric-resample ${map} ${RegSphere} ${spherical_std} ADAP_BARY_AREA ${map_lowres} -area-surfs ${mid_hcp_t1} ${mid_lowres} -current-roi ${roi_native}
+  #        caret7 wb_command -metric-mask ${map_lowres} ${atlasroi} ${map_lowres}
+  #        LWDP_lockfile_delete ${map_lowres}
+  #      fi
+  #    done
+  #  done
+  #done
+
+  ## create cifti files
+  #STRINGII=""
+  #for LowResMesh in ${LowResMeshes}; do
+  #  STRINGII=`echo "${STRINGII}${AtlasSpaceFolder}/${baseline}/fsaverage_LR${LowResMesh}k%${BaselineAtlasSpaceFolder}/fsaverage_LR${LowResMesh}k%${LowResMesh}k_fs_LR%atlasroi "`
+  #done
+  #for STRING in ${AtlasSpaceFolder}/${baseline}/${NativeFolder}%${BaselineAtlasSpaceFolder}/${NativeFolder}%native%roi ${AtlasSpaceFolder}/${baseline}%${BaselineAtlasSpaceFolder}%${HighResMesh}k_fs_LR%atlasroi ${STRINGII}; do
+  #  Folder=`echo $STRING | cut -d "%" -f 1`
+  #  BaselineFolder=`echo $STRING | cut -d "%" -f 2`
+  #  Mesh=`echo $STRING | cut -d "%" -f 3`
+  #  ROI=`echo $STRING | cut -d "%" -f 4`
+  #  for STRINGII in t1_div_t2_ref%func t1_div_t2%func t1_div_t2_bc%func t1_div_t2_bcdm%func t1_div_t2_bias%func; do
+  #    Map=`echo $STRINGII | cut -d "%" -f 1`
+  #    Ext=`echo $STRINGII | cut -d "%" -f 2`
+  #    if [ ! -e ${Folder}/L.${Map}.${Mesh}.${Ext}.gii ]; then
+  #      continue
+  #    fi
+  #    inps="${Folder}/L.${Map}.${Mesh}.${Ext}.gii ${BaselineFolder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.${Map}.${Mesh}.${Ext}.gii ${BaselineFolder}/R.${ROI}.${Mesh}.shape.gii"
+  #    out=${Folder}/${Map}.${Mesh}.dscalar.nii
+  #    if LWDP_needs_update_and_lock ${out} ${inps}; then
+  #      caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.${Map}.${Mesh}.${Ext}.gii -roi-left ${BaselineFolder}/L.${ROI}.${Mesh}.shape.gii -right-metric ${Folder}/R.${Map}.${Mesh}.${Ext}.gii -roi-right ${BaselineFolder}/R.${ROI}.${Mesh}.shape.gii
+  #      caret7 wb_command -set-map-names ${out} -map 1 "${Map}"
+  #      caret7 wb_command -cifti-palette ${out} MODE_AUTO_SCALE_PERCENTAGE ${out} -pos-percent 4 96 -interpolate true -palette-name videen_style -disp-pos true -disp-neg false -disp-zero false
+  #      LWDP_lockfile_delete ${out}
+  #    fi
+  #  done
+  #  for STRINGII in t1_div_t2_bcsm%func; do
+  #    Map=`echo $STRINGII | cut -d "%" -f 1`
+  #    Ext=`echo $STRINGII | cut -d "%" -f 2`
+  #    if [ ! -e ${Folder}/L.${Map}.${Mesh}.${Ext}.gii ]; then
+  #      continue
+  #    fi
+  #    inps="${Folder}/L.${Map}.${Mesh}.${Ext}.gii ${BaselineFolder}/L.${ROI}.${Mesh}.shape.gii ${Folder}/R.${Map}.${Mesh}.${Ext}.gii ${BaselineFolder}/R.${ROI}.${Mesh}.shape.gii"
+  #    out=${Folder}/${Map}.${Mesh}.dscalar.nii
+  #    if LWDP_needs_update_and_lock ${out} ${inps}; then
+  #      caret7 wb_command -cifti-create-dense-scalar ${out} -left-metric ${Folder}/L.${Map}.${Mesh}.${Ext}.gii -roi-left ${BaselineFolder}/L.${ROI}.${Mesh}.shape.gii -right-metric ${Folder}/R.${Map}.${Mesh}.${Ext}.gii -roi-right ${BaselineFolder}/R.${ROI}.${Mesh}.shape.gii
+  #      caret7 wb_command -set-map-names ${out} -map 1 "${Map}"
+  #      caret7 wb_command -cifti-palette ${out} MODE_USER_SCALE ${out} -pos-user 0 0.5 -neg-user 0 -0.5 -disp-pos true -disp-neg true -disp-zero false -palette-name raich4_clrmid -interpolate true
+  #      LWDP_lockfile_delete ${out}
+  #    fi
+  #  done
+  #done
+fi
+

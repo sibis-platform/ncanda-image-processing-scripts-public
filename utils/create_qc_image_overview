@@ -1,0 +1,149 @@
+#!/bin/bash
+
+################
+# WARNING
+#
+#
+#  This script should be run in folder 
+#	/path/to/cases/
+#  using command line 
+#	./../scripts/image_processing/utils/create_qc_image_overview
+
+# all html files that changed after that day will be considered 
+# TIMESTAMP="5/1/2021"
+TIMESTAMP="20250712"
+PATTERN="NCANDA_S0*/standard" 
+
+if [ "$TIMESTAMP" != "" ]; then 
+    # OUTPUT_DIR=qc_overview_`echo $TIMESTAMP | cut -d' ' -f1 | cut -d'/' -f3` 
+    OUTPUT_DIR=qc_overview_$((10#${TIMESTAMP::4} + 1))
+else 
+    OUTPUT_DIR=qc_overview_all 
+fi  
+
+[ -d $OUTPUT_DIR ] || mkdir $OUTPUT_DIR
+echo $OUTPUT_DIR 
+
+echo "<!DOCTYPE html>" 										>  $OUTPUT_DIR/index.html
+echo "<html>" 											>> $OUTPUT_DIR/index.html
+echo "<head>" 											>> $OUTPUT_DIR/index.html
+echo "<script type=\"text/javascript\">" 							>> $OUTPUT_DIR/index.html
+echo "var f=0;" 										>> $OUTPUT_DIR/index.html
+echo "var htmllist = [" 									>> $OUTPUT_DIR/index.html
+
+# SUBJECTS="$PWD/NCANDA_S000*/standard/followup_4y"
+# SUBJECTS="$PWD/NCANDA_S*/*"
+#ls $PWD/NCANDA_S*/* -1 | wc -l
+#echo $SUBJECTS
+
+if true; then 
+   iii=0
+   rm -f /tmp/index_.html
+
+   for SUB in $PWD/$PATTERN; do
+       echo $SUB
+        if [ "$TIMESTAMP" != "" ]; then 
+	   VISITS=`cd $SUB; find */qc_images/index*.html -newermt $TIMESTAMP 2> /dev/null | cut -d'/' -f1 | sort -u`
+	else 
+           VISITS=`cd $SUB; ls -d1 */qc_images/index*.html 2> /dev/null | cut -d'/' -f1 | sort -u`
+	fi 
+
+	if [ `echo $VISITS | wc -w` -eq 0 ]; then
+	    continue 
+	fi
+
+	LAST=""
+	for VI in $VISITS; do
+	    DIR=$SUB/$VI
+	    indexFile=$DIR/qc_images/index.html
+	    if [ -e $indexFile ] ; then
+	        #echo $indexFile
+	        echo "\"$indexFile\"," >> $OUTPUT_DIR/index.html
+		numDIR=`echo "$DIR" | tr '/' '\n' | grep -n NCANDA_S | cut -d: -f1`
+		optDIR=`echo "$DIR" | cut -d/ -f${numDIR}-`
+		echo "                         <option value=\"$iii\">$optDIR</option>"                 >> /tmp/index_.html
+	    	LAST=$DIR
+		iii=$((iii+1))
+	    fi
+	done
+	#echo "$LAST/qc_images/index_longitudinal.html"
+	if [ "$LAST" != "" ]; then 
+	  indexFile=$LAST/qc_images/index_longitudinal.html
+	  # VISITS=`cd $SUB; find */qc_images/index*.html -newermt $TIMESTAMP 2> /dev/null | cut -d'/' -f1 | sort -u`
+
+	  if [ -e $indexFile ] ; then
+	      if [ "$TIMESTAMP" != "" ]; then 
+		  mtime=$(date '+%Y%m%d' -r "${indexFile}")
+		  if [[ ${mtime} < ${TIMESTAMP} ]]; then 
+		      continue 
+		  fi
+	      fi 
+	      echo "\"$indexFile\"," >> $OUTPUT_DIR/index.html
+
+  	      numDIR=`echo "$LAST" | tr '/' '\n' | grep -n NCANDA_S | cut -d: -f1`
+              optDIR=`echo "$LAST" | cut -d/ -f${numDIR}-`
+
+              echo "                         <option value=\"$iii\">$optDIR longitudinal</option>"                 >> /tmp/index_.html
+              iii=$((iii+1))
+   	  fi
+        fi 
+   done
+
+   echo "\" \"];" 											>> $OUTPUT_DIR/index.html
+   
+   
+   echo "function newContent()     {" 								>> $OUTPUT_DIR/index.html
+   echo "document.getElementById('fr_content').src =htmllist[f];" 					>> $OUTPUT_DIR/index.html
+   echo "}" 											>> $OUTPUT_DIR/index.html
+   echo "function setNext()     {" 								>> $OUTPUT_DIR/index.html
+   echo "try     {" 										>> $OUTPUT_DIR/index.html
+   echo "if (f < htmllist.length - 1) f++;" 							>> $OUTPUT_DIR/index.html
+   echo "document.getElementById('fr_content').src=htmllist[f];    " 				>> $OUTPUT_DIR/index.html
+   echo "} catch(e)     {" 									>> $OUTPUT_DIR/index.html
+   echo "ErrorHandler.handleError(e);" 								>> $OUTPUT_DIR/index.html
+   echo "}" 											>> $OUTPUT_DIR/index.html
+   echo "} //setNext" 										>> $OUTPUT_DIR/index.html
+   echo "function setPrev()     {" 								>> $OUTPUT_DIR/index.html
+   echo "if (f > 0) f--;" 										>> $OUTPUT_DIR/index.html
+   echo "document.getElementById('fr_content').src=htmllist[f];    " 				>> $OUTPUT_DIR/index.html
+   echo "}" 											>> $OUTPUT_DIR/index.html
+   echo "function goTo()     {" 					         			>> $OUTPUT_DIR/index.html
+   echo "f=Number(document.getElementById('select_drop').value);"  				>> $OUTPUT_DIR/index.html
+   echo "document.getElementById('fr_content').src=htmllist[f];    " 				>> $OUTPUT_DIR/index.html
+   echo "}" 											>> $OUTPUT_DIR/index.html
+   echo "</script>" 										>> $OUTPUT_DIR/index.html
+   echo "<head>" 											>> $OUTPUT_DIR/index.html
+   echo "<body>" 											>> $OUTPUT_DIR/index.html
+   echo "<div>" 											>> $OUTPUT_DIR/index.html
+   echo "  <nav>" 											>> $OUTPUT_DIR/index.html
+   echo "  <table style=\"width: 100%;\" >" 										>> $OUTPUT_DIR/index.html
+   echo "	<tr>" 											>> $OUTPUT_DIR/index.html
+   echo "		<td>" 										>> $OUTPUT_DIR/index.html
+   echo "			<ul style=list-style-type: inline;>" 					>> $OUTPUT_DIR/index.html
+   echo "			  <button  onclick=\"setPrev();\">    <u>Prev    </u>    </button>  " >> $OUTPUT_DIR/index.html
+   echo "			  <button  onclick=\"setNext();\">    <u>Next    </u>    </button>  " >> $OUTPUT_DIR/index.html
+   echo "			</ul>" 									>> $OUTPUT_DIR/index.html
+   echo "			<ul>" 									>> $OUTPUT_DIR/index.html
+   echo "			    <select id=\"select_drop\">"					>> $OUTPUT_DIR/index.html
+fi 
+
+cat /tmp/index_.html >>  $OUTPUT_DIR/index.html
+
+echo "			    </select>" 								>> $OUTPUT_DIR/index.html
+echo "			    <button onclick=\"goTo();\">Go</button>"				>> $OUTPUT_DIR/index.html
+echo "			</ul>" 									>> $OUTPUT_DIR/index.html
+echo "		</td>" 										>> $OUTPUT_DIR/index.html
+echo "	</tr>" 								        		>> $OUTPUT_DIR/index.html
+echo "	<tr>" 					         					>> $OUTPUT_DIR/index.html
+echo "		<td>" 										>> $OUTPUT_DIR/index.html
+echo "			<iframe id=\"fr_content\" src=\"about:blank\" width=100% height=1400>" 	>> $OUTPUT_DIR/index.html
+echo "			</iframe>" 								>> $OUTPUT_DIR/index.html
+echo "			<script type=\"text/javascript\"> newContent();	</script>" 		>> $OUTPUT_DIR/index.html
+echo "		</td>" 										>> $OUTPUT_DIR/index.html
+echo "	</tr>" 								         		>> $OUTPUT_DIR/index.html
+echo "  </nav>" 										>> $OUTPUT_DIR/index.html
+echo "</div>" 											>> $OUTPUT_DIR/index.html
+echo "</body>" 											>> $OUTPUT_DIR/index.html
+echo "</html>" 											>>  $OUTPUT_DIR/index.html
+
+echo "Created $OUTPUT_DIR/index.html"

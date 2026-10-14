@@ -1,0 +1,81 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL $
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+if [ "$2" == "" ]; then
+  echo "provide as stat file, subject arm visit  and corresponding csv file"
+  echo "turn_freesurfer_stats_into_csv <input stats file> <output stats file> <optional: template header file>"
+  echo "unless you create the template file always specify template header file as freesurfer skips scores" 
+  echo "turn_freesurfer_stats_into_csv <subject>/standard/baseline/freesurfer/<subject>_standard_baseline/stats/aseg.stats <subject>/standard/baseline/freesurfer/measures/cross_sectional/aseg.csv "
+  exit 1
+fi
+
+UTIL_DIR=$(dirname $0)
+
+FS_STATS_FILE=${1}
+if [ ! -e $FS_STATS_FILE ]; then
+  echo "ERROR:  ${FS_STATS_FILE} does not exist"
+  exit 1
+fi
+
+FS_STATS_NAME=`basename $FS_STATS_FILE`
+
+if [ "${FS_STATS_NAME##*.}" != "stats" ]; then
+  echo "ERROR:  ${FS_STATS_FILE} is not a stats file"
+  exit 1
+fi
+
+if [ "${FS_STATS_NAME}" == lh.curv.stats ] || [ "${FS_STATS_NAME}" == rh.curv.stats ]; then
+  echo "ERROR: file is a curv.stats file"
+  exit 1
+fi
+
+OUTPUT=$2
+TEMPLATE=$3
+if [ "$TEMPLATE" != "" ]; then 
+   if [ ! -e ${TEMPLATE} ]; then 
+     echo "ERROR: template $TEMPLATE does not exist!"
+     exit 1
+   fi 
+   TEMPLATE="--template $TEMPLATE"
+fi 
+
+# now works also if full path is given 
+WORKDIR=`echo ${FS_STATS_FILE} | sed 's/\(.*freesurfer\).*/\1/'`
+SUBJECT=$(echo $WORKDIR | sed 's/^.*\(NCANDA_S[0-9]\{5\}\).*$/\1/')
+ARM=$(echo $WORKDIR | sed 's/^.*NCANDA_S[0-9]\{5\}\/*\([^/]*\)\/.*$/\1/')
+
+longIndex=`echo ${FS_STATS_FILE} | tr '/' '\n' | grep -n .long. | head -n1 | cut -d: -f1`
+if [ "$longIndex" == "" ]; then  
+   VISIT=$(echo $WORKDIR | sed 's/^.*NCANDA_S[0-9]\{5\}\/*[^/]*\/*\([^/]*\).*$/\1/')
+else 
+   VISIT_TMP=$(echo ${FS_STATS_FILE}  | cut -d'/' -f$longIndex | cut -d'.' -f1)
+   if [ "${VISIT_TMP}" == "baseline" ]; then 
+     VISIT=${VISIT_TMP}
+   else   
+     VISIT=followup_${VISIT_TMP}
+   fi  
+fi 
+
+MEASUREHEADER=$(cat ${FS_STATS_FILE} | grep "# Measure" | cut -d, -f2 | sed -e 's/^[[:space:]]*//' )
+MEASUREVALUE=$(cat ${FS_STATS_FILE} | grep "# Measure" | cut -d, -f4 | sed -e 's/^[[:space:]]*//' )
+if [ "${FS_STATS_NAME}" == "aseg.stats" ] || [ "${FS_STATS_NAME}" == "lh.w-g.pct.stats" ] || [ "${FS_STATS_NAME}" == "rh.w-g.pct.stats" ] || [ "${FS_STATS_NAME}" == "wmparc.stats" ]; then
+  HEADERTEMP=$(cat ${FS_STATS_FILE} | grep '#' | tail -n1 | tr -s ' ' | cut -d' ' -f4-6,8-)
+  TABLE=$(cat ${FS_STATS_FILE} | grep -v '#' | tr -s ' ' | cut -d' ' -f3- | tr ' ' ',' | cut -d, -f1-3,5- | tr -d '\n')
+  NAMES=$(cat ${FS_STATS_FILE} | grep -v '#' | tr -s ' ' | cut -d' ' -f3- | tr ' ' ',' | cut -d, -f4)
+else
+  HEADERTEMP=$(cat ${FS_STATS_FILE} | grep '#' | tail -n1 | tr -s ' ' | cut -d' ' -f4-)
+  TABLE=$(cat ${FS_STATS_FILE} | grep -v '#' | tr -s ' ' | cut -d' ' -f1- | tr ' ' ',' | cut -d, -f2- | tr '\n' ',')
+  NAMES=$(cat ${FS_STATS_FILE} | grep -v '#' | tr -s ' ' | cut -d' ' -f1- | tr ' ' ',' | cut -d, -f1)
+fi
+ 
+python ${UTIL_DIR}/turn_freesurfer_stats_into_csv.py --headertemp "${HEADERTEMP}" --table "${TABLE}" --name "${NAMES}" --filename ${OUTPUT} --subject "${SUBJECT}" --arm "${ARM}" --visit "${VISIT}" --measurevalue "${MEASUREVALUE}" --measureheader "${MEASUREHEADER}" $TEMPLATE
+

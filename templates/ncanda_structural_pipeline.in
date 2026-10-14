@@ -1,0 +1,1935 @@
+#!/bin/bash
+
+##
+##  Copyright 2016 SRI International
+##  See COPYING file distributed along with the package for the copyright and license terms.
+##
+##  $HeadURL$
+##  $Revision$
+##  $LastChangedDate$
+##  $LastChangedBy$
+##
+
+NCANDA_BINARY_DIR=@NCANDA_BINARY_DIR_CONFIG@
+DATA_DIR=@DATA_DIR_CONFIG@
+TEMPLATE_DIR=@TEMPLATE_DIR_CONFIG@
+ 
+source ${NCANDA_BINARY_DIR}/ncanda_setup.sh $*
+
+#
+# Setup input and output
+#
+
+export t1_input=$(LWDP_get_override_file ${WORKDIR}/structural/native/t1.nii.gz)
+export t2_input=$(LWDP_get_override_file ${WORKDIR}/structural/native/t2.nii.gz)
+
+if [ ! -f ${t1_input} -o ! -f ${t2_input} ]; then
+  MSG="ERROR: ${WORKDIR}: missing or incomplete structural data"
+  echo "${MSG}"
+  #echo "${MSG}" | ncanda_error_email $(basename $0)
+  exit 1
+fi
+
+if [ -e ${WORKDIR}/structural/failed_qc ]; then
+  echo "Warning: ${WORKDIR}/structural: failed qc"
+  exit 1
+fi
+
+export phantom_xml_input=$(LWDP_get_override_file ${WORKDIR}/structural/native/phantom.xml)
+if [ ! -f ${phantom_xml_input} ]; then
+  unset phantom_xml_input
+fi
+
+#
+# 1 - Denoising
+#
+
+[ -d ${WORKDIR}/structural/denoised ] || mkdir -p ${WORKDIR}/structural/denoised
+
+t1_denoised=${WORKDIR}/structural/denoised/t1.nii.gz
+if LWDP_needs_update_and_lock ${t1_denoised} ${t1_input}; then
+  naonlm naonlm3d -i ${t1_input} -o ${t1_denoised}
+  LWDP_lockfile_delete ${t1_denoised}
+fi
+export t1_denoised=$(LWDP_get_override_file ${t1_denoised})
+
+#
+# 2 - Bias field correcton without mask (step1)
+#
+
+[ -d ${WORKDIR}/structural/mrbias/step1 ] || mkdir -p ${WORKDIR}/structural/mrbias/step1
+
+t1_mrbias=${WORKDIR}/structural/mrbias/step1/t1.nii.gz
+if LWDP_needs_update_and_lock ${t1_mrbias} ${t1_denoised}; then
+  ants N4BiasFieldCorrection -i ${t1_denoised} -o [${t1_mrbias},${WORKDIR}/structural/mrbias/step1/t1_bias.nii.gz]
+  LWDP_lockfile_delete ${t1_mrbias}
+fi
+export t1_mrbias=$(LWDP_get_override_file ${t1_mrbias})
+
+#t2_mrbias=${WORKDIR}/structural/mrbias/step1/t2.nii.gz
+#if LWDP_needs_update_and_lock ${t2_mrbias} ${t2_denoised}; then
+#  ants N4BiasFieldCorrection -i ${t2_denoised} -o [${t2_mrbias},${WORKDIR}/structural/mrbias/step1/t2_bias.nii.gz]
+#  LWDP_lockfile_delete ${t2_mrbias}
+#fi
+#export t2_mrbias=$(LWDP_get_override_file ${t2_mrbias})
+
+#
+# 3 - Align T1 and T2 weighted images and reslice T2w to T1w
+#
+
+t1t2_affine=${WORKDIR}/structural/registration/t1_t2/affine.xform
+if LWDP_needs_update_and_lock ${t1t2_affine} ${t1_mrbias} ${t2_input}; then
+  cmtk registrationx ${CMTK_GLOBAL_ARGS} --dofs 6,9,12 --auto-multi-levels 4 --init physical -o ${t1t2_affine} ${t1_mrbias} ${t2_input}
+  LWDP_lockfile_delete ${t1t2_affine}
+fi
+export t1t2_affine=$(LWDP_get_override_file ${t1t2_affine})
+
+t1t2_warp=${WORKDIR}/structural/registration/t1_t2/warp.xform
+if LWDP_needs_update_and_lock ${t1t2_warp} ${t1t2_affine}; then
+  cmtk warp ${CMTK_GLOBAL_ARGS} --jacobian-weight 1e-2 --grid-spacing 40 --refine 1 -e 4 -a 0.125 -o ${t1t2_warp} ${t1t2_affine}
+  LWDP_lockfile_delete ${t1t2_warp}
+fi
+export t1t2_warp=$(LWDP_get_override_file ${t1t2_warp})
+
+#t2t1_warp=${WORKDIR}/structural/registration/t2_t1/warp.xform
+#if LWDP_needs_update_and_lock ${t2t1_warp} ${t1t2_affine}; then
+#  cmtk warp ${CMTK_GLOBAL_ARGS} --jacobian-weight 1e-2 --grid-spacing 40 --refine 1 -e 4 -a 0.125 -o ${t2t1_warp} --switch ${t1t2_affine}
+#  LWDP_lockfile_delete ${t2t1_warp}
+#fi
+#export t2t1_warp=$(LWDP_get_override_file ${t2t1_warp})
+
+t2_reslice_t1=${WORKDIR}/structural/reslice/subject_t1/t2.nii.gz
+if LWDP_needs_update_and_lock ${t2_reslice_t1} ${t1t2_warp} ${t2_input} ${t1_input}; then
+  cmtk reformatx --sinc-cosine -o ${t2_reslice_t1} --floating ${t2_input} ${t1_input} ${t1t2_warp}
+  LWDP_lockfile_delete ${t2_reslice_t1}
+fi
+export t2_reslice_t1=$(LWDP_get_override_file ${t2_reslice_t1})
+
+#t2_affine_reslice_t1=${WORKDIR}/structural/reslice/subject_t1/t2_affine.nii.gz
+#if LWDP_needs_update_and_lock ${t2_affine_reslice_t1} ${t1t2_affine} ${t2_input} ${t1_input}; then
+#  cmtk reformatx --sinc-cosine -o ${t2_affine_reslice_t1} --floating ${t2_input} ${t1_input} ${t1t2_affine}
+#  LWDP_lockfile_delete ${t2_affine_reslice_t1}
+#fi
+#export t2_affine_reslice_t1=$(LWDP_get_override_file ${t2_affine_reslice_t1})
+
+t2_denoised=${WORKDIR}/structural/denoised/t2.nii.gz
+if LWDP_needs_update_and_lock ${t2_denoised} ${t2_reslice_t1}; then
+  naonlm naonlm3d -i ${t2_reslice_t1} -o ${t2_denoised}
+  LWDP_lockfile_delete ${t2_denoised}
+fi
+export t2_denoised=$(LWDP_get_override_file ${t2_denoised})
+
+t2_mrbias=${WORKDIR}/structural/mrbias/step1/t2.nii.gz
+if LWDP_needs_update_and_lock ${t2_mrbias} ${t2_denoised}; then
+  ants N4BiasFieldCorrection -i ${t2_denoised} -o [${t2_mrbias},${WORKDIR}/structural/mrbias/step1/t2_bias.nii.gz]
+  LWDP_lockfile_delete ${t2_mrbias}
+fi
+export t2_mrbias=$(LWDP_get_override_file ${t2_mrbias})
+
+#
+# 4 - Register T1 and SRI24 with skull
+#
+
+sri24_t1_whole=${DATA_DIR}/sri24/sri24_t1_whole.nii.gz
+sri24_t2_whole=${DATA_DIR}/sri24/sri24_t2_whole.nii.gz
+sri24_brainmask=${DATA_DIR}/sri24/sri24_brainmask.nii.gz
+
+t1_sri24_whole_pfx=${WORKDIR}/structural/registration/t1_sri24_whole/ants_
+t1_sri24_whole_affine=${t1_sri24_whole_pfx}0GenericAffine.mat
+if LWDP_needs_update_and_lock ${t1_sri24_whole_affine} ${t1_mrbias} ${sri24_t1_whole}; then
+  log_out=${t1_sri24_whole_pfx}0GenericAffine.log
+  ants antsRegistration -d 3 -r [${t1_mrbias},${sri24_t1_whole},0] -t Affine[0.1] -m MI[${t1_mrbias},${sri24_t1_whole},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${t1_sri24_whole_pfx} > ${log_out}
+  LWDP_lockfile_delete ${t1_sri24_whole_affine}
+fi
+export t1_sri24_whole_affine=$(LWDP_get_override_file ${t1_sri24_whole_affine})
+
+t1_sri24_whole_pfx=${WORKDIR}/structural/registration/t1_sri24_whole/ants_
+t1_sri24_whole_warp=${t1_sri24_whole_pfx}1Warp.nii.gz
+#if LWDP_needs_update_and_lock ${t1_sri24_whole_warp} ${t1_sri24_whole_affine} ${t1_mrbias} ${sri24_t1_whole}; then
+if LWDP_needs_update_and_lock ${t1_sri24_whole_warp} ${t1_mrbias} ${sri24_t1_whole}; then
+  log_out=${t1_sri24_whole_pfx}1Warp.log
+  #ants antsRegistration -d 3 --initial-moving-transform ${t1_sri24_whole_affine} -t SyN[0.5,3,0.5] -m CC[${t1_mrbias},${sri24_t1_whole},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${t1_sri24_whole_pfx} > ${log_out}
+  ants antsRegistration -d 3 --initial-moving-transform ${t1_sri24_whole_affine} -t SyN[0.5,3,0.5] -m CC[${t1_mrbias},${sri24_t1_whole},1,4] -c 100x30x10 -f 4x2x1 -s 2x1x0vox -o ${t1_sri24_whole_pfx} > ${log_out}
+  #touch -r ${log_out} ${t1_sri24_whole_warp}
+  LWDP_lockfile_delete ${t1_sri24_whole_warp}
+fi
+t1_sri24_whole_warp=$(LWDP_get_override_file ${t1_sri24_whole_warp})
+  
+sri24_t1_whole_aligned=${WORKDIR}/structural/reslice/subject_t1/t1_sri24_whole/t1_whole.nii.gz
+if LWDP_needs_update_and_lock ${sri24_t1_whole_aligned} ${sri24_t1_whole} ${t1_mrbias} ${t1_sri24_whole_warp} ${t1_sri24_whole_affine}; then
+  ants antsApplyTransforms -i ${sri24_t1_whole} -r ${t1_mrbias} -o ${sri24_t1_whole_aligned} -t ${t1_sri24_whole_warp} ${t1_sri24_whole_affine}
+  #ants antsApplyTransforms -i ${sri24_t1_whole} -r ${t1_mrbias} -o ${sri24_t1_whole_aligned} -t ${t1_sri24_whole_affine}
+  c3d c3d ${sri24_t1_whole_aligned} -type float -o ${sri24_t1_whole_aligned}
+  LWDP_lockfile_delete ${sri24_t1_whole_aligned}
+fi
+sri24_t2_whole_aligned=${WORKDIR}/structural/reslice/subject_t1/t1_sri24_whole/t2_whole.nii.gz
+if LWDP_needs_update_and_lock ${sri24_t2_whole_aligned} ${sri24_t2_whole} ${t1_mrbias} ${t1_sri24_whole_warp} ${t1_sri24_whole_affine}; then
+  ants antsApplyTransforms -i ${sri24_t2_whole} -r ${t1_mrbias} -o ${sri24_t2_whole_aligned} -t ${t1_sri24_whole_warp} ${t1_sri24_whole_affine}
+  #ants antsApplyTransforms -i ${sri24_t2_whole} -r ${t1_mrbias} -o ${sri24_t2_whole_aligned} -t ${t1_sri24_whole_affine}
+  c3d c3d ${sri24_t2_whole_aligned} -type float -o ${sri24_t2_whole_aligned}
+  LWDP_lockfile_delete ${sri24_t2_whole_aligned}
+fi
+sri24_brainmask_aligned=${WORKDIR}/structural/reslice/subject_t1/t1_sri24_whole/brainmask.nii.gz
+if LWDP_needs_update_and_lock ${sri24_brainmask_aligned} ${sri24_brainmask} ${t1_mrbias} ${t1_sri24_whole_warp} ${t1_sri24_whole_affine}; then
+  # used MultiLabel (default value equals MultiLabel[1,1]) interpolation to make smooth boundaries
+  ants antsApplyTransforms -n MultiLabel -i ${sri24_brainmask} -r ${t1_mrbias} -o ${sri24_brainmask_aligned} -t ${t1_sri24_whole_warp} ${t1_sri24_whole_affine}
+  c3d c3d ${sri24_brainmask_aligned} -type byte -o ${sri24_brainmask_aligned}
+  LWDP_lockfile_delete ${sri24_brainmask_aligned}
+fi
+
+#
+# 5 - Apply mask on T1 and T2 image, cut non-brain area
+#
+
+mask_width=10
+
+mask_org=${sri24_brainmask_aligned}
+mask_temp=${WORKDIR}/structural/reslice/subject_t1/t1_sri24_whole/brainmask_${mask_width}.nii.gz
+if LWDP_needs_update_and_lock ${mask_temp} ${mask_org}; then
+  c3d c3d ${mask_org} -dilate 1 ${mask_width}mmx${mask_width}mmx${mask_width}mm -o ${mask_temp}
+  LWDP_lockfile_delete ${mask_temp}
+fi 
+
+t1m_input=${WORKDIR}/structural/denoised/t1_masked.nii.gz
+if LWDP_needs_update_and_lock ${t1m_input} ${t1_denoised} ${mask_temp}; then
+  fsl fslmaths ${t1_denoised} -mul ${mask_temp} ${t1m_input}
+  LWDP_lockfile_delete ${t1m_input}
+fi
+export t1m_input=$(LWDP_get_override_file ${t1m_input})
+
+t1m_mrbias=${WORKDIR}/structural/mrbias/step1/t1_masked.nii.gz
+if LWDP_needs_update_and_lock ${t1m_mrbias} ${t1_mrbias} ${mask_temp}; then
+  fsl fslmaths ${t1_mrbias} -mul ${mask_temp} ${t1m_mrbias}
+  LWDP_lockfile_delete ${t1m_mrbias}
+fi
+export t1m_mrbias=$(LWDP_get_override_file ${t1m_mrbias})
+
+t2m_input=${WORKDIR}/structural/denoised/t2_masked.nii.gz
+if LWDP_needs_update_and_lock ${t2m_input} ${t2_denoised} ${mask_temp}; then
+  fsl fslmaths ${t2_denoised} -mul ${mask_temp} ${t2m_input}
+  LWDP_lockfile_delete ${t2m_input}
+fi
+export t2m_input=$(LWDP_get_override_file ${t2m_input})
+
+t2m_mrbias=${WORKDIR}/structural/mrbias/step1/t2_masked.nii.gz
+if LWDP_needs_update_and_lock ${t2m_mrbias} ${t2_mrbias} ${mask_temp}; then
+  fsl fslmaths ${t2_mrbias} -mul ${mask_temp} ${t2m_mrbias}
+  LWDP_lockfile_delete ${t2m_mrbias}
+fi
+export t2m_mrbias=$(LWDP_get_override_file ${t2m_mrbias})
+
+#
+# 6 - Skull stripping by voting
+#
+
+strip_voting_dir=${WORKDIR}/structural/stripped/voting
+[ -d ${strip_voting_dir} ] || mkdir -p ${strip_voting_dir}
+
+skip_num=0
+
+skull_strip_robex()
+{
+  local input=$1
+  local brain=$2
+  local mask=$3
+
+  if LWDP_needs_update_and_lock ${mask} ${input}; then
+    robex_strip ${input} ${brain} ${mask}
+    LWDP_lockfile_delete ${mask}
+  fi
+}
+
+robex_t1_mask=
+if [ ! -d ${strip_voting_dir}/skip_robex_t1_brain_mask ]; then
+  robex_t1_mask=${strip_voting_dir}/robex_t1_brain_mask.nii.gz
+  skull_strip_robex ${t1m_input} ${strip_voting_dir}/robex_t1_brain.nii.gz ${robex_t1_mask}
+else
+  echo "INFO: ${WORKDIR}: skip robex_t1_brain_mask"
+  let skip_num++
+fi
+
+robex_t1b_mask=
+if [ ! -d ${strip_voting_dir}/skip_robex_t1b_brain_mask ]; then
+  robex_t1b_mask=${strip_voting_dir}/robex_t1b_brain_mask.nii.gz
+  skull_strip_robex ${t1m_mrbias} ${strip_voting_dir}/robex_t1b_brain.nii.gz ${robex_t1b_mask}
+else
+  echo "INFO: ${WORKDIR}: skip robex_t1b_brain_mask"
+  let skip_num++
+fi
+
+skull_strip_bet()
+{
+  local input=$1
+  local mask=$2
+
+  if LWDP_needs_update_and_lock ${mask} ${input}; then
+    fsl bet ${input} $(dirname ${mask})/$(basename ${mask} _mask.nii.gz) -m -R -f 0.2
+    LWDP_lockfile_delete ${mask}
+  fi
+}
+
+bet_t1_mask=
+if [ ! -d ${strip_voting_dir}/skip_bet_t1_brain_mask ]; then
+  bet_t1_mask=${strip_voting_dir}/bet_t1_brain_mask.nii.gz
+  skull_strip_bet ${t1m_input} ${bet_t1_mask}
+else
+  echo "INFO: ${WORKDIR}: skip bet_t1_brain_mask"
+  let skip_num++
+fi
+
+bet_t1b_mask=
+if [ ! -d ${strip_voting_dir}/skip_bet_t1b_brain_mask ]; then
+  bet_t1b_mask=${strip_voting_dir}/bet_t1b_brain_mask.nii.gz
+  skull_strip_bet ${t1m_mrbias} ${bet_t1b_mask}
+else
+  echo "INFO: ${WORKDIR}: skip bet_t1b_brain_mask"
+  let skip_num++
+fi
+
+skull_strip_afni()
+{
+  local input=$1
+  local brain=$2
+  local mask=$3
+
+  if LWDP_needs_update_and_lock ${mask} ${input}; then
+    local tmpdir=$(mktemp -d)
+    afni 3dSkullStrip -input ${input} -prefix ${tmpdir}/afni_brain_mask_tmp.nii.gz -mask_vol
+    fsl fslcpgeom ${input} ${tmpdir}/afni_brain_mask_tmp.nii.gz
+    fsl fslmaths ${tmpdir}/afni_brain_mask_tmp.nii.gz -thr 1 -bin ${mask}
+    fsl fslmaths ${input} -mul ${mask} ${brain}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${mask}
+  fi
+}
+
+afni_t1_mask=
+if [ ! -d ${strip_voting_dir}/skip_afni_t1_brain_mask ]; then
+  afni_t1_mask=${strip_voting_dir}/afni_t1_brain_mask.nii.gz
+  skull_strip_afni ${t1m_input} ${strip_voting_dir}/afni_t1_brain.nii.gz ${afni_t1_mask}
+else
+  echo "INFO: ${WORKDIR}: skip afni_t1_brain_mask"
+  let skip_num++
+fi
+
+afni_t1b_mask=
+if [ ! -d ${strip_voting_dir}/skip_afni_t1b_brain_mask ]; then
+  afni_t1b_mask=${strip_voting_dir}/afni_t1b_brain_mask.nii.gz
+  skull_strip_afni ${t1m_mrbias} ${strip_voting_dir}/afni_t1b_brain.nii.gz ${afni_t1b_mask}
+else
+  echo "INFO: ${WORKDIR}: skip afni_t1b_brain_mask"
+  let skip_num++
+fi
+
+skull_strip_gcut()
+{
+  local input=$1
+  local brain=$2
+  local mask=$3
+
+  if LWDP_needs_update_and_lock ${mask} ${input}; then
+    local tmpdir=$(mktemp -d)
+    mri_gcut ${input} ${tmpdir}/gcut_brain.mgz
+    mri_convert ${tmpdir}/gcut_brain.mgz ${brain}
+    c3d c3d ${brain} -thresh 0 0 0 1 -o ${mask}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${mask}
+  fi
+}
+
+# 20150828 djk
+# gcut works better in bias corrected images, so we'll always skip this
+gcut_t1_mask=
+
+gcut_t1b_mask=
+if [ ! -d ${strip_voting_dir}/skip_gcut_t1b_brain_mask ]; then
+  gcut_t1b_mask=${strip_voting_dir}/gcut_t1b_brain_mask.nii.gz
+  skull_strip_gcut ${t1m_mrbias} ${strip_voting_dir}/gcut_t1b_brain.nii.gz ${gcut_t1b_mask}
+else
+  echo "INFO: ${WORKDIR}: skip gcut_t1b_brain_mask"
+  let skip_num++
+fi
+
+# 20150828 djk
+# robex is not robust on t2 images, so we'll always skip this
+robex_t2_mask=
+robex_t2b_mask=
+
+bet_t2_mask=
+if [ ! -d ${strip_voting_dir}/skip_bet_t2_brain_mask ]; then
+  bet_t2_mask=${strip_voting_dir}/bet_t2_brain_mask.nii.gz
+  skull_strip_bet ${t2m_input} ${bet_t2_mask}
+else
+  echo "INFO: ${WORKDIR}: skip bet_t2_brain_mask"
+  let skip_num++
+fi
+
+bet_t2b_mask=
+if [ ! -d ${strip_voting_dir}/skip_bet_t2b_brain_mask ]; then
+  bet_t2b_mask=${strip_voting_dir}/bet_t2b_brain_mask.nii.gz
+  skull_strip_bet ${t2m_mrbias} ${bet_t2b_mask}
+else
+  echo "INFO: ${WORKDIR}: skip bet_t2b_brain_mask"
+  let skip_num++
+fi
+
+afni_t2_mask=
+if [ ! -d ${strip_voting_dir}/skip_afni_t2_brain_mask ]; then
+  afni_t2_mask=${strip_voting_dir}/afni_t2_brain_mask.nii.gz
+  skull_strip_afni ${t2m_input} ${strip_voting_dir}/afni_t2_brain.nii.gz ${afni_t2_mask}
+else
+  echo "INFO: ${WORKDIR}: skip afni_t2_brain_mask"
+  let skip_num++
+fi
+
+afni_t2b_mask=
+if [ ! -d ${strip_voting_dir}/skip_afni_t2b_brain_mask ]; then
+  afni_t2b_mask=${strip_voting_dir}/afni_t2b_brain_mask.nii.gz
+  skull_strip_afni ${t2m_mrbias} ${strip_voting_dir}/afni_t2b_brain.nii.gz ${afni_t2b_mask}
+else
+  echo "INFO: ${WORKDIR}: skip afni_t2b_brain_mask"
+  let skip_num++
+fi
+
+# 20150828 djk
+# gcut is not designed to work on t2 images, so we'll always skip this
+gcut_t2_mask=
+gcut_t2b_mask=
+
+vote_input_masks=$(LWDP_get_override_files_list ${robex_t1_mask} ${robex_t1b_mask} ${bet_t1_mask} ${bet_t1b_mask} ${afni_t1_mask} ${afni_t1b_mask} ${gcut_t1_mask} ${gcut_t1b_mask} ${robex_t2_mask} ${robex_t2b_mask} ${bet_t2_mask} ${bet_t2b_mask} ${afni_t2_mask} ${afni_t2b_mask} ${gcut_t2_mask} ${gcut_t2b_mask})
+vote_mask=${strip_voting_dir}/vote_brain_mask.nii.gz
+if [ ${skip_num} -gt 0 ]; then
+  echo "INFO: ${WORKDIR}: skip_num is ${skip_num}"
+  LWDP_lockfile_create ${vote_mask}
+  (cmtk imagemath --in ${vote_input_masks} --vote --out ${vote_mask} && cmtk convertx --byte ${vote_mask} ${vote_mask}) || rm ${vote_mask}.gz
+  LWDP_lockfile_delete ${vote_mask}
+else
+  if LWDP_needs_update_and_lock ${vote_mask} ${vote_input_masks}; then
+    (cmtk imagemath --in ${vote_input_masks} --vote --out ${vote_mask} && cmtk convertx --byte ${vote_mask} ${vote_mask}) || rm ${vote_mask}.gz
+    LWDP_lockfile_delete ${vote_mask}
+  fi
+fi
+export vote_mask=$(LWDP_get_override_file ${vote_mask})
+
+if `is_manual_file $vote_mask`; then 
+  echo "Warning: $WORKDIR: Ignoring voting and use manual mask!"  
+fi   
+
+vote_brain=${strip_voting_dir}/vote_brain.nii.gz
+if LWDP_needs_update_and_lock ${vote_brain} ${vote_mask}; then
+  cmtk convertx ${CMTK_GLOBAL_ARGS} --set-padding 0 --mask ${vote_mask} ${t1_mrbias} ${vote_brain}
+  LWDP_lockfile_delete ${vote_brain}
+fi
+
+#
+# 7 - Redo bias correction using vote mask (step2)
+#
+
+[ -d ${WORKDIR}/structural/mrbias/step2 ] || mkdir -p ${WORKDIR}/structural/mrbias/step2
+
+t1_mrbias=${WORKDIR}/structural/mrbias/step2/t1.nii.gz
+if LWDP_needs_update_and_lock ${t1_mrbias} ${t1_denoised} ${vote_mask}; then
+  ants N4BiasFieldCorrection -i ${t1_denoised} -x ${vote_mask} -o [${t1_mrbias},${WORKDIR}/structural/mrbias/step2/t1_bias.nii.gz]
+  LWDP_lockfile_delete ${t1_mrbias}
+fi
+export t1_mrbias=$(LWDP_get_override_file ${t1_mrbias})
+
+t2_mrbias=${WORKDIR}/structural/mrbias/step2/t2.nii.gz
+if LWDP_needs_update_and_lock ${t2_mrbias} ${t2_denoised} ${vote_mask}; then
+  ants N4BiasFieldCorrection -i ${t2_denoised} -x ${vote_mask} -o [${t2_mrbias},${WORKDIR}/structural/mrbias/step2/t2_bias.nii.gz]
+  LWDP_lockfile_delete ${t2_mrbias}
+fi
+export t2_mrbias=$(LWDP_get_override_file ${t2_mrbias})
+
+t1_brain=${WORKDIR}/structural/mrbias/step2/t1_brain.nii.gz
+if LWDP_needs_update_and_lock ${t1_brain} ${vote_mask} ${t1_mrbias}; then
+  cmtk convertx ${CMTK_GLOBAL_ARGS} --set-padding 0 --mask ${vote_mask} ${t1_mrbias} ${t1_brain}
+  LWDP_lockfile_delete ${t1_brain}
+fi
+export t1_brain=$(LWDP_get_override_file ${t1_brain})
+
+t2_brain=${WORKDIR}/structural/mrbias/step2/t2_brain.nii.gz
+if LWDP_needs_update_and_lock ${t2_brain} ${vote_mask} ${t2_mrbias}; then
+  cmtk convertx ${CMTK_GLOBAL_ARGS} --set-padding 0 --mask ${vote_mask} ${t2_mrbias} ${t2_brain}
+  LWDP_lockfile_delete ${t2_brain}
+fi
+export t2_brain=$(LWDP_get_override_file ${t2_brain})
+
+#
+# 8 - Select or reslice mask, based on whether this is a baseline or follow-up case
+#
+function baseline_to_visit_affine_dice {
+  # Reformat baseline brainmask (affine) to this visit
+  t1_brainmask_affine=${WORKDIR}/structural/stripped/t1_brain_mask_affine.nii.gz
+  if LWDP_needs_update_and_lock ${t1_brainmask_affine} ${t1_brainmask_at_baseline} ${t1_mrbias} ${baseline_to_t1_affine}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${t1_brainmask_at_baseline} -r ${t1_mrbias} -o ${t1_brainmask_affine} -t [${baseline_to_t1_affine},1]
+    c3d c3d ${t1_brainmask_affine} -type short -o ${t1_brainmask_affine}
+    LWDP_lockfile_delete ${t1_brainmask_affine}
+  fi
+
+  t1_brainmask_affine_dice=${baseline_to_t1_pfx}0GenericAffine.dice
+  if LWDP_needs_update_and_lock ${t1_brainmask_affine_dice} ${t1_brainmask_affine} ${vote_mask}; then
+      c3d c3d ${t1_brainmask_affine} ${vote_mask} -overlap 1 | cut -d "," -f 5 | tr -d " " &> ${t1_brainmask_affine_dice}
+      LWDP_lockfile_delete ${t1_brainmask_affine_dice}
+  fi  
+}
+
+function baseline_to_visit_affine_registration {
+  baseline_to_t1_affine=${baseline_to_t1_pfx}0GenericAffine.mat
+
+  if LWDP_needs_update_and_lock ${baseline_to_t1_affine} ${t1_at_baseline} ${t1_mrbias}; then
+    log_out=${baseline_to_t1_pfx}0GenericAffine.log
+    
+    if [ -d $baseline_to_t1_firstRun ]; then 
+	## if first trial did not work, remove rigid transformation and change affine converging rate from 0.1 to 0.02
+	CMD="ants antsRegistration -d 3 -r [${t1_at_baseline},${t1_mrbias},1] -t Affine[0.02] -m MI[${t1_at_baseline},${t1_mrbias},1,32,Regular,0.25] -x ${t1_brainmask_at_baseline} -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${baseline_to_t1_pfx}"
+	echo "INFO:$WORKDIR:baseline_to_visit_affine_registration is trying alternative registration setting!"
+    else	
+	CMD="ants antsRegistration -d 3 -r [${t1_at_baseline},${t1_mrbias},1] -t Rigid[0.1] -m MI[${t1_at_baseline},${t1_mrbias},1,32,Regular,0.25] -x ${t1_brainmask_at_baseline} -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${t1_at_baseline},${t1_mrbias},1,32,Regular,0.25] -x ${t1_brainmask_at_baseline} -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${baseline_to_t1_pfx}"
+    fi
+    echo $CMD > ${baseline_to_t1_pfx}0GenericAffine.cmd
+    $CMD > ${log_out}
+
+    LWDP_lockfile_delete ${baseline_to_t1_affine}
+  fi
+  baseline_to_t1_affine=$(LWDP_get_override_file ${baseline_to_t1_affine})
+
+  baseline_to_visit_affine_dice 
+}
+
+t1_brainmask=${WORKDIR}/structural/stripped/t1_brain_mask.nii.gz
+if [ "${VISIT}" == "baseline" ]; then
+  if LWDP_needs_update_and_lock ${t1_brainmask} ${vote_mask}; then
+    cmtk convertx ${vote_mask} ${t1_brainmask}
+    LWDP_lockfile_delete ${t1_brainmask}
+  fi
+else
+
+  [ -d ${WORKDIR}/structural/longitudinal/registration/baseline_to_t1 ] || mkdir -p ${WORKDIR}/structural/longitudinal/registration/baseline_to_t1
+
+  # align with baseline t1 using baseline's t1_brainmask
+  t1_brainmask_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/stripped/t1_brain_mask.nii.gz)
+  t1_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/mrbias/t1.nii.gz)
+
+  baseline_to_t1_pfx=${WORKDIR}/structural/longitudinal/registration/baseline_to_t1/ants_
+  baseline_to_t1_firstRun=${WORKDIR}/structural/longitudinal/registration/baseline_to_t1/first_trial
+
+  baseline_to_visit_affine_registration 
+
+  # check overlap between warped baseline mask and vote mask
+  dice=`cat $t1_brainmask_affine_dice`
+  if [ $(echo "${dice} < 0.9" | bc) -eq 1 ]; then
+    if [ ! -d $baseline_to_t1_firstRun ]; then 
+    	echo "INFO:${WORKDIR}:trying a different registration setting due to insufficient overlap between warped baseline and vote mask (dice = ${dice} < 0.9)"   
+	mkdir -p ${baseline_to_t1_firstRun}
+	mv ${baseline_to_t1_pfx}* ${baseline_to_t1_firstRun}/. 
+	
+        baseline_to_visit_affine_registration
+	dice=`cat $t1_brainmask_affine_dice`
+    fi 
+    if [ $(echo "${dice} < 0.9" | bc) -eq 1 ]; then
+	MSG="ERROR:${WORKDIR}:insufficient overlap between warped baseline mask ${t1_brainmask_affine} and vote mask ${vote_mask} (dice = ${dice} < 0.9)" 
+	echo "${MSG}"
+	echo "${MSG}" | ncanda_error_email $(basename $0)
+	exit 1
+    fi
+  fi
+
+  baseline_to_t1_warp=${baseline_to_t1_pfx}1Warp.nii.gz
+  if LWDP_needs_update_and_lock ${baseline_to_t1_warp} ${t1_at_baseline} ${t1_mrbias}; then
+    log_out=${baseline_to_t1_pfx}1Warp.log
+    ants antsRegistration -d 3 --initial-moving-transform ${baseline_to_t1_affine} -t SyN[0.5,3,0.5] -m CC[${t1_at_baseline},${t1_mrbias},1,4] -x ${t1_brainmask_at_baseline} -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${baseline_to_t1_pfx} > ${log_out}
+    #touch -r ${log_out} ${baseline_to_t1_warp}
+    LWDP_lockfile_delete ${baseline_to_t1_warp}
+  fi
+  export baseline_to_t1_warp=$(LWDP_get_override_file ${baseline_to_t1_warp})
+
+  t1_to_baseline_warp=${baseline_to_t1_pfx}1InverseWarp.nii.gz
+  export t1_to_baseline_warp=$(LWDP_get_override_file ${t1_to_baseline_warp})
+
+  # have to do it again as time stamp of affine registration is changed 
+  baseline_to_visit_affine_dice 
+  dice=`cat $t1_brainmask_affine_dice`
+  if [ $(echo "${dice} < 0.9" | bc) -eq 1 ]; then
+      # this should have caught earlier 
+      MSG="ERROR:${WORKDIR}:insufficient overlap between warped baseline mask ${t1_brainmask_affine} and vote mask ${vote_mask} (dice = ${dice} < 0.9)! not sure how we got here" 
+      echo "${MSG}"
+      echo "${MSG}" | ncanda_error_email $(basename $0)
+      exit 1
+  fi
+
+  # Reformat baseline brainmask to this visit
+  if LWDP_needs_update_and_lock ${t1_brainmask} ${t1_brainmask_at_baseline} ${t1_mrbias} ${baseline_to_t1_affine} ${t1_to_baseline_warp}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${t1_brainmask_at_baseline} -r ${t1_mrbias} -o ${t1_brainmask} -t [${baseline_to_t1_affine},1] ${t1_to_baseline_warp}
+    c3d c3d ${t1_brainmask} -type short -o ${t1_brainmask}
+    LWDP_lockfile_delete ${t1_brainmask}
+  fi
+fi
+
+export t1_brainmask=$(LWDP_get_override_file ${t1_brainmask})
+if `is_manual_file $t1_brainmask`; then 
+  echo "ERROR:$WORKDIR:The manually generated mask $t1_brainmask should not be used. Fix 'vote_mask' or 'baseline_to_t1_warp'!"
+  exit 1 
+fi   
+
+#
+# 9 - Redo bias correction using final mask
+#
+
+t1_mrbias=${WORKDIR}/structural/mrbias/t1.nii.gz
+if LWDP_needs_update_and_lock ${t1_mrbias} ${t1_denoised} ${t1_brainmask}; then
+  ants N4BiasFieldCorrection -i ${t1_denoised} -x ${t1_brainmask} -o [${t1_mrbias},${WORKDIR}/structural/mrbias/t1_bias.nii.gz]
+  LWDP_lockfile_delete ${t1_mrbias}
+fi
+export t1_mrbias=$(LWDP_get_override_file ${t1_mrbias})
+
+t2_mrbias=${WORKDIR}/structural/mrbias/t2.nii.gz
+if LWDP_needs_update_and_lock ${t2_mrbias} ${t2_denoised} ${t1_brainmask}; then
+  ants N4BiasFieldCorrection -i ${t2_denoised} -x ${t1_brainmask} -o [${t2_mrbias},${WORKDIR}/structural/mrbias/t2_bias.nii.gz]
+  LWDP_lockfile_delete ${t2_mrbias}
+fi
+export t2_mrbias=$(LWDP_get_override_file ${t2_mrbias})
+
+t1_brain=${WORKDIR}/structural/stripped/t1_brain.nii.gz
+if LWDP_needs_update_and_lock ${t1_brain} ${t1_brainmask} ${t1_mrbias}; then
+  cmtk convertx ${CMTK_GLOBAL_ARGS} --set-padding 0 --mask ${t1_brainmask} ${t1_mrbias} ${t1_brain}
+  LWDP_lockfile_delete ${t1_brain}
+fi
+export t1_brain=$(LWDP_get_override_file ${t1_brain})
+
+t2_brain=${WORKDIR}/structural/stripped/t2_brain.nii.gz
+if LWDP_needs_update_and_lock ${t2_brain} ${t1_brainmask} ${t2_mrbias}; then
+  cmtk convertx ${CMTK_GLOBAL_ARGS} --set-padding 0 --mask ${t1_brainmask} ${t2_mrbias} ${t2_brain}
+  LWDP_lockfile_delete ${t2_brain}
+fi
+export t2_brain=$(LWDP_get_override_file ${t2_brain})
+
+t1_skull=${WORKDIR}/structural/stripped/t1_skull.nii.gz
+if LWDP_needs_update_and_lock ${t1_skull} ${t1_brainmask} ${t1_mrbias}; then
+  cmtk convertx ${CMTK_GLOBAL_ARGS} --set-padding 0 --mask-inverse ${t1_brainmask} ${t1_mrbias} ${t1_skull}
+  LWDP_lockfile_delete ${t1_skull}
+fi
+export t1_skull=$(LWDP_get_override_file ${t1_skull})
+
+# generate affinely registratered t2
+t1_to_t2_pfx=${WORKDIR}/structural/registration/t1_t2/ants_
+t1_to_t2_affine=${t1_to_t2_pfx}0GenericAffine.mat
+# if it does not do well try running with -t Rigid[0.01]  -t Affine[0.01]
+# or omitting rigid registration
+
+if LWDP_needs_update_and_lock ${t1_to_t2_affine} ${t1_mrbias} ${t2_input} ${t1_brainmask}; then
+  log_out=${t1_to_t2_pfx}0GenericAffine.log
+  ants antsRegistration -d 3 -r [${t1_mrbias},${t2_input},0] -t Rigid[0.1] -m MI[${t1_mrbias},${t2_input},1,32,Regular,0.25] -x ${t1_brainmask} -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${t1_mrbias},${t2_input},1,32,Regular,0.25] -x ${t1_brainmask} -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${t1_to_t2_pfx} > ${log_out}
+  LWDP_lockfile_delete ${t1_to_t2_affine}
+fi
+t1_to_t2_affine=$(LWDP_get_override_file ${t1_to_t2_affine})
+if [ ! -e $t1_to_t2_affine ]; then 
+    echo "ERROR:$WORKDIR:Failed to register t1 (${t1_mrbias}) with t2 (${t2_input}) via ants!"
+    exit 1
+fi 
+
+t2_affine_denoised=${WORKDIR}/structural/denoised/t2_affine.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_denoised} ${t2_input} ${t1_mrbias} ${t1_to_t2_affine}; then
+  tmpdir=$(mktemp -d)
+  ants antsApplyTransforms -n BlackmanWindowedSinc -i ${t2_input} -r ${t1_mrbias} -o ${tmpdir}/t2.nii.gz -t ${t1_to_t2_affine}
+  c3d c3d ${tmpdir}/t2.nii.gz -clip 0 inf -type float -o ${tmpdir}/t2.nii.gz
+  naonlm naonlm3d -i ${tmpdir}/t2.nii.gz -o ${t2_affine_denoised}
+  rm -rf ${tmpdir}
+  LWDP_lockfile_delete ${t2_affine_denoised}
+fi
+export t2_affine_denoised=$(LWDP_get_override_file ${t2_affine_denoised})
+
+t2_affine_mrbias=${WORKDIR}/structural/mrbias/t2_affine.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_mrbias} ${t2_affine_denoised} ${t1_mrbias} ${t1_brainmask} ${t1_to_t2_affine}; then
+  ants N4BiasFieldCorrection -i ${t2_affine_denoised} -x ${t1_brainmask} -o [${t2_affine_mrbias},${WORKDIR}/structural/mrbias/t2_affine_bias.nii.gz]
+  LWDP_lockfile_delete ${t2_affine_mrbias}
+fi
+export t2_affine_mrbias=$(LWDP_get_override_file ${t2_affine_mrbias})
+
+t2_affine_brain=${WORKDIR}/structural/stripped/t2_affine_brain.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_brain} ${t2_affine_mrbias} ${t1_brainmask}; then
+  c3d c3d ${t2_affine_mrbias} ${t1_brainmask} -multiply -o ${t2_affine_brain}
+  LWDP_lockfile_delete ${t2_affine_brain}
+fi
+export t2_affine_brain=$(LWDP_get_override_file ${t2_affine_brain})
+
+#
+# 10 - Match intensity of follow-up toward baseline
+#
+
+if [ "${VISIT}" != "baseline" ]; then
+  for tx in t1 t2 t2_affine; do
+    tx_brain_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/stripped/${tx}_brain.nii.gz)
+    tx_brain_reference=${WORKDIR}/structural/longitudinal/corrected/${tx}_brain_reference.nii.gz
+    tx_brain_scale=${WORKDIR}/structural/longitudinal/corrected/${tx}_brain_scale.nii.gz
+    tx_brain_corrected=${WORKDIR}/structural/longitudinal/corrected/${tx}_brain.nii.gz
+    tx_brain=${WORKDIR}/structural/stripped/${tx}_brain.nii.gz
+    smooth_width=3
+  
+    # Reformat baseline to this visit
+    if LWDP_needs_update_and_lock ${tx_brain_reference} ${tx_brain_at_baseline} ${t1_mrbias} ${baseline_to_t1_affine} ${t1_to_baseline_warp}; then
+      [ -d ${WORKDIR}/structural/longitudinal/corrected ] || mkdir -p ${WORKDIR}/structural/longitudinal/corrected
+
+      ants antsApplyTransforms -i ${tx_brain_at_baseline} -r ${t1_mrbias} -o ${tx_brain_reference} -t [${baseline_to_t1_affine},1] ${t1_to_baseline_warp}
+      c3d c3d ${tx_brain_reference} -type float -o ${tx_brain_reference}
+      LWDP_lockfile_delete ${tx_brain_reference}
+    fi
+  
+    if LWDP_needs_update_and_lock ${tx_brain_corrected} ${tx_brain_reference} ${tx_brain} ${t1_brainmask}; then
+      tmpdir=$(mktemp -d)
+      c3d c3d ${tx_brain_reference} -smooth ${smooth_width}mm -o ${tmpdir}/ref.nii.gz
+      c3d c3d ${tx_brain} -smooth ${smooth_width}mm -o ${tmpdir}/img.nii.gz
+      # need caution if use c3d: c3d A B -divide -o C computes C = B / A, not C = A / B
+      fsl fslmaths ${tmpdir}/ref.nii.gz -div ${tmpdir}/img.nii.gz -mul ${t1_brainmask} ${tx_brain_scale}
+      c3d c3d ${tx_brain} ${tx_brain_scale} -multiply -o ${tx_brain_corrected}
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${tx_brain_corrected}
+    fi
+  done
+
+  t1_brain_corrected=${WORKDIR}/structural/longitudinal/corrected/t1_brain.nii.gz
+  t2_brain_corrected=${WORKDIR}/structural/longitudinal/corrected/t2_brain.nii.gz
+  t2_affine_brain_corrected=${WORKDIR}/structural/longitudinal/corrected/t2_affine_brain.nii.gz
+
+  t1_brain=${t1_brain_corrected}
+  export t1_brain=$(LWDP_get_override_file ${t1_brain_corrected})
+  t2_brain=${t2_brain_corrected}
+  export t2_brain=$(LWDP_get_override_file ${t2_brain_corrected})
+  t2_affine_brain=${t2_affine_brain_corrected}
+  export t2_affine_brain=$(LWDP_get_override_file ${t2_affine_brain_corrected})
+fi
+
+#
+# (for testing) Match intensity of follow-up toward baseline (native image)
+#
+
+if [ "${VISIT}" != "baseline" ]; then
+  [ -d ${WORKDIR}/structural/longitudinal/corrected/native ] || mkdir -p ${WORKDIR}/structural/longitudinal/corrected/native
+
+  # Input 
+  t1_at_baseline=${WORKDIR}/../baseline/structural/native/t1.nii.gz
+  t1_brainmask_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/stripped/t1_brain_mask.nii.gz)
+
+  # Output 
+  t1_brain_reference=${WORKDIR}/structural/longitudinal/corrected/native/t1_brain_reference.nii.gz
+  t1_brain_scale=${WORKDIR}/structural/longitudinal/corrected/native/t1_brain_scale.nii.gz
+  t1_brain_corrected=${WORKDIR}/structural/longitudinal/corrected/native/t1_brain.nii.gz
+
+  smooth_width=3
+
+  # Reformat baseline t1 to this visit
+  if LWDP_needs_update_and_lock ${t1_brain_reference} ${t1_at_baseline} ${t1_brainmask_at_baseline} ${t1_mrbias} ${baseline_to_t1_affine} ${t1_to_baseline_warp}; then
+    tmpdir=$(mktemp -d)
+    c3d c3d ${t1_at_baseline} ${t1_brainmask_at_baseline} -multiply -o ${tmpdir}/t1_brain.nii.gz
+    ants antsApplyTransforms -i ${tmpdir}/t1_brain.nii.gz -r ${t1_mrbias} -o ${t1_brain_reference} -t [${baseline_to_t1_affine},1] ${t1_to_baseline_warp}
+    c3d c3d ${t1_brain_reference} -type float -o ${t1_brain_reference}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${t1_brain_reference}
+  fi
+
+  if LWDP_needs_update_and_lock ${t1_brain_corrected} ${t1_brain_reference} ${t1_input} ${t1_brainmask}; then
+    tmpdir=$(mktemp -d)
+    c3d c3d ${t1_input} ${t1_brainmask} -multiply -o ${tmpdir}/inp.nii.gz
+    c3d c3d ${t1_brain_reference} -smooth ${smooth_width}mm -o ${tmpdir}/ref.nii.gz
+    c3d c3d ${tmpdir}/inp.nii.gz -smooth ${smooth_width}mm -o ${tmpdir}/img.nii.gz
+    # need caution if use c3d: c3d A B -divide -o C computes C = B / A, not C = A / B
+    fsl fslmaths ${tmpdir}/ref.nii.gz -div ${tmpdir}/img.nii.gz -mul ${t1_brainmask} ${t1_brain_scale}
+    c3d c3d ${t1_brain} ${t1_brain_scale} -multiply -o ${t1_brain_corrected}
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${t1_brain_corrected}
+  fi
+fi
+
+#
+# 11 - Main registration: baseline: align with SRI24, follow-ups: align with baseline
+#
+
+sri24_t1=${DATA_DIR}/sri24/sri24_t1.nii.gz
+#mni_t1=${DATA_DIR}/mni/avg152T1_brain.nii.gz
+
+if [ "${VISIT}" == "baseline" ]; then
+  # Only align baseline with atlas directly
+  t1_sri24_pfx=${WORKDIR}/structural/registration/t1_sri24/ants_
+  t1_sri24_affine=${t1_sri24_pfx}0GenericAffine.mat
+  if LWDP_needs_update_and_lock ${t1_sri24_affine} ${t1_brain} ${sri24_t1}; then
+    tmpdir=$(mktemp -d)
+    log_out=${t1_sri24_pfx}0GenericAffine.log
+
+    for i in 1 2; do
+      if [ "${i}" == "1" ]; then
+        ants antsRegistration -d 3 -r [${t1_brain},${sri24_t1},0] -t Affine[0.1] -m MI[${t1_brain},${sri24_t1},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${t1_sri24_pfx} > ${log_out}
+      elif [ "${i}" == "2" ]; then
+        rm -f ${t1_sri24_affine}
+        rm -f ${log_out}
+        echo "INFO: ${WORKDIR}: attempt affine registration again by changing parameters"
+
+        # apply histogram matching, clip intensity ranges, finer updates for inter-subject registrations
+        ants antsRegistration -d 3 -u -w [0.005,0.995] -r [${t1_brain},${sri24_t1},0] -t Affine[0.001] -m MI[${t1_brain},${sri24_t1},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${t1_sri24_pfx} > ${log_out}
+      fi
+
+      # check registration result
+      ants antsApplyTransforms -n NearestNeighbor -i ${sri24_brainmask} -r ${t1_brain} -o ${tmpdir}/sri24_brainmask_affine_${i}.nii.gz -t ${t1_sri24_affine}
+      dice=`c3d c3d ${t1_brainmask} ${tmpdir}/sri24_brainmask_affine_${i}.nii.gz -overlap 1 | cut -d "," -f 5 | tr -d " "`
+      echo "INFO: ${WORKDIR}: overlap between warped sri24 baseline mask and t1_brainmask: (dice = ${dice})"
+      if [ $(echo "${dice} < 0.9" | bc) -eq 1 ]; then
+        echo "WARNING: ${WORKDIR}: insufficient overlap between warped sri24 baseline mask and t1_brainmask (dice = ${dice} < 0.9)"
+      else
+        # stop here if we get a sufficient overlap
+        echo "INFO: ${WORKDIR}: overlap is sufficient"
+        break
+      fi
+    done
+
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${t1_sri24_affine}
+  fi
+  export t1_sri24_affine=$(LWDP_get_override_file ${t1_sri24_affine})
+
+  t1_sri24_warp=${t1_sri24_pfx}1Warp.nii.gz
+  if LWDP_needs_update_and_lock ${t1_sri24_warp} ${t1_brain} ${sri24_t1}; then
+    log_out=${t1_sri24_pfx}1Warp.log
+    ants antsRegistration -d 3 --initial-moving-transform ${t1_sri24_affine} -t SyN[0.5,3,0.5] -m CC[${t1_brain},${sri24_t1},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${t1_sri24_pfx} > ${log_out}
+    LWDP_lockfile_delete ${t1_sri24_warp}
+  fi
+  t1_sri24_warp=$(LWDP_get_override_file ${t1_sri24_warp})
+  
+  sri24_t1_warp=${t1_sri24_pfx}1InverseWarp.nii.gz
+  export sri24_t1_warp=$(LWDP_get_override_file ${sri24_t1_warp})
+
+  export t1_sri24_mtx=$(LWDP_get_override_files_list ${t1_sri24_warp} ${t1_sri24_affine})
+
+  ## registers t1 to mni atlas  .... ReferenceImage [FloatingImage] as we only need it for registering all cases to template - also atlas is over lower resolution so bad idea to register atlas to t1 !
+  #mni_t1_pfx=${WORKDIR}/structural/registration/mni_t1/ants_
+  #mni_t1_affine=${mni_t1_pfx}0GenericAffine.mat
+  #if LWDP_needs_update_and_lock ${mni_t1_affine} ${t1_brain} ${mni_t1}; then
+  #  log_out=${mni_t1_pfx}0GenericAffine.log
+  #  ants antsRegistration -d 3 -r [${mni_t1},${t1_brain},0] -t Affine[0.1] -m MI[${mni_t1},${t1_brain},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${mni_t1_pfx} > ${log_out}
+  #  LWDP_lockfile_delete ${mni_t1_affine}
+  #fi
+  #export mni_t1_affine=$(LWDP_get_override_file ${mni_t1_affine})
+
+  #mni_t1_warp=${mni_t1_pfx}1Warp.nii.gz 
+  ##if LWDP_needs_update_and_lock ${mni_t1_warp} ${mni_t1_affine} ${mni_t1} ${t1_brain}; then
+  #if LWDP_needs_update_and_lock ${mni_t1_warp} ${mni_t1} ${t1_brain}; then
+  #  log_out=${mni_t1_pfx}1Warp.log
+  #  ants antsRegistration -d 3 --initial-moving-transform ${mni_t1_affine} -t SyN[0.5,3,0.5] -m CC[${mni_t1},${t1_brain},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${mni_t1_pfx} > ${log_out}
+  #  LWDP_lockfile_delete ${mni_t1_warp}
+  #fi
+  #export mni_t1_warp=$(LWDP_get_override_file ${mni_t1_warp})
+
+  ## reslice for quality control
+  #t1_aligned_to_mni=${WORKDIR}/structural/reslice/mni/affine/t1_brain.nii.gz
+  #if LWDP_needs_update_and_lock ${t1_aligned_to_mni} ${t1_brain} ${mni_t1} ${mni_t1_affine}; then
+  #  ants antsApplyTransforms -i ${t1_brain} -r ${mni_t1} -o ${t1_aligned_to_mni} -t ${mni_t1_affine}
+  #  c3d c3d ${t1_aligned_to_mni} -type float -o ${t1_aligned_to_mni}
+  #  LWDP_lockfile_delete ${t1_aligned_to_mni}
+  #fi
+  #t1_aligned_to_mni=${WORKDIR}/structural/reslice/mni/warp/t1_brain.nii.gz
+  #if LWDP_needs_update_and_lock ${t1_aligned_to_mni} ${t1_brain} ${mni_t1} ${mni_t1_warp} ${mni_t1_affine}; then
+  #  ants antsApplyTransforms -i ${t1_brain} -r ${mni_t1} -o ${t1_aligned_to_mni} -t ${mni_t1_warp} ${mni_t1_affine}
+  #  c3d c3d ${t1_aligned_to_mni} -type float -o ${t1_aligned_to_mni}
+  #  LWDP_lockfile_delete ${t1_aligned_to_mni}
+  #fi
+else
+  [ -d ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline ] || mkdir -p ${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline
+
+  # align with baseline t1
+  t1_brain_at_baseline=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/stripped/t1_brain.nii.gz)
+
+  t1_brain_to_baseline_pfx=${WORKDIR}/structural/longitudinal/registration/t1_brain_to_baseline/ants_
+  t1_brain_to_baseline_affine=${t1_brain_to_baseline_pfx}0GenericAffine.mat
+  if LWDP_needs_update_and_lock ${t1_brain_to_baseline_affine} ${t1_brain} ${t1_brain_at_baseline}; then
+    log_out=${t1_brain_to_baseline_pfx}0GenericAffine.log
+    ants antsRegistration -d 3 -r [${t1_brain},${t1_brain_at_baseline},1] -t Rigid[0.1] -m MI[${t1_brain},${t1_brain_at_baseline},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${t1_brain},${t1_brain_at_baseline},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${t1_brain_to_baseline_pfx} > ${log_out}
+    LWDP_lockfile_delete ${t1_brain_to_baseline_affine}
+  fi
+  t1_brain_to_baseline_affine=$(LWDP_get_override_file ${t1_brain_to_baseline_affine})
+
+  t1_brain_to_baseline_warp=${t1_brain_to_baseline_pfx}1Warp.nii.gz
+  if LWDP_needs_update_and_lock ${t1_brain_to_baseline_warp} ${t1_brain} ${t1_brain_at_baseline}; then
+    log_out=${t1_brain_to_baseline_pfx}1Warp.log
+    ants antsRegistration -d 3 --initial-moving-transform ${t1_brain_to_baseline_affine} -t SyN[0.5,3,0.5] -m CC[${t1_brain},${t1_brain_at_baseline},1,4] -c 100x50x30 -f 4x2x1 -s 2x1x0vox -o ${t1_brain_to_baseline_pfx} > ${log_out}
+    #touch -r ${log_out} ${t1_brain_to_baseline_warp}
+    LWDP_lockfile_delete ${t1_brain_to_baseline_warp}
+  fi
+  export t1_brain_to_baseline_warp=$(LWDP_get_override_file ${t1_brain_to_baseline_warp})
+
+  baseline_to_t1_brain_warp=${t1_brain_to_baseline_pfx}1InverseWarp.nii.gz
+  export baseline_to_t1_brain_warp=$(LWDP_get_override_file ${baseline_to_t1_brain_warp})
+
+  # for follow-ups, the transformation from visit T1w to SRI24 is a concantenation of two transformations: T1w to baseline, baseline T1w to atlas
+  # ants applies transformations from the last one to the first one: baseline->sri24 (affine), baseline->sri24 (warp), t1->baseline (affine), t1->baseline (warp)
+  export t1_sri24_mtx=$(LWDP_get_override_files_list ${t1_brain_to_baseline_warp} ${t1_brain_to_baseline_affine} ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_1Warp.nii.gz ${WORKDIR}/../baseline/structural/registration/t1_sri24/ants_0GenericAffine.mat)
+fi
+
+#
+# (for testing) Match instensity of t1 toward SRI24
+#
+
+#[ -d ${WORKDIR}/structural/corrected ] || mkdir -p ${WORKDIR}/structural/corrected
+#
+#sri24_t1_reslice=${WORKDIR}/structural/reslice/subject_t1/sri24/t1.nii.gz
+#if LWDP_needs_update_and_lock ${sri24_t1_reslice} ${sri24_t1} ${t1_sri24_mtx}  ${t1_brain}; then
+#  ants antsApplyTransforms -i ${sri24_t1} -r ${t1_brain} -o ${sri24_t1_reslice} -t ${t1_sri24_mtx}
+#  c3d c3d ${sri24_t1_reslice} -type float -o ${sri24_t1_reslice}
+#  LWDP_lockfile_delete ${sri24_t1_reslice}
+#fi
+#
+#t1_brain_reference=${sri24_t1_reslice}
+#t1_brain_scale=${WORKDIR}/structural/corrected/t1_brain_scale.nii.gz
+#t1_brain_corrected=${WORKDIR}/structural/corrected/t1_brain.nii.gz
+#smooth_width=7
+#
+#if LWDP_needs_update_and_lock ${t1_brain_corrected} ${t1_brain_reference} ${t1_brain} ${t1_brainmask}; then
+#  tmpdir=$(mktemp -d)
+#  c3d c3d ${t1_brain_reference} -smooth ${smooth_width}mm -o ${tmpdir}/ref.nii.gz
+#  c3d c3d ${t1_brain} -smooth ${smooth_width}mm -o ${tmpdir}/img.nii.gz
+#  # need caution if use c3d: c3d A B -divide -o C computes C = B / A, not C = A / B
+#  fsl fslmaths ${tmpdir}/ref.nii.gz -div ${tmpdir}/img.nii.gz -mul ${t1_brainmask} ${t1_brain_scale}
+#  c3d c3d ${t1_brain} ${t1_brain_scale} -multiply -o ${t1_brain_corrected}
+#  rm -rf ${tmpdir}
+#  LWDP_lockfile_delete ${t1_brain_corrected}
+#fi
+
+#
+# 12 - reformat SRI24 parcellation maps and tissue priors
+#
+
+# get t2_brain_exp_mask - removes dark t2 regions from t1_brainmask
+t2_brain_exp_mask=${WORKDIR}/structural/reslice/subject_t1/t2_brain_exp_mask.nii.gz
+if LWDP_needs_update_and_lock ${t2_brain_exp_mask} ${t2_brain} ${t1_brainmask}; then
+  mean=`fsl fslstats ${t2_brain} -k ${t1_brainmask} -m | tr -d " "`
+  mean_1=`bc -l <<< 1/${mean}`
+  echo "INFO: ${WORKDIR}: t2_brain: mean=${mean}, 1/mean=${mean_1}"
+  # thresh 0.8 cuts 20% of the mean
+  c3d c3d ${t2_brain} -scale -${mean_1} -exp -thresh 0.8 inf 0 1 -o ${t2_brain_exp_mask}
+  LWDP_lockfile_delete ${t2_brain_exp_mask}
+fi
+export t2_brain_exp_mask=$(LWDP_get_override_file ${t2_brain_exp_mask})
+#
+t2_affine_brain_exp_mask=${WORKDIR}/structural/reslice/subject_t1/t2_affine_brain_exp_mask.nii.gz
+if LWDP_needs_update_and_lock ${t2_affine_brain_exp_mask} ${t2_affine_brain} ${t1_brainmask}; then
+  mean=`fsl fslstats ${t2_affine_brain} -k ${t1_brainmask} -m | tr -d " "`
+  mean_1=`bc -l <<< 1/${mean}`
+  echo "INFO: ${WORKDIR}: t2_affine_brain: mean=${mean}, 1/mean=${mean_1}"
+  c3d c3d ${t2_affine_brain} -scale -${mean_1} -exp -thresh 0.8 inf 0 1 -o ${t2_affine_brain_exp_mask}
+  LWDP_lockfile_delete ${t2_affine_brain_exp_mask}
+fi
+export t2_affine_brain_exp_mask=$(LWDP_get_override_file ${t2_affine_brain_exp_mask})
+
+PARCELLATIONS="parc116 wm400 ventricles suptent parc_cortical icv inftent suptent2 postfossa_dmid"
+
+inp[1]=${DATA_DIR}/sri24/parcellation/sri24_parc116.nii.gz
+inp[2]=${DATA_DIR}/sri24/parcellation/sri24_wm400.nii.gz
+inp[3]=${DATA_DIR}/sri24/parcellation/sri24_ventricles.nii.gz
+inp[4]=${DATA_DIR}/sri24/parcellation/sri24_suptent.nii.gz
+inp[5]=${DATA_DIR}/sri24/parcellation/sri24_parc_cortical.nii.gz
+inp[6]=${DATA_DIR}/sri24/sri24_pbmap_CSF.nii.gz
+inp[7]=${DATA_DIR}/sri24/sri24_pbmap_GM.nii.gz
+inp[8]=${DATA_DIR}/sri24/sri24_pbmap_WM.nii.gz
+inp[9]=${DATA_DIR}/sri24/parcellation/sri24_inftent.nii.gz
+inp[10]=${DATA_DIR}/sri24/parcellation/sri24_suptent2.nii.gz
+inp[11]=${DATA_DIR}/sri24/parcellation/sri24_postfossa_dmid.nii.gz
+
+out[1]=${WORKDIR}/structural/reslice/subject_t1/sri24/parc116.nii.gz
+out[2]=${WORKDIR}/structural/reslice/subject_t1/sri24/wm400.nii.gz
+out[3]=${WORKDIR}/structural/reslice/subject_t1/sri24/ventricles.nii.gz
+out[4]=${WORKDIR}/structural/reslice/subject_t1/sri24/suptent.nii.gz
+out[5]=${WORKDIR}/structural/reslice/subject_t1/sri24/parc_cortical.nii.gz
+out[6]=${WORKDIR}/structural/reslice/subject_t1/sri24/pbmap_CSF.nii.gz
+out[7]=${WORKDIR}/structural/reslice/subject_t1/sri24/pbmap_GM.nii.gz
+out[8]=${WORKDIR}/structural/reslice/subject_t1/sri24/pbmap_WM.nii.gz
+out[9]=${WORKDIR}/structural/reslice/subject_t1/sri24/inftent.nii.gz
+out[10]=${WORKDIR}/structural/reslice/subject_t1/sri24/suptent2.nii.gz
+out[11]=${WORKDIR}/structural/reslice/subject_t1/sri24/postfossa_dmid.nii.gz
+
+for i in 1; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${t1_sri24_mtx} ${t1_brain}; then
+    # choose MultiLabel params which preserves boundaries close to NN, but applying some mild smoothness
+    ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${i}]} -r ${t1_brain} -o ${out[${i}]} -t ${t1_sri24_mtx}
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 2 3 4 5; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${t1_sri24_mtx} ${t1_brain}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${t1_brain} -o ${out[${i}]} -t ${t1_sri24_mtx}
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 6 7 8; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${t1_sri24_mtx}  ${t1_brain} ${t1_brainmask}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${t1_brain} -o ${out[${i}]} -t ${t1_sri24_mtx}
+    c3d c3d ${out[${i}]} ${t1_brainmask} -multiply -clip 0 inf -type float -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 9 10 11; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${t1_sri24_mtx} ${t1_brain} ${t1_brainmask} ${t2_affine_brain_exp_mask}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${t1_brain} -o ${out[${i}]} -t ${t1_sri24_mtx}
+    c3d c3d ${out[${i}]} ${t1_brainmask} -multiply ${t2_affine_brain_exp_mask} -multiply -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+
+t1_sri_parc=${out[1]}
+t1_sri_wm=${out[2]}
+t1_sri_ven=${out[3]}
+t1_prior_CSF=${out[6]}
+t1_prior_GM=${out[7]}
+t1_prior_WM=${out[8]}
+
+# Copy brainmask and pretend it's a parcellation map also - this is for whole-brain (ICV) tissue volumes
+icv_mask=${WORKDIR}/structural/reslice/subject_t1/sri24/icv.nii.gz
+if LWDP_needs_update_and_lock ${icv_mask} ${t1_brainmask}; then
+  cmtk convertx ${t1_brainmask} ${icv_mask}
+  LWDP_lockfile_delete ${icv_mask}
+fi
+
+#
+# 13 - Tissue classification
+#
+
+function segment_fast
+{
+  local in_image_num=${1}
+  local in_images=${2}
+  local in_prefix=${3}
+  local in_prior_CSF=${4}
+  local in_prior_GM=${5}
+  local in_prior_WM=${6}
+  local in_sri_ven=${7}
+  local in_sri_parc=${8}
+  local in_sri_wm=${9}
+
+  seg=${in_prefix}_seg.nii.gz
+  if [ "${in_image_num}" == "1" ]; then
+    if LWDP_needs_update_and_lock ${seg} ${in_prior_CSF} ${in_prior_GM} ${in_prior_WM} ${in_images}; then
+      fsl fast -A ${in_prior_CSF} ${in_prior_GM} ${in_prior_WM} -a ${FSLDIR}/src/fsl-flirt/flirtsch/ident.mat -P -v -o ${in_prefix} ${in_images} && cmtk convertx --byte ${seg} ${seg}
+      # remove again-reformatted priors
+      rm ${in_prefix}_*_stdspace.*
+      LWDP_lockfile_delete ${seg}
+    fi
+  else
+    echo "ERROR: ${WORKDIR}: Not supported yet"
+    return
+  fi
+
+  seg_clean=${in_prefix}_seg_clean.nii.gz
+  if LWDP_needs_update_and_lock ${seg_clean} ${seg}; then
+    ${SLICER_CLI}/IslandRemoval -m 25 ${seg} ${seg_clean} 
+    fsl fslcpgeom ${seg} ${seg_clean}
+    LWDP_lockfile_delete ${seg_clean}
+  fi
+  
+  ven_parc=${in_prefix}_ven_parc.nii.gz
+  if LWDP_needs_update_and_lock ${ven_parc} ${seg_clean} ${in_sri_ven}; then
+    fsl fslmaths ${seg_clean} -thr 1 -uthr 1 -bin -mul ${in_sri_ven} ${ven_parc}
+    LWDP_lockfile_delete ${ven_parc}
+  fi 
+  gm_parc=${in_prefix}_gm_parc.nii.gz
+  if LWDP_needs_update_and_lock ${gm_parc} ${seg_clean} ${in_sri_parc}; then
+    fsl fslmaths ${seg_clean} -thr 2 -uthr 2 -bin -mul ${in_sri_parc} ${gm_parc}
+    LWDP_lockfile_delete ${gm_parc}
+  fi 
+  wm_parc=${in_prefix}_wm_parc.nii.gz
+  if LWDP_needs_update_and_lock ${wm_parc} ${seg_clean} ${in_sri_wm}; then
+    fsl fslmaths ${seg_clean} -thr 3 -uthr 3 -bin -mul ${in_sri_wm} ${wm_parc}
+    LWDP_lockfile_delete ${wm_parc}
+  fi
+}
+
+function segment_atropos
+{
+  local in_image_num=${1}
+  local in_images=${2}
+  local in_mask=${3}
+  local in_prefix=${4}
+  local in_prior_CSF=${5}
+  local in_prior_GM=${6}
+  local in_prior_WM=${7}
+  local in_sri_ven=${8}
+  local in_sri_parc=${9}
+  local in_sri_wm=${10}
+
+  seg=${in_prefix}_seg.nii.gz
+  if [ "${in_image_num}" == "1" ] || [ "${in_image_num}" == "2" ]; then
+    if LWDP_needs_update_and_lock ${seg} ${in_prior_CSF} ${in_prior_GM} ${in_prior_WM} ${in_images}; then
+      tmpdir=$(mktemp -d)
+
+      idx=1
+      for FILE in ${in_prior_CSF} ${in_prior_GM} ${in_prior_WM}; do 
+	  cp ${FILE} ${tmpdir}/pbmap_${idx}.nii.gz
+	  # if tmp dir does not have enough space - this will give you an error 
+	  if [ "`diff ${FILE} ${tmpdir}/pbmap_${idx}.nii.gz 2>&1`" != "" ]; then
+	      echo "ERROR:$WORKDIR:Problem with copying data to tmpdir !"
+	      rm -rf ${tmpdir}
+	      LWDP_lockfile_delete ${seg}
+	      exit 1 
+	  fi
+	  let idx++ 
+      done
+	
+    
+      CMD="ants Atropos -d 3 -x ${in_mask} -c [5,0.0] -a ${in_images} -i PriorProbabilityImages[3,${tmpdir}/pbmap_%d.nii.gz,0.0] -k HistogramParzenWindows -m [0.05,1x1x1] -o [${seg},${in_prefix}_posteriors_%d.nii.gz] -r 0 -p Socrates[1] --use-partial-volume-likelihoods 1 -s 1x2 -s 2x3"
+      $CMD 
+    
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${seg}
+    fi
+  else
+    echo "ERROR: ${WORKDIR}: Not supported yet"
+    return
+  fi
+
+  seg_clean=${in_prefix}_seg_clean.nii.gz
+  if LWDP_needs_update_and_lock ${seg_clean} ${seg}; then
+    ${SLICER_CLI}/IslandRemoval -m 25 ${seg} ${seg_clean} 
+    fsl fslcpgeom ${seg} ${seg_clean}
+    LWDP_lockfile_delete ${seg_clean}
+  fi
+  
+  ven_parc=${in_prefix}_ven_parc.nii.gz
+  if LWDP_needs_update_and_lock ${ven_parc} ${seg_clean} ${in_sri_ven}; then
+    fsl fslmaths ${seg_clean} -thr 1 -uthr 1 -bin -mul ${in_sri_ven} ${ven_parc}
+    LWDP_lockfile_delete ${ven_parc}
+  fi 
+  gm_parc=${in_prefix}_gm_parc.nii.gz
+  if LWDP_needs_update_and_lock ${gm_parc} ${seg_clean} ${in_sri_parc}; then
+    fsl fslmaths ${seg_clean} -thr 2 -uthr 2 -bin -mul ${in_sri_parc} ${gm_parc}
+    LWDP_lockfile_delete ${gm_parc}
+  fi 
+  wm_parc=${in_prefix}_wm_parc.nii.gz
+  if LWDP_needs_update_and_lock ${wm_parc} ${seg_clean} ${in_sri_wm}; then
+    fsl fslmaths ${seg_clean} -thr 3 -uthr 3 -bin -mul ${in_sri_wm} ${wm_parc}
+    LWDP_lockfile_delete ${wm_parc}
+  fi
+}
+
+# classification using fast with t1
+[ -d ${WORKDIR}/structural/segment/subject_t1/fast ] || mkdir -p ${WORKDIR}/structural/segment/subject_t1/fast
+t1_seg_pfx=${WORKDIR}/structural/segment/subject_t1/fast/t1
+t1_seg=${t1_seg_pfx}_seg.nii.gz
+segment_fast 1 "${t1_brain}" ${t1_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+
+# classification using atropos with t1
+[ -d ${WORKDIR}/structural/segment/subject_t1/atropos ] || mkdir -p ${WORKDIR}/structural/segment/subject_t1/atropos
+t1_seg_pfx=${WORKDIR}/structural/segment/subject_t1/atropos/t1
+t1_seg=${t1_seg_pfx}_seg.nii.gz
+segment_atropos 1 "${t1_brain}" ${t1_brainmask} ${t1_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+
+## classification using atropos with t1 and t2
+#[ -d ${WORKDIR}/structural/segment/subject_t1/atropos_t1t2 ] || mkdir -p ${WORKDIR}/structural/segment/subject_t1/atropos_t1t2
+#t1t2_seg_pfx=${WORKDIR}/structural/segment/subject_t1/atropos_t1t2/t1t2
+#t1t2_seg=${t1t2_seg_pfx}_seg.nii.gz
+##segment_atropos 2 "${t1_brain} ${t2_brain}" ${t1_brainmask} ${t1t2_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+#segment_atropos 2 "${t1_brain} ${t2_affine_brain}" ${t1_brainmask} ${t1t2_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+
+#
+# 14 - compute distortion-correcting Jacobian map from ADNI phantom description
+#
+
+if [ "${phantom_xml_input}" != "" ]; then
+  phantom_unwarp=${WORKDIR}/structural/phantom/unwarp.xform
+  if LWDP_needs_update_and_lock ${phantom_unwarp} ${phantom_xml_input} ${t1_input}; then
+    cmtk unwarp_image_phantom --poly --degree 4 ${phantom_xml_input} ${t1_input} ${phantom_unwarp}
+    LWDP_lockfile_delete ${phantom_unwarp}
+  fi
+  
+  phantom_unwarp_inverse=${WORKDIR}/structural/phantom/unwarp_inverse.xform
+  if LWDP_needs_update_and_lock ${phantom_unwarp_inverse} ${phantom_xml_input}  ${t1_input}; then
+    cmtk unwarp_image_phantom --poly --degree 4 --fit-inverse ${phantom_xml_input} ${t1_input} ${phantom_unwarp_inverse}
+    LWDP_lockfile_delete ${phantom_unwarp_inverse}
+  fi
+  
+  phantom_jacobian=${WORKDIR}/structural/phantom/jacobian.nii
+  if LWDP_needs_update_and_lock ${phantom_jacobian} ${phantom_unwarp_inverse}  ${t1_input}; then
+    cmtk reformatx -o ${phantom_jacobian} ${t1_input} --jacobian ${phantom_unwarp_inverse}
+    LWDP_lockfile_delete ${phantom_jacobian}
+  fi
+
+  phantom_scale=$(fgrep \<scale\> ${phantom_xml_input} | sed 's/^.*<scale>//g; s/<\/scale>.*$//g' | gawk '{ print 1.0 / ( $1 * $2 * $3 ) }')
+fi
+
+#
+# 15 - generate CSV tissue files
+#
+
+# Function to bring the tabular CSV into row form, so we can concat and/or merge
+tab_to_csv()
+{
+  local tabfile=$1
+  local csvfile=$2
+  local visit=$3
+
+  if LWDP_needs_update_and_lock ${csvfile} ${tabfile}; then
+    ${NCANDA_SOURCE_DIR}/utils/serialize_csv --lowercase-labels --label-prefix sri24_${parc}_ --insert-key-value subject:${SUBJECT},arm:${ARM},visit:${visit} ${tabfile} ${csvfile}
+    LWDP_lockfile_delete ${csvfile}
+  fi
+}
+
+for i in 1 2 4; do
+  if [ "${i}" == "1" ]; then
+    # posteriors from fast
+    tab_folder=${WORKDIR}/structural/volumetry/subject_t1/sri24/fast
+    posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/fast/t1_pve_0.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/fast/t1_pve_1.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/fast/t1_pve_2.nii.gz)"
+  elif [ "${i}" == "2" ]; then
+    # posteriors from atropos t1
+    tab_folder=${WORKDIR}/structural/volumetry/subject_t1/sri24/atropos
+    posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos/t1_posteriors_1.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos/t1_posteriors_2.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos/t1_posteriors_3.nii.gz)"
+  elif [ "${i}" == "3" ]; then
+    # posteriors from atropos t1+t2
+    tab_folder=${WORKDIR}/structural/volumetry/subject_t1/sri24/atropos_t1t2
+    posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos_t1t2/t1t2_posteriors_1.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos_t1t2/t1t2_posteriors_2.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/subject_t1/atropos_t1t2/t1t2_posteriors_3.nii.gz)"
+  elif [ "${i}" == "4" ]; then
+    # atropos t1 hard segmentation
+    tab_folder=${WORKDIR}/structural/volumetry/subject_t1/sri24/atropos_hs
+    t1_seg=${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg.nii.gz
+    t1_seg_1=${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg_1.nii.gz
+    t1_seg_2=${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg_2.nii.gz
+    t1_seg_3=${WORKDIR}/structural/segment/subject_t1/atropos/t1_seg_3.nii.gz
+    if LWDP_needs_update_and_lock ${t1_seg_1} ${t1_seg}; then
+      c3d c3d ${t1_seg} -replace 0 0 1 1 2 0 3 0 -o ${t1_seg_1}
+      c3d c3d ${t1_seg} -replace 0 0 1 0 2 1 3 0 -o ${t1_seg_2}
+      c3d c3d ${t1_seg} -replace 0 0 1 0 2 0 3 1 -o ${t1_seg_3}
+      LWDP_lockfile_delete ${t1_seg_1}
+    fi
+    posteriors="${t1_seg_1} ${t1_seg_2} ${t1_seg_3}"
+  fi
+  
+  # For each parcellation, compute tissue volume tables
+  for parc in ${PARCELLATIONS}; do
+    label_image=$(LWDP_get_override_file ${WORKDIR}/structural/reslice/subject_t1/sri24/${parc}.nii.gz)
+    label_txt=${DATA_DIR}/sri24/parcellation/sri24_${parc}.txt
+  
+    # First, without "unwarping" correction
+    tabout=${tab_folder}/${parc}.tab
+    if LWDP_needs_update_and_lock ${tabout} ${label_image} ${posteriors} ${label_txt}; then
+      cmtk vol2csv --density-labels CSF,GM,WM -o ${tabout} --labels-file ${label_txt} ${label_image} ${posteriors}
+      LWDP_lockfile_delete ${tabout}
+    fi
+    csvout=${tab_folder}/${parc}.csv
+    tab_to_csv ${tabout} ${csvout} ${VISIT}
+  
+    if [ -n "${phantom_xml_input}" ]; then
+      # Second, global scale from ADNI phantom scan to adjust volumes globally
+      tabout=${tab_folder}/${parc}_scale.tab
+      if LWDP_needs_update_and_lock ${tabout} ${label_image} ${posteriors} ${label_txt}; then
+        cmtk vol2csv --density-labels CSF,GM,WM -o ${tabout} --pixel-scale-factor ${phantom_scale} --labels-file ${label_txt} ${label_image} ${posteriors}
+        LWDP_lockfile_delete ${tabout}
+      fi
+      csvout=${tab_folder}/${parc}_scale.csv
+      tab_to_csv ${tabout} ${csvout} ${VISIT}
+  
+      # Third, using Jacobian map from phantom-based unwarping to correct for differences in local pixel volumes
+      tabout=${tab_folder}/${parc}_unwarp.tab
+      if LWDP_needs_update_and_lock ${tabout} ${label_image} ${posteriors} ${phantom_jacobian} ${label_txt}; then
+        cmtk vol2csv --density-labels CSF,GM,WM -o ${tabout} --pixel-scale-image ${phantom_jacobian} --labels-file ${label_txt} ${label_image} ${posteriors}
+        LWDP_lockfile_delete ${tabout}
+      fi
+      csvout=${tab_folder}/${parc}_unwarp.csv
+      tab_to_csv ${tabout} ${csvout} ${VISIT}
+    fi
+  done
+done
+
+#
+# XX - Resample baseline to padded sri24 space and move followup to resampled baseline space
+#
+
+if [ "${VISIT}" == "baseline" ]; then
+  [ -d ${WORKDIR}/structural/reslice/sri24_padded ] || mkdir -p ${WORKDIR}/structural/reslice/sri24_padded
+
+  sri24_t1_padded=${WORKDIR}/structural/reslice/sri24_padded/sri24_t1_padded.nii.gz
+  if LWDP_needs_update_and_lock ${sri24_t1_padded} ${sri24_t1}; then
+    c3d c3d ${sri24_t1} -pad 0x0x45vox 0x0x40vox -o ${sri24_t1_padded}
+    LWDP_lockfile_delete ${sri24_t1_padded}
+  fi
+
+  [ -d ${WORKDIR}/structural/registration/sri24_padded_to_t1 ] || mkdir -p ${WORKDIR}/structural/registration/sri24_padded_to_t1
+
+  sri24_padded_to_t1_rigid_pfx=${WORKDIR}/structural/registration/sri24_padded_to_t1/ants_rigid_
+  sri24_padded_to_t1_rigid=${sri24_padded_to_t1_rigid_pfx}0GenericAffine.mat
+  if LWDP_needs_update_and_lock ${sri24_padded_to_t1_rigid} ${sri24_t1_padded} ${t1_brain}; then
+    log_out=${sri24_padded_to_t1_rigid_pfx}0GenericAffine.log
+    ants antsRegistration -d 3 -r [${sri24_t1_padded},${t1_brain},0] -t Rigid[0.1] -m MI[${sri24_t1_padded},${t1_brain},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${sri24_padded_to_t1_rigid_pfx} > ${log_out}
+    LWDP_lockfile_delete ${sri24_padded_to_t1_rigid}
+  fi
+  sri24_padded_to_t1_rigid=$(LWDP_get_override_file ${sri24_padded_to_t1_rigid})
+
+  inp[1]=${t1_brainmask}
+  inp[2]=${t1_mrbias}
+  inp[3]=${t2_mrbias}
+  inp[4]=${t2_affine_mrbias}
+
+  out[1]=${WORKDIR}/structural/reslice/sri24_padded/t1_brain_mask.nii.gz
+  out[2]=${WORKDIR}/structural/reslice/sri24_padded/t1.nii.gz
+  out[3]=${WORKDIR}/structural/reslice/sri24_padded/t2.nii.gz
+  out[4]=${WORKDIR}/structural/reslice/sri24_padded/t2_affine.nii.gz
+
+  inp[5]=${out[2]}
+  inp[6]=${out[3]}
+  inp[7]=${out[4]}
+
+  out[5]=${WORKDIR}/structural/reslice/sri24_padded/t1_brain.nii.gz
+  out[6]=${WORKDIR}/structural/reslice/sri24_padded/t2_brain.nii.gz
+  out[7]=${WORKDIR}/structural/reslice/sri24_padded/t2_affine_brain.nii.gz
+
+  sri24_padded_t1_brainmask=${out[1]}
+  sri24_padded_t1=${out[2]}
+  sri24_padded_t2=${out[3]}
+  sri24_padded_t2_affine=${out[4]}
+  sri24_padded_t1_brain=${out[5]}
+  sri24_padded_t2_brain=${out[6]}
+  sri24_padded_t2_affine_brain=${out[7]}
+
+  for i in 1; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_t1_padded} ${sri24_padded_to_t1_rigid}; then
+      ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${sri24_t1_padded} -o ${out[${i}]} -t ${sri24_padded_to_t1_rigid}
+      c3d c3d ${out[${i}]} -type uchar -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+  for i in 2 3 4; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_t1_padded} ${sri24_padded_to_t1_rigid}; then
+      ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${sri24_t1_padded} -o ${out[${i}]} -t ${sri24_padded_to_t1_rigid}
+      c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+  for i in 5 6 7; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_padded_t1_brainmask}; then
+      c3d c3d ${inp[${i}]} ${sri24_padded_t1_brainmask} -multiply -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+
+  ## generate affinely registratered t2
+  #sri24_padded_t1_to_t2_pfx=${WORKDIR}/structural/registration/sri24_padded_t1_to_t2/ants_
+  #sri24_padded_t1_to_t2_affine=${sri24_padded_t1_to_t2_pfx}0GenericAffine.mat
+  #if LWDP_needs_update_and_lock ${sri24_padded_t1_to_t2_affine} ${sri24_padded_t1_brain} ${t2_affine_brain}; then
+  #  log_out=${sri24_padded_t1_to_t2_pfx}0GenericAffine.log
+  #  ants antsRegistration -d 3 -r [${sri24_padded_t1_brain},${t2_affine_brain},0] -t Rigid[0.1] -m MI[${sri24_padded_t1_brain},${t2_affine_brain},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${sri24_padded_t1_brain},${t2_affine_brain},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${sri24_padded_t1_to_t2_pfx} > ${log_out}
+  #  LWDP_lockfile_delete ${sri24_padded_t1_to_t2_affine}
+  #fi
+  #sri24_padded_t1_to_t2_affine=$(LWDP_get_override_file ${sri24_padded_t1_to_t2_affine})
+
+  #sri24_padded_t2_affine=${WORKDIR}/structural/reslice/sri24_padded/t2_affine.nii.gz
+  #if LWDP_needs_update_and_lock ${sri24_padded_t2_affine} ${t2_affine_denoised} ${sri24_padded_t1} ${sri24_padded_t1_brainmask} ${sri24_padded_t1_to_t2_affine}; then
+  #  tmpdir=$(mktemp -d)
+  #  ants antsApplyTransforms -n BlackmanWindowedSinc -i ${t2_affine_denoised} -r ${sri24_padded_t1} -o ${tmpdir}/t2.nii.gz -t ${sri24_padded_t1_to_t2_affine}
+  #  c3d c3d ${tmpdir}/t2.nii.gz -clip 0 inf -type float -o ${tmpdir}/t2.nii.gz
+  #  ants N4BiasFieldCorrection -i ${tmpdir}/t2.nii.gz -x ${sri24_padded_t1_brainmask} -o ${sri24_padded_t2_affine}
+  #  rm -rf ${tmpdir}
+  #  LWDP_lockfile_delete ${sri24_padded_t2_affine}
+  #fi
+
+  #sri24_padded_t2_affine_brain=${WORKDIR}/structural/reslice/sri24_padded/t2_affine_brain.nii.gz
+  #if LWDP_needs_update_and_lock ${sri24_padded_t2_affine_brain} ${sri24_padded_t2_affine} ${sri24_padded_t1_brainmask}; then
+  #  c3d c3d ${sri24_padded_t2_affine} ${sri24_padded_t1_brainmask} -multiply -o ${sri24_padded_t2_affine_brain}
+  #  LWDP_lockfile_delete ${sri24_padded_t2_affine_brain}
+  #fi
+else
+  [ -d ${WORKDIR}/structural/longitudinal/registration/baseline_sri24_padded_to_t1 ] || mkdir -p ${WORKDIR}/structural/longitudinal/registration/baseline_sri24_padded_to_t1
+
+  t1_brain_at_baseline_sri24_padded=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/t1_brain.nii.gz)
+
+  baseline_sri24_padded_to_t1_rigid_pfx=${WORKDIR}/structural/longitudinal/registration/baseline_sri24_padded_to_t1/ants_rigid_
+  baseline_sri24_padded_to_t1_rigid=${baseline_sri24_padded_to_t1_rigid_pfx}0GenericAffine.mat
+  if LWDP_needs_update_and_lock ${baseline_sri24_padded_to_t1_rigid} ${t1_brain} ${t1_brain_at_baseline_sri24_padded}; then
+    log_out=${baseline_sri24_padded_to_t1_rigid_pfx}0GenericAffine.log
+    ants antsRegistration -d 3 -r [${t1_brain_at_baseline_sri24_padded},${t1_brain},1] -t Rigid[0.1] -m MI[${t1_brain_at_baseline_sri24_padded},${t1_brain},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${baseline_sri24_padded_to_t1_rigid_pfx} > ${log_out}
+    LWDP_lockfile_delete ${baseline_sri24_padded_to_t1_rigid}
+  fi
+  baseline_sri24_padded_to_t1_rigid=$(LWDP_get_override_file ${baseline_sri24_padded_to_t1_rigid})
+
+  # transfer baseline images to this visit for verification
+  [ -d ${WORKDIR}/structural/reslice/sri24_padded ] || mkdir -p ${WORKDIR}/structural/reslice/sri24_padded
+
+  #inp[1]=${t1_brainmask}
+  inp[1]=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/stripped/t1_brain_mask.nii.gz)
+  inp[2]=${t1_mrbias}
+  inp[3]=${t2_mrbias}
+  inp[4]=${t2_affine_mrbias}
+
+  out[1]=${WORKDIR}/structural/reslice/sri24_padded/t1_brain_mask.nii.gz
+  out[2]=${WORKDIR}/structural/reslice/sri24_padded/t1.nii.gz
+  out[3]=${WORKDIR}/structural/reslice/sri24_padded/t2.nii.gz
+  out[4]=${WORKDIR}/structural/reslice/sri24_padded/t2_affine.nii.gz
+
+  inp[5]=${out[2]}
+  inp[6]=${out[3]}
+  inp[7]=${out[4]}
+
+  out[5]=${WORKDIR}/structural/reslice/sri24_padded/t1_brain.nii.gz
+  out[6]=${WORKDIR}/structural/reslice/sri24_padded/t2_brain.nii.gz
+  out[7]=${WORKDIR}/structural/reslice/sri24_padded/t2_affine_brain.nii.gz
+
+  sri24_padded_t1_brainmask=${out[1]}
+  sri24_padded_t1=${out[2]}
+  sri24_padded_t2=${out[3]}
+  sri24_padded_t2_affine=${out[4]}
+  sri24_padded_t1_brain=${out[5]}
+  sri24_padded_t2_brain=${out[6]}
+  sri24_padded_t2_affine_brain=${out[7]}
+
+  # mask: baseline_sri24_padded -> t1 -> baseline
+  for i in 1; do
+    #if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${t1_brain_at_baseline_sri24_padded} ${baseline_sri24_padded_to_t1_rigid}; then
+    #  ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${t1_brain_at_baseline_sri24_padded} -o ${out[${i}]} -t ${baseline_sri24_padded_to_t1_rigid}
+    #  c3d c3d ${out[${i}]} -type uchar -o ${out[${i}]}
+    #  LWDP_lockfile_delete ${out[${i}]}
+    #fi
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${t1_brain_at_baseline_sri24_padded} ${baseline_sri24_padded_to_t1_rigid} ${baseline_to_t1_affine} ${t1_to_baseline_warp}; then
+      ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${t1_brain_at_baseline_sri24_padded} -o ${out[${i}]} -t ${baseline_sri24_padded_to_t1_rigid} [${baseline_to_t1_affine},1] ${t1_to_baseline_warp}
+      c3d c3d ${out[${i}]} -type uchar -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+  for i in 2 3 4; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${t1_brain_at_baseline_sri24_padded} ${baseline_sri24_padded_to_t1_rigid}; then
+      ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${t1_brain_at_baseline_sri24_padded} -o ${out[${i}]} -t ${baseline_sri24_padded_to_t1_rigid}
+      c3d c3d ${out[${i}]} -clip 0 inf -type float -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+  for i in 5 6 7; do
+    if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_padded_t1_brainmask}; then
+      c3d c3d ${inp[${i}]} ${sri24_padded_t1_brainmask} -multiply -o ${out[${i}]}
+      LWDP_lockfile_delete ${out[${i}]}
+    fi
+  done
+
+  ## generate affinely registratered t2
+  #t2_affine_brain_at_baseline_sri24_padded=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/t2_affine_brain.nii.gz)
+
+  #baseline_sri24_padded_t2_to_t2_pfx=${WORKDIR}/structural/longitudinal/registration/baseline_sri24_padded_t2_to_t2/ants_
+  #baseline_sri24_padded_t2_to_t2_affine=${baseline_sri24_padded_t2_to_t2_pfx}0GenericAffine.mat
+  #if LWDP_needs_update_and_lock ${baseline_sri24_padded_t2_to_t2_affine} ${t2_affine_brain_at_baseline_sri24_padded} ${t2_affine_brain}; then
+  #  log_out=${baseline_sri24_padded_t2_to_t2_pfx}0GenericAffine.log
+  #  ants antsRegistration -d 3 -r [${t2_affine_brain_at_baseline_sri24_padded},${t2_affine_brain},1] -t Rigid[0.1] -m MI[${t2_affine_brain_at_baseline_sri24_padded},${t2_affine_brain},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -t Affine[0.1] -m MI[${t2_affine_brain_at_baseline_sri24_padded},${t2_affine_brain},1,32,Regular,0.25] -c [1000x500x250x100, 1e-6, 10] -f 8x4x2x1 -s 3x2x1x0vox -o ${baseline_sri24_padded_t2_to_t2_pfx} > ${log_out}
+  #  LWDP_lockfile_delete ${baseline_sri24_padded_t2_to_t2_affine}
+  #fi
+  #baseline_sri24_padded_t2_to_t2_affine=$(LWDP_get_override_file ${baseline_sri24_padded_t2_to_t2_affine})
+
+  #sri24_padded_t2_affine=${WORKDIR}/structural/reslice/sri24_padded/t2_affine.nii.gz
+  #if LWDP_needs_update_and_lock ${sri24_padded_t2_affine} ${t2_affine_denoised} ${t2_affine_brain_at_baseline_sri24_padded} ${sri24_padded_t1_brainmask} ${baseline_sri24_padded_t2_to_t2_affine}; then
+  #  tmpdir=$(mktemp -d)
+  #  ants antsApplyTransforms -n BlackmanWindowedSinc -i ${t2_affine_denoised} -r ${t2_affine_brain_at_baseline_sri24_padded} -o ${tmpdir}/t2.nii.gz -t ${baseline_sri24_padded_t2_to_t2_affine}
+  #  c3d c3d ${tmpdir}/t2.nii.gz -clip 0 inf -type float -o ${tmpdir}/t2.nii.gz
+  #  ants N4BiasFieldCorrection -i ${tmpdir}/t2.nii.gz -x ${sri24_padded_t1_brainmask} -o ${sri24_padded_t2_affine}
+  #  rm -rf ${tmpdir}
+  #  LWDP_lockfile_delete ${sri24_padded_t2_affine}
+  #fi
+
+  #sri24_padded_t2_affine_brain=${WORKDIR}/structural/reslice/sri24_padded/t2_affine_brain.nii.gz
+  #if LWDP_needs_update_and_lock ${sri24_padded_t2_affine_brain} ${sri24_padded_t2_affine} ${sri24_padded_t1_brainmask}; then
+  #  c3d c3d ${sri24_padded_t2_affine} ${sri24_padded_t1_brainmask} -multiply -o ${sri24_padded_t2_affine_brain}
+  #  LWDP_lockfile_delete ${sri24_padded_t2_affine_brain}
+  #fi
+
+  # match intensity toward baseline
+  [ -d ${WORKDIR}/structural/reslice/sri24_padded/corrected ] || mkdir -p ${WORKDIR}/structural/reslice/sri24_padded/corrected
+
+  for tx in t1 t2 t2_affine; do
+    tx_brain_reference=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/${tx}_brain.nii.gz)
+    tx_brain=${WORKDIR}/structural/reslice/sri24_padded/${tx}_brain.nii.gz
+    tx_brainmask=${WORKDIR}/structural/reslice/sri24_padded/t1_brain_mask.nii.gz
+    tx_brain_scale=${WORKDIR}/structural/reslice/sri24_padded/corrected/${tx}_brain_scale.nii.gz
+    tx_brain_corrected=${WORKDIR}/structural/reslice/sri24_padded/corrected/${tx}_brain.nii.gz
+    smooth_width=3
+  
+    if LWDP_needs_update_and_lock ${tx_brain_corrected} ${tx_brain_reference} ${tx_brain} ${tx_brainmask}; then
+      tmpdir=$(mktemp -d)
+      c3d c3d ${tx_brain_reference} -smooth ${smooth_width}mm -o ${tmpdir}/ref.nii.gz
+      c3d c3d ${tx_brain} -smooth ${smooth_width}mm -o ${tmpdir}/img.nii.gz
+      # need caution if use c3d: c3d A B -divide -o C computes C = B / A, not C = A / B
+      fsl fslmaths ${tmpdir}/ref.nii.gz -div ${tmpdir}/img.nii.gz -mul ${tx_brainmask} ${tx_brain_scale}
+      c3d c3d ${tx_brain} ${tx_brain_scale} -multiply -o ${tx_brain_corrected}
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${tx_brain_corrected}
+    fi
+  done
+
+  sri24_padded_t1_brain=${WORKDIR}/structural/reslice/sri24_padded/corrected/t1_brain.nii.gz
+  sri24_padded_t2_brain=${WORKDIR}/structural/reslice/sri24_padded/corrected/t2_brain.nii.gz
+  sri24_padded_t2_affine_brain=${WORKDIR}/structural/reslice/sri24_padded/corrected/t2_affine_brain.nii.gz
+fi
+
+#
+# XX - reformat SRI24 parcellation maps and tissue priors to padded sri24 space
+#
+
+# get sri24_padded_t2_brain_exp_mask - removes dark t2 regions from t1_brainmask
+sri24_padded_t2_brain_exp_mask=${WORKDIR}/structural/reslice/sri24_padded/t2_brain_exp_mask.nii.gz
+if LWDP_needs_update_and_lock ${sri24_padded_t2_brain_exp_mask} ${sri24_padded_t2_brain} ${sri24_padded_t1_brainmask}; then
+  mean=`fsl fslstats ${sri24_padded_t2_brain} -k ${sri24_padded_t1_brainmask} -m | tr -d " "`
+  mean_1=`bc -l <<< 1/${mean}`
+  echo ${WORKDIR} sri24_padded_t2_brain: mean=${mean}, 1/mean=${mean_1}
+  # thresh 0.8 cuts 20% of the mean
+  c3d c3d ${sri24_padded_t2_brain} -scale -${mean_1} -exp -thresh 0.8 inf 0 1 -o ${sri24_padded_t2_brain_exp_mask}
+  LWDP_lockfile_delete ${sri24_padded_t2_brain_exp_mask}
+fi
+export sri24_padded_t2_brain_exp_mask=$(LWDP_get_override_file ${sri24_padded_t2_brain_exp_mask})
+#
+sri24_padded_t2_affine_brain_exp_mask=${WORKDIR}/structural/reslice/sri24_padded/t2_affine_brain_exp_mask.nii.gz
+if LWDP_needs_update_and_lock ${sri24_padded_t2_affine_brain_exp_mask} ${sri24_padded_t2_affine_brain} ${sri24_padded_t1_brainmask}; then
+  mean=`fsl fslstats ${sri24_padded_t2_affine_brain} -k ${sri24_padded_t1_brainmask} -m | tr -d " "`
+  mean_1=`bc -l <<< 1/${mean}`
+  echo "INFO: ${WORKDIR}: sri24_padded_t2_affine_brain: mean=${mean}, 1/mean=${mean_1}"
+  c3d c3d ${sri24_padded_t2_affine_brain} -scale -${mean_1} -exp -thresh 0.8 inf 0 1 -o ${sri24_padded_t2_affine_brain_exp_mask}
+  LWDP_lockfile_delete ${sri24_padded_t2_affine_brain_exp_mask}
+fi
+export sri24_padded_t2_affine_brain_exp_mask=$(LWDP_get_override_file ${sri24_padded_t2_affine_brain_exp_mask})
+
+# get refined t1_brain image using t2 mask
+if [ "${VISIT}" == "baseline" ]; then
+  sri24_padded_t1_brain_t2_masked=${WORKDIR}/structural/reslice/sri24_padded/t1_brain_t2_masked.nii.gz
+else
+  sri24_padded_t1_brain_t2_masked=${WORKDIR}/structural/reslice/sri24_padded/corrected/t1_brain_t2_masked.nii.gz
+fi
+if LWDP_needs_update_and_lock ${sri24_padded_t1_brain_t2_masked} ${sri24_padded_t1_brain} ${sri24_padded_t2_affine_brain_exp_mask}; then
+  # remove non-csf region using t2 exp mask
+  c3d c3d ${sri24_padded_t1_brain} ${sri24_padded_t2_affine_brain_exp_mask} -multiply -o ${sri24_padded_t1_brain_t2_masked}
+  LWDP_lockfile_delete ${sri24_padded_t1_brain_t2_masked}
+fi
+
+if [ "${VISIT}" == "baseline" ]; then
+  sri24_padded_sri24_mtx="${sri24_padded_to_t1_rigid} ${t1_sri24_mtx}"
+else
+  sri24_padded_sri24_mtx="${baseline_sri24_padded_to_t1_rigid} ${t1_sri24_mtx}"
+fi
+
+inp[1]=${DATA_DIR}/sri24/parcellation/sri24_parc116.nii.gz
+inp[2]=${DATA_DIR}/sri24/parcellation/sri24_wm400.nii.gz
+inp[3]=${DATA_DIR}/sri24/parcellation/sri24_ventricles.nii.gz
+inp[4]=${DATA_DIR}/sri24/parcellation/sri24_suptent.nii.gz
+inp[5]=${DATA_DIR}/sri24/parcellation/sri24_parc_cortical.nii.gz
+inp[6]=${DATA_DIR}/sri24/sri24_pbmap_CSF.nii.gz
+inp[7]=${DATA_DIR}/sri24/sri24_pbmap_GM.nii.gz
+inp[8]=${DATA_DIR}/sri24/sri24_pbmap_WM.nii.gz
+inp[9]=${DATA_DIR}/sri24/parcellation/sri24_inftent.nii.gz
+inp[10]=${DATA_DIR}/sri24/parcellation/sri24_suptent2.nii.gz
+inp[11]=${DATA_DIR}/sri24/parcellation/sri24_postfossa_dmid.nii.gz
+
+out[1]=${WORKDIR}/structural/reslice/sri24_padded/parc116.nii.gz
+out[2]=${WORKDIR}/structural/reslice/sri24_padded/wm400.nii.gz
+out[3]=${WORKDIR}/structural/reslice/sri24_padded/ventricles.nii.gz
+out[4]=${WORKDIR}/structural/reslice/sri24_padded/suptent.nii.gz
+out[5]=${WORKDIR}/structural/reslice/sri24_padded/parc_cortical.nii.gz
+out[6]=${WORKDIR}/structural/reslice/sri24_padded/pbmap_CSF.nii.gz
+out[7]=${WORKDIR}/structural/reslice/sri24_padded/pbmap_GM.nii.gz
+out[8]=${WORKDIR}/structural/reslice/sri24_padded/pbmap_WM.nii.gz
+out[9]=${WORKDIR}/structural/reslice/sri24_padded/inftent.nii.gz
+out[10]=${WORKDIR}/structural/reslice/sri24_padded/suptent2.nii.gz
+out[11]=${WORKDIR}/structural/reslice/sri24_padded/postfossa_dmid.nii.gz
+
+for i in 1; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_padded_sri24_mtx} ${sri24_padded_t1_brain}; then
+    # choose MultiLabel params which preserves boundaries close to NN, but applying some mild smoothness
+    ants antsApplyTransforms -n MultiLabel[0.5,1] -i ${inp[${i}]} -r ${sri24_padded_t1_brain} -o ${out[${i}]} -t ${sri24_padded_sri24_mtx}
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 2 3 4 5; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_padded_sri24_mtx} ${sri24_padded_t1_brain}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${sri24_padded_t1_brain} -o ${out[${i}]} -t ${sri24_padded_sri24_mtx}
+    c3d c3d ${out[${i}]} -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 6 7 8; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_padded_sri24_mtx}  ${sri24_padded_t1_brain} ${sri24_padded_t1_brainmask}; then
+    ants antsApplyTransforms -n BlackmanWindowedSinc -i ${inp[${i}]} -r ${sri24_padded_t1_brain} -o ${out[${i}]} -t ${sri24_padded_sri24_mtx}
+    c3d c3d ${out[${i}]} ${sri24_padded_t1_brainmask} -multiply -clip 0 inf -type float -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+for i in 9 10 11; do
+  if LWDP_needs_update_and_lock ${out[${i}]} ${inp[${i}]} ${sri24_padded_sri24_mtx} ${sri24_padded_t1_brain} ${sri24_padded_t1_brainmask} ${sri24_padded_t2_affine_brain_exp_mask}; then
+    ants antsApplyTransforms -n NearestNeighbor -i ${inp[${i}]} -r ${sri24_padded_t1_brain} -o ${out[${i}]} -t ${sri24_padded_sri24_mtx}
+    c3d c3d ${out[${i}]} ${sri24_padded_t1_brainmask} -multiply ${sri24_padded_t2_affine_brain_exp_mask} -multiply -type short -o ${out[${i}]}
+    LWDP_lockfile_delete ${out[${i}]}
+  fi
+done
+
+t1_sri_parc=${out[1]}
+t1_sri_wm=${out[2]}
+t1_sri_ven=${out[3]}
+t1_prior_CSF=${out[6]}
+t1_prior_GM=${out[7]}
+t1_prior_WM=${out[8]}
+
+# Copy brainmask and pretend it's a parcellation map also - this is for whole-brain (ICV) tissue volumes
+icv_mask=${WORKDIR}/structural/reslice/sri24_padded/icv.nii.gz
+if LWDP_needs_update_and_lock ${icv_mask} ${sri24_padded_t1_brainmask}; then
+  cmtk convertx ${sri24_padded_t1_brainmask} ${icv_mask}
+  LWDP_lockfile_delete ${icv_mask}
+fi
+
+# classification using fast with t1
+[ -d ${WORKDIR}/structural/segment/sri24_padded/fast ] || mkdir -p ${WORKDIR}/structural/segment/sri24_padded/fast
+t1_seg_pfx=${WORKDIR}/structural/segment/sri24_padded/fast/t1
+t1_seg=${t1_seg_pfx}_seg.nii.gz
+segment_fast 1 "${sri24_padded_t1_brain}" ${t1_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+
+# classification using atropos with t1
+[ -d ${WORKDIR}/structural/segment/sri24_padded/atropos ] || mkdir -p ${WORKDIR}/structural/segment/sri24_padded/atropos
+t1_seg_pfx=${WORKDIR}/structural/segment/sri24_padded/atropos/t1
+t1_seg=${t1_seg_pfx}_seg.nii.gz
+segment_atropos 1 "${sri24_padded_t1_brain}" ${sri24_padded_t1_brainmask} ${t1_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+
+# classification using atropos with t1 masked
+[ -d ${WORKDIR}/structural/segment/sri24_padded/atropos_masked ] || mkdir -p ${WORKDIR}/structural/segment/sri24_padded/atropos_masked
+t1_masked_seg_pfx=${WORKDIR}/structural/segment/sri24_padded/atropos_masked/t1
+t1_masked_seg=${t1_masked_seg_pfx}_seg.nii.gz
+segment_atropos 1 "${sri24_padded_t1_brain_t2_masked}" ${sri24_padded_t1_brainmask} ${t1_masked_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+
+## classification using atropos with t1 and t2
+#[ -d ${WORKDIR}/structural/segment/sri24_padded/atropos_t1t2 ] || mkdir -p ${WORKDIR}/structural/segment/sri24_padded/atropos_t1t2
+#t1t2_seg_pfx=${WORKDIR}/structural/segment/sri24_padded/atropos_t1t2/t1t2
+#t1t2_seg=${t1t2_seg_pfx}_seg.nii.gz
+##segment_atropos 2 "${sri24_padded_t1_brain} ${sri24_padded_t2_brain}" ${sri24_padded_t1_brainmask} ${t1t2_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+#segment_atropos 2 "${sri24_padded_t1_brain} ${sri24_padded_t2_affine_brain}" ${sri24_padded_t1_brainmask} ${t1t2_seg_pfx} ${t1_prior_CSF} ${t1_prior_GM} ${t1_prior_WM} ${t1_sri_ven} ${t1_sri_parc} ${t1_sri_wm}
+
+# generate CSV tissue files
+for i in 1 2 4 5; do
+  if [ "${i}" == "1" ]; then
+    # posteriors from fast
+    tab_folder=${WORKDIR}/structural/volumetry/sri24_padded/fast
+    posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/fast/t1_pve_0.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/fast/t1_pve_1.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/fast/t1_pve_2.nii.gz)"
+  elif [ "${i}" == "2" ]; then
+    # posteriors from atropos t1
+    tab_folder=${WORKDIR}/structural/volumetry/sri24_padded/atropos
+    posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos/t1_posteriors_1.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos/t1_posteriors_2.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos/t1_posteriors_3.nii.gz)"
+  elif [ "${i}" == "3" ]; then
+    # posteriors from atropos t1+t2
+    tab_folder=${WORKDIR}/structural/volumetry/sri24_padded/atropos_t1t2
+    posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos_t1t2/t1t2_posteriors_1.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos_t1t2/t1t2_posteriors_2.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos_t1t2/t1t2_posteriors_3.nii.gz)"
+  elif [ "${i}" == "4" ]; then
+    # atropos t1 hard segmentation
+    tab_folder=${WORKDIR}/structural/volumetry/sri24_padded/atropos_hs
+    t1_seg=${WORKDIR}/structural/segment/sri24_padded/atropos/t1_seg.nii.gz
+    t1_seg_1=${WORKDIR}/structural/segment/sri24_padded/atropos/t1_seg_1.nii.gz
+    t1_seg_2=${WORKDIR}/structural/segment/sri24_padded/atropos/t1_seg_2.nii.gz
+    t1_seg_3=${WORKDIR}/structural/segment/sri24_padded/atropos/t1_seg_3.nii.gz
+    if LWDP_needs_update_and_lock ${t1_seg_1} ${t1_seg}; then
+      c3d c3d ${t1_seg} -replace 0 0 1 1 2 0 3 0 -o ${t1_seg_1}
+      c3d c3d ${t1_seg} -replace 0 0 1 0 2 1 3 0 -o ${t1_seg_2}
+      c3d c3d ${t1_seg} -replace 0 0 1 0 2 0 3 1 -o ${t1_seg_3}
+      LWDP_lockfile_delete ${t1_seg_1}
+    fi
+    posteriors="${t1_seg_1} ${t1_seg_2} ${t1_seg_3}"
+  elif [ "${i}" == "5" ]; then
+    # posteriors from atropos t1
+    tab_folder=${WORKDIR}/structural/volumetry/sri24_padded/atropos_masked
+    posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos_masked/t1_posteriors_1.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos_masked/t1_posteriors_2.nii.gz)"
+    posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/segment/sri24_padded/atropos_masked/t1_posteriors_3.nii.gz)"
+  fi
+  
+  # For each parcellation, compute tissue volume tables
+  for parc in ${PARCELLATIONS}; do
+    label_image=$(LWDP_get_override_file ${WORKDIR}/structural/reslice/sri24_padded/${parc}.nii.gz)
+    label_txt=${DATA_DIR}/sri24/parcellation/sri24_${parc}.txt
+  
+    # First, without "unwarping" correction
+    tabout=${tab_folder}/${parc}.tab
+    if LWDP_needs_update_and_lock ${tabout} ${label_image} ${posteriors} ${label_txt}; then
+      cmtk vol2csv --density-labels CSF,GM,WM -o ${tabout} --labels-file ${label_txt} ${label_image} ${posteriors}
+      LWDP_lockfile_delete ${tabout}
+    fi
+    csvout=${tab_folder}/${parc}.csv
+    tab_to_csv ${tabout} ${csvout} ${VISIT}
+  
+    if [ -n "${phantom_xml_input}" ]; then
+      # Second, global scale from ADNI phantom scan to adjust volumes globally
+      tabout=${tab_folder}/${parc}_scale.tab
+      if LWDP_needs_update_and_lock ${tabout} ${label_image} ${posteriors} ${label_txt}; then
+        cmtk vol2csv --density-labels CSF,GM,WM -o ${tabout} --pixel-scale-factor ${phantom_scale} --labels-file ${label_txt} ${label_image} ${posteriors}
+        LWDP_lockfile_delete ${tabout}
+      fi
+      csvout=${tab_folder}/${parc}_scale.csv
+      tab_to_csv ${tabout} ${csvout} ${VISIT}
+    fi
+  done
+done
+
+#
+# XX - 4D segmentations for followup
+#
+
+function segment_atropos_4D
+{
+  local in_time_num=${1}
+  local in_t1_image=${2}
+  local in_t2_image=${3}
+  local in_mask=${4}
+  local in_prefix=${5}
+  local in_prior_CSF=${6}
+  local in_prior_GM=${7}
+  local in_prior_WM=${8}
+  local in_sri_ven=${9}
+  local in_sri_parc=${10}
+  local in_sri_wm=${11}
+
+  if [ ${in_time_num} -lt 2 ]; then
+    echo "ERROR: ${WORKDIR}: Multiple input time points required"
+    return
+  fi
+  #if [ ${in_time_num} -gt 2 ]; then
+  #  echo "ERROR: Not supported yet"
+  #  return
+  #fi
+
+  seg=${in_prefix}_seg.nii.gz
+  # if LWDP_needs_update_and_lock ${seg} ${in_prior_CSF} ${in_prior_GM} ${in_prior_WM} ${in_t1_images} ${in_t2_images}; then # updated var name to image not images
+  if LWDP_needs_update_and_lock ${seg} ${in_prior_CSF} ${in_prior_GM} ${in_prior_WM} ${in_t1_image} ${in_t2_image}; then
+    tmpdir=$(mktemp -d)
+
+    fsl fslmerge -t ${tmpdir}/t1_image.nii.gz ${in_t1_image}
+    fsl fslmerge -t ${tmpdir}/mask.nii.gz ${in_mask}
+    fsl fslmerge -t ${tmpdir}/pbmap_1.nii.gz ${in_prior_CSF}
+    fsl fslmerge -t ${tmpdir}/pbmap_2.nii.gz ${in_prior_GM}
+    fsl fslmerge -t ${tmpdir}/pbmap_3.nii.gz ${in_prior_WM}
+
+    in_images=${tmpdir}/t1_image.nii.gz
+    if [ "${in_t2_image}" != "" ]; then
+      fsl fslmerge -t ${tmpdir}/t2_image.nii.gz ${in_t2_image}
+      in_images="${in_images} ${tmpdir}/t2_image.nii.gz"
+    fi
+
+    # djk: changed mrf params from [0.01,1x1x1x1] to [0.05,1x1x1x0] as mrf weight between time points generates boundary errors
+    #ants Atropos -d 4 -x ${tmpdir}/mask.nii.gz -c [5,0.0] -a ${in_images} -i PriorProbabilityImages[3,${tmpdir}/pbmap_%d.nii.gz,0.0] -k HistogramParzenWindows -m [0.01,1x1x1x1] -o [${seg},${in_prefix}_posteriors_%d.nii.gz] -r 0 -p Socrates[1] --use-partial-volume-likelihoods 1 -s 1x2 -s 2x3
+    ants Atropos -d 4 -x ${tmpdir}/mask.nii.gz -c [5,0.0] -a ${in_images} -i PriorProbabilityImages[3,${tmpdir}/pbmap_%d.nii.gz,0.0] -k HistogramParzenWindows -m [0.05,1x1x1x0] -o [${seg},${in_prefix}_posteriors_%d.nii.gz] -r 0 -p Socrates[1] --use-partial-volume-likelihoods 1 -s 1x2 -s 2x3
+
+    status=$?
+
+    if [ ${status} -ne 0 ] || [ ! -e "${seg}" ]; then
+      echo "ERROR:${WORKDIR}: segment_atropos_4D failed to create ${seg}"
+      echo "ERROR:${WORKDIR}: command exit status was ${status}"
+      rm -rf ${tmpdir}
+      LWDP_lockfile_delete ${seg}
+      return 1
+    fi
+
+    fsl fslsplit ${seg} ${in_prefix}_seg_ -t
+    for i in 1 2 3; do
+      fsl fslsplit ${in_prefix}_posteriors_${i}.nii.gz ${in_prefix}_posteriors_${i}_ -t
+    done
+  
+    rm -rf ${tmpdir}
+    LWDP_lockfile_delete ${seg}
+  fi
+
+  in_time_num_1=`expr ${in_time_num} - 1`
+  idx=1
+  for i in `seq -f "%04g" 0 ${in_time_num_1}`; do
+    seg=${in_prefix}_seg_${i}.nii.gz
+    seg_clean=${in_prefix}_seg_clean_${i}.nii.gz
+    if LWDP_needs_update_and_lock ${seg_clean} ${seg}; then
+      ${SLICER_CLI}/IslandRemoval -m 25 ${seg} ${seg_clean} 
+      fsl fslcpgeom ${seg} ${seg_clean}
+      LWDP_lockfile_delete ${seg_clean}
+    fi
+   
+    sri_ven=`echo ${in_sri_ven} | cut -d " " -f${idx}` 
+    ven_parc=${in_prefix}_ven_parc_${i}.nii.gz
+    if LWDP_needs_update_and_lock ${ven_parc} ${seg_clean} ${sri_ven}; then
+      fsl fslmaths ${seg_clean} -thr 1 -uthr 1 -bin -mul ${sri_ven} ${ven_parc}
+      LWDP_lockfile_delete ${ven_parc}
+    fi 
+    sri_parc=`echo ${in_sri_parc} | cut -d " " -f${idx}` 
+    gm_parc=${in_prefix}_gm_parc_${i}.nii.gz
+    if LWDP_needs_update_and_lock ${gm_parc} ${seg_clean} ${sri_parc}; then
+      fsl fslmaths ${seg_clean} -thr 2 -uthr 2 -bin -mul ${sri_parc} ${gm_parc}
+      LWDP_lockfile_delete ${gm_parc}
+    fi 
+    sri_wm=`echo ${in_sri_wm} | cut -d " " -f${idx}` 
+    wm_parc=${in_prefix}_wm_parc_${i}.nii.gz
+    if LWDP_needs_update_and_lock ${wm_parc} ${seg_clean} ${sri_wm}; then
+      fsl fslmaths ${seg_clean} -thr 3 -uthr 3 -bin -mul ${sri_wm} ${wm_parc}
+      LWDP_lockfile_delete ${wm_parc}
+    fi
+
+    let idx++
+  done
+}
+
+if [ "${VISIT}" != "baseline" ]; then
+  followup_year=`echo ${VISIT} | cut -d "_" -f2 | cut -d "y" -f1`
+  followup_char=`echo ${VISIT} | cut -d "_" -f2 | sed 's/^[0-9]\+//'`
+
+  sri24_padded_t1_brain_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/t1_brain.nii.gz)
+  sri24_padded_t1_brain_t2_masked_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/t1_brain_t2_masked.nii.gz)
+  sri24_padded_t2_affine_brain_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/t2_affine_brain.nii.gz)
+  sri24_padded_t1_brainmask_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/t1_brain_mask.nii.gz)
+  t1_prior_CSF_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/pbmap_CSF.nii.gz)
+  t1_prior_GM_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/pbmap_GM.nii.gz)
+  t1_prior_WM_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/pbmap_WM.nii.gz)
+  t1_sri_ven_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/ventricles.nii.gz)
+  t1_sri_parc_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/parc116.nii.gz)
+  t1_sri_wm_list=$(LWDP_get_override_file ${WORKDIR}/../baseline/structural/reslice/sri24_padded/wm400.nii.gz)
+
+  # generate CSV tissue files
+  visit_num=0
+  for year in `seq 0 ${followup_year}`; do
+    if [ ${year} -eq 0 ]; then
+      let visit_num++
+      continue
+    else
+      visit=followup_${year}${followup_char}
+      reslicePath=${visit}/structural/reslice
+      longPath=structural/longitudinal/volumetry/sri24_padded/atropos
+      if [ ! -d ${CASESDIR}/${SUBJECT}/${ARM}/$reslicePath ]; then
+          if [ -d ${WORKDIR}/$longPath/${visit} ]; then
+            echo "INFO:$WORKDIR:Inconcistency - $visit in $longPath but $reslicePath is missing - remove segment and volumetry folders!"
+            rm -rf ${WORKDIR}/structural/longitudinal/segment/sri24_padded/*
+            rm -rf ${WORKDIR}/structural/longitudinal/volumetry/sri24_padded/*
+          fi
+          #
+          if [ ! -d ${CASESDIR}/${SUBJECT}/${ARM}/${visit}/structural ]; then 
+	    echo "WARNING:${WORKDIR}: missing ${CASESDIR}/${SUBJECT}/${ARM}/${visit}/structural; atropos 4D will omit this visit"
+	  else 
+ 	    echo "ERROR:${WORKDIR}: directory 'reslice' is missing in  ${CASESDIR}/${SUBJECT}/${ARM}/${visit}/structural; atropos 4D will omit this visit"
+	  fi 
+          continue
+      else
+        if [ -d ${WORKDIR}/$longPath ]; then
+          if [ ! -d ${WORKDIR}/$longPath/${visit} ]; then
+	    echo "INFO:$WORKDIR:Inconcistency -  $reslicePath exists but no $visit in $longPath - remove segment and volumetry folders!"
+            rm -rf ${WORKDIR}/structural/longitudinal/segment/sri24_padded/*
+            rm -rf ${WORKDIR}/structural/longitudinal/volumetry/sri24_padded/*
+          fi
+        fi
+      fi
+
+      sri24_padded_t1_brain_list="${sri24_padded_t1_brain_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/corrected/t1_brain.nii.gz)"
+      sri24_padded_t1_brain_t2_masked_list="${sri24_padded_t1_brain_t2_masked_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/corrected/t1_brain_t2_masked.nii.gz)"
+      sri24_padded_t2_affine_brain_list="${sri24_padded_t2_affine_brain_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/corrected/t2_affine_brain.nii.gz)"
+      sri24_padded_t1_brainmask_list="${sri24_padded_t1_brainmask_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/t1_brain_mask.nii.gz)"
+      t1_prior_CSF_list="${t1_prior_CSF_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/pbmap_CSF.nii.gz)"
+      t1_prior_GM_list="${t1_prior_GM_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/pbmap_GM.nii.gz)"
+      t1_prior_WM_list="${t1_prior_WM_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/pbmap_WM.nii.gz)"
+      t1_sri_ven_list="${t1_sri_ven_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/ventricles.nii.gz)"
+      t1_sri_parc_list="${t1_sri_parc_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/parc116.nii.gz)"
+      t1_sri_wm_list="${t1_sri_wm_list} $(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/wm400.nii.gz)"
+
+      let visit_num++
+    fi
+  done
+
+  # classification using atropos_4D with t1
+  [ -d ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos ] || mkdir -p ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos
+  t1_seg_pfx=${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos/t1
+  t1_seg=${t1_seg_pfx}_seg.nii.gz
+  # 05/19/26:JD: Added echo warning for downstream fails
+  if ! segment_atropos_4D ${visit_num} "${sri24_padded_t1_brain_list}" "" "${sri24_padded_t1_brainmask_list}" ${t1_seg_pfx} "${t1_prior_CSF_list}" "${t1_prior_GM_list}" "${t1_prior_WM_list}" "${t1_sri_ven_list}" "${t1_sri_parc_list}" "${t1_sri_wm_list}"; then
+    echo "WARNING:${WORKDIR}: segment_atropos_4D failed for longitudinal atropos; downstream longitudinal volumetry may be skipped or fail"
+  fi
+
+  # classification using atropos_4D with t1 masked
+  [ -d ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_masked ] || mkdir -p ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_masked
+  t1_masked_seg_pfx=${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_masked/t1
+  t1_masked_seg=${t1_masked_seg_pfx}_seg.nii.gz
+  segment_atropos_4D ${visit_num} "${sri24_padded_t1_brain_t2_masked_list}" "" "${sri24_padded_t1_brainmask_list}" ${t1_masked_seg_pfx} "${t1_prior_CSF_list}" "${t1_prior_GM_list}" "${t1_prior_WM_list}" "${t1_sri_ven_list}" "${t1_sri_parc_list}" "${t1_sri_wm_list}"
+
+  ## classification using atropos_4D with t1 and t2
+  #[ -d ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_t1t2 ] || mkdir -p ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_t1t2
+  #t1t2_seg_pfx=${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_t1t2/t1t2
+  #t1t2_seg=${t1t2_seg_pfx}_seg.nii.gz
+  #segment_atropos_4D ${visit_num} "${sri24_padded_t1_brain_list}" "${sri24_padded_t2_affine_brain_list}" "${sri24_padded_t1_brainmask_list}" ${t1t2_seg_pfx} "${t1_prior_CSF_list}" "${t1_prior_GM_list}" "${t1_prior_WM_list}" "${t1_sri_ven_list}" "${t1_sri_parc_list}" "${t1_sri_wm_list}"
+
+  # generate CSV tissue files
+  idx=0
+  for year in `seq 0 ${followup_year}`; do
+    idx_f=`seq -f "%04g" ${idx} ${idx}`
+    if [ ${year} -eq 0 ]; then
+      visit=baseline
+      let idx++
+    else
+      visit=followup_${year}${followup_char}
+      if [ ! -d ${CASESDIR}/${SUBJECT}/${ARM}/${visit}/structural/reslice ]; then
+        continue
+      fi
+      let idx++
+    fi
+
+    for i in 1 3 4; do
+      if [ "${i}" == "1" ]; then
+        # posteriors from atropos_4D t1
+        tab_folder=${WORKDIR}/structural/longitudinal/volumetry/sri24_padded/atropos/${visit}
+        posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos/t1_posteriors_1_${idx_f}.nii.gz)"
+        posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos/t1_posteriors_2_${idx_f}.nii.gz)"
+        posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos/t1_posteriors_3_${idx_f}.nii.gz)"
+      elif [ "${i}" == "2" ]; then
+        # posteriors from atropos_4D t1+t2
+        tab_folder=${WORKDIR}/structural/longitudinal/volumetry/sri24_padded/atropos_t1t2/${visit}
+        posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_t1t2/t1t2_posteriors_1_${idx_f}.nii.gz)"
+        posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_t1t2/t1t2_posteriors_2_${idx_f}.nii.gz)"
+        posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_t1t2/t1t2_posteriors_3_${idx_f}.nii.gz)"
+      elif [ "${i}" == "3" ]; then
+        # atropos_4D t1 hard segmentation
+        tab_folder=${WORKDIR}/structural/longitudinal/volumetry/sri24_padded/atropos_hs/${visit}
+        t1_seg=${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos/t1_seg_${idx_f}.nii.gz
+        t1_seg_1=${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos/t1_seg_1_${idx_f}.nii.gz
+        t1_seg_2=${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos/t1_seg_2_${idx_f}.nii.gz
+        t1_seg_3=${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos/t1_seg_3_${idx_f}.nii.gz
+        if LWDP_needs_update_and_lock ${t1_seg_1} ${t1_seg}; then
+          c3d c3d ${t1_seg} -replace 0 0 1 1 2 0 3 0 -o ${t1_seg_1}
+          c3d c3d ${t1_seg} -replace 0 0 1 0 2 1 3 0 -o ${t1_seg_2}
+          c3d c3d ${t1_seg} -replace 0 0 1 0 2 0 3 1 -o ${t1_seg_3}
+          LWDP_lockfile_delete ${t1_seg_1}
+        fi
+        posteriors="${t1_seg_1} ${t1_seg_2} ${t1_seg_3}"
+      elif [ "${i}" == "4" ]; then
+        # posteriors from atropos_4D t1 masked
+        tab_folder=${WORKDIR}/structural/longitudinal/volumetry/sri24_padded/atropos_masked/${visit}
+        posteriors="$(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_masked/t1_posteriors_1_${idx_f}.nii.gz)"
+        posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_masked/t1_posteriors_2_${idx_f}.nii.gz)"
+        posteriors+=" $(LWDP_get_override_file ${WORKDIR}/structural/longitudinal/segment/sri24_padded/atropos_masked/t1_posteriors_3_${idx_f}.nii.gz)"
+      fi
+      
+      # For each parcellation, compute tissue volume tables
+      for parc in ${PARCELLATIONS}; do
+        label_image=$(LWDP_get_override_file ${WORKDIR}/../${visit}/structural/reslice/sri24_padded/${parc}.nii.gz)
+        label_txt=${DATA_DIR}/sri24/parcellation/sri24_${parc}.txt
+      
+        # First, without "unwarping" correction
+        tabout=${tab_folder}/${parc}.tab
+        if LWDP_needs_update_and_lock ${tabout} ${label_image} ${posteriors} ${label_txt}; then
+          cmtk vol2csv --density-labels CSF,GM,WM -o ${tabout} --labels-file ${label_txt} ${label_image} ${posteriors}
+          LWDP_lockfile_delete ${tabout}
+        fi
+        csvout=${tab_folder}/${parc}.csv
+        tab_to_csv ${tabout} ${csvout} ${visit}
+      
+        if [ -n "${phantom_xml_input}" ]; then
+          # Second, global scale from ADNI phantom scan to adjust volumes globally
+          tabout=${tab_folder}/${parc}_scale.tab
+          if LWDP_needs_update_and_lock ${tabout} ${label_image} ${posteriors} ${label_txt}; then
+            cmtk vol2csv --density-labels CSF,GM,WM -o ${tabout} --pixel-scale-factor ${phantom_scale} --labels-file ${label_txt} ${label_image} ${posteriors}
+            LWDP_lockfile_delete ${tabout}
+          fi
+          csvout=${tab_folder}/${parc}_scale.csv
+          tab_to_csv ${tabout} ${csvout} ${visit}
+        fi
+      done
+    done
+  done
+fi
+

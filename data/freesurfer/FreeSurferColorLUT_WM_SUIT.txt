@@ -1,0 +1,7 @@
+629 Cbm_Left_Dentate 0 0 0
+630 Cbm_Right_Dentate 0 0 0
+631 Cbm_Left_Interposed 0 0 0
+632 Cbm_Right_Interposed 0 0 0
+633 Cbm_Left_Fastigial 0 0 0
+634 Cbm_Right_Fastigial 0 0 0
+635 Cbm_White_Matter 0 0 0

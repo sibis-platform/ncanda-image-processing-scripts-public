@@ -1,0 +1,9 @@
+4 Left-Lateral-Ventricle 120 18 134 0
+5 Left-Inf-Lat-Vent 196 58 250 0
+14 3rd-Ventricle 204 182 142 0
+15 4th-Ventricle 42 204 164 0
+31 Left-choroid-plexus 0 200 200 0
+43 Right-Lateral-Ventricle 120 18 134 0
+44 Right-Inf-Lat-Vent 196 58 250 0
+63 Right-choroid-plexus 0 200 221 0
+72 5th-Ventricle 120 190 150 0
