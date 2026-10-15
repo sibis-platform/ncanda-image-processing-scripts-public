@@ -52,26 +52,26 @@ container ([sibis-image-processing-public](https://github.com/sibis-platform/sib
 
 1. Clone with LFS so the images download:
 
-```bash
+   ```bash
    git lfs install
    git clone https://github.com/sibis-platform/ncanda-image-processing-scripts-public.git
    cd ncanda-image-processing-scripts-public
-```
+   ```
 
 2. Get the reference data that is not distributed here:
 
-```bash
+   ```bash
    bash data/fetch_external.sh
-```
+   ```
 
    It downloads the HCP Pipelines templates and prints instructions for the files you need to
    download yourself. See [Reference data](#reference-data).
 
 3. Generate the pipeline scripts into `bin/`. Inside the container:
 
-```bash
+   ```bash
    cmake --preset docker .
-```
+   ```
 
    If your tools live elsewhere, add a `CMakeUserPresets.json` with a preset that inherits `docker`
    and overrides the `NCANDA_*` paths, or pass each one with `-D`. Rerun CMake after editing a
@@ -170,11 +170,8 @@ Releases are tagged `vYYYY.MM.N`, matching the NCANDA internal release they were
 
 ## Citing
 
-If you use these pipelines, please cite the NCANDA study and the papers describing the processing:
+If you use these pipelines, please cite:
 
-- Brown SA, et al. The National Consortium on Alcohol and NeuroDevelopment in Adolescence (NCANDA):
-  a multisite study of adolescent development and substance use. *J Stud Alcohol Drugs*.
-  2015;76(6):895-908.
 - **Segmentations (structural, diffusion and resting-state pipelines):** Pfefferbaum A, Kwon D,
   Brumback T, et al. Altered brain developmental trajectories in adolescents after initiating
   drinking. *Am J Psychiatry*. 2018;175(4):370-380.
@@ -185,6 +182,11 @@ If you use these pipelines, please cite the NCANDA study and the papers describi
   estimates of intrinsic functional networks. *Hum Brain Mapp*. 2019;40(8):2511-2528.
 
 Please also cite the tools and atlases you use, per their own instructions.
+
+## Acknowledgments
+
+Development of this software was partly supported by funding from the National Institute on Alcohol
+Abuse and Alcoholism of the National Institutes of Health (U24 AA021697).
 
 ## License
 
